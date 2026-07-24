@@ -23,6 +23,11 @@ parameters:
   - name: cratesArtifactName
     type: string
     default: mxc-crates-package
+  # When true, run stage + verify-order but SKIP the ESRP publish and feed wait --
+  # exercises the pipeline plumbing without publishing anything.
+  - name: cratesDryRun
+    type: boolean
+    default: false
 
 jobs:
   - deployment: publish_crates
@@ -63,32 +68,37 @@ jobs:
                     python3 "$(script)" stage --order-file "$(orderFile)" --crate "${{ crate }}" --out-dir "$(esrpDir)"
                   displayName: "Stage ${{ crate }} for ESRP"
 
-                - task: EsrpRelease@12
-                  displayName: "Publish ${{ crate }} to crates.io"
-                  inputs:
-                    connectedservicename: ${{ parameters.ESRPInfo.serviceName }}
-                    usemanagedidentity: false
-                    keyvaultname: ${{ parameters.ESRPInfo.azureKeyVaultName }}
-                    authcertname: ${{ parameters.ESRPInfo.authCertName }}
-                    signcertname: ${{ parameters.ESRPInfo.signCertName }}
-                    clientid: ${{ parameters.ESRPInfo.clientId }}
-                    intent: 'PackageDistribution'
-                    contenttype: 'Rust'
-                    contentsource: 'Folder'
-                    folderlocation: $(esrpDir)
-                    owners: ${{ parameters.ESRPInfo.OwnersEmail }}
-                    approvers: ${{ parameters.ESRPInfo.ApproversEmail }}
-                    waitforreleasecompletion: true
-                    serviceendpointurl: 'https://api.esrp.microsoft.com'
-                    mainpublisher: 'ESRPRELPACMAN'
-                    domaintenantid: ${{ parameters.ESRPInfo.tenantId }}
+                - ${{ if parameters.cratesDryRun }}:
+                  - script: |
+                      echo "##vso[task.logissue type=warning]DRY RUN: skipping ESRP publish and feed wait for ${{ crate }} (staged .crate only)."
+                    displayName: "DRY RUN: skip publish ${{ crate }}"
+                - ${{ else }}:
+                  - task: EsrpRelease@12
+                    displayName: "Publish ${{ crate }} to crates.io"
+                    inputs:
+                      connectedservicename: ${{ parameters.ESRPInfo.serviceName }}
+                      usemanagedidentity: false
+                      keyvaultname: ${{ parameters.ESRPInfo.azureKeyVaultName }}
+                      authcertname: ${{ parameters.ESRPInfo.authCertName }}
+                      signcertname: ${{ parameters.ESRPInfo.signCertName }}
+                      clientid: ${{ parameters.ESRPInfo.clientId }}
+                      intent: 'PackageDistribution'
+                      contenttype: 'Rust'
+                      contentsource: 'Folder'
+                      folderlocation: $(esrpDir)
+                      owners: ${{ parameters.ESRPInfo.OwnersEmail }}
+                      approvers: ${{ parameters.ESRPInfo.ApproversEmail }}
+                      waitforreleasecompletion: true
+                      serviceendpointurl: 'https://api.esrp.microsoft.com'
+                      mainpublisher: 'ESRPRELPACMAN'
+                      domaintenantid: ${{ parameters.ESRPInfo.tenantId }}
 
-                - script: |
-                    set -euo pipefail
-                    python3 "$(script)" wait --order-file "$(orderFile)" --crate "${{ crate }}"
-                  displayName: "Wait for ${{ crate }} on the Azure Artifacts feed"
-                  env:
-                    # `wait` queries the private feed's sparse index because the
-                    # network-isolated build cannot reach crates.io; it
-                    # authenticates with the build identity's OAuth token.
-                    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                  - script: |
+                      set -euo pipefail
+                      python3 "$(script)" wait --order-file "$(orderFile)" --crate "${{ crate }}"
+                    displayName: "Wait for ${{ crate }} on the Azure Artifacts feed"
+                    env:
+                      # `wait` queries the private feed's sparse index because the
+                      # network-isolated build cannot reach crates.io; it
+                      # authenticates with the build identity's OAuth token.
+                      SYSTEM_ACCESSTOKEN: $(System.AccessToken)

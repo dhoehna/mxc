@@ -1,39 +1,18 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 #
-# Single entry point for MXC package releases. A run can publish the npm SDK,
-# the crates.io Rust crates, or both, selected by the `publishNpm` /
-# `publishCrates` parameters in the "Run pipeline" dialog. Both feeds publish
-# through ESRP Release, so no registry tokens live in this repo.
+# Single entry point for MXC package releases: one run can publish the npm SDK,
+# the Rust crate closure to crates.io, or both, via the `publishNpm` /
+# `publishCrates` parameters. Both publish through ESRP Release (no registry
+# tokens in this repo), consuming artifacts from `MXC-Official-Build`:
+#   * npm SDK   -> `mxc-npm-sdk-package`  (Package.NpmSdk.Job.yml)
+#   * crates.io -> `mxc-crates-package`   (Package.Crates.Job.yml)
+# Leaf-first crate ordering/verification lives in templates/Publish.CratesIo.Job.yml.
 #
-# Artifacts are consumed from the official build (`MXC-Official-Build`):
-#   * npm SDK   -> `mxc-npm-sdk-package`     (Package.NpmSdk.Job.yml)
-#   * crates.io -> `mxc-crates-package`      (Package.Crates.Job.yml)
-#
-# crates.io specifics (per the ESRP crates.io docs): ESRP publishes pre-built
-# `.crate` files under the official `microsoft-oss-releases` account via the
-# crates.io API, which does NOT enforce dependency order. The crate closure is
-# therefore published leaf-first, one ESRP task per crate, verifying each on the
-# crates.io index before its dependents -- all handled by
-# templates/Publish.CratesIo.Job.yml.
-#
-# ---------------------------------------------------------------------------
-# ONE-TIME crates.io enablement (out of band -- not codeable in this repo)
-# ---------------------------------------------------------------------------
-# 1. OSPO / CELA open-source release registration + checklist (LICENSE, README,
-#    SECURITY.md, CONTRIBUTING.md) for publishing MXC to crates.io.
-# 2. Reserve (or first-publish) the crate names under the `microsoft-oss-releases`
-#    account: mxc_telemetry, nanvix_common, mxc_pty, sandbox_spec, wxc_common,
-#    lxc_common, seatbelt_common, appcontainer_common, bwrap_common, mxc-sdk.
-# 3. Have the ESRP Release team enable the `Rust` content type for this pipeline's
-#    ESRP client id (see the "Tenant does not have access to the given Main
-#    Publisher" note in the ESRP crates.io docs). The same App-Registration
-#    identity used for npm/signing (ESRPInfo below) is reused.
-# 4. Allow read egress to the crates.io index (index.crates.io) on the release
-#    pool so the between-crates propagation check can confirm each publish.
-# No CARGO_REGISTRY_TOKEN, variable group, or custom environment is required --
-# ESRP owns the crates.io credentials, and the 1ES production releaseJob provides
-# the manual release gate.
+# One-time enablement (out of band): OSPO OSS-release registration, crate-name
+# reservation under `microsoft-oss-releases`, and ESRP `Rust` content-type
+# onboarding for the ESRP client id (see the ESRP crates.io docs). No
+# CARGO_REGISTRY_TOKEN or variable group is needed -- ESRP owns the credentials.
 
 trigger: none
 name: $(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
@@ -55,9 +34,13 @@ parameters:
   - name: publishNpm
     displayName: "Publish the npm SDK to npmjs.com"
     type: boolean
-    default: true
+    default: false
   - name: publishCrates
     displayName: "Publish the Rust crate closure to crates.io"
+    type: boolean
+    default: false
+  - name: cratesDryRun
+    displayName: "Crates dry run: stage + verify only, skip the ESRP publish"
     type: boolean
     default: false
   # Leaf-first crate order for crates.io. MUST match the CRATES list in
@@ -160,5 +143,6 @@ extends:
           parameters:
             ESRPInfo: ${{ parameters.ESRPInfo }}
             crateOrder: ${{ parameters.crateOrder }}
+            cratesDryRun: ${{ parameters.cratesDryRun }}
 
   
