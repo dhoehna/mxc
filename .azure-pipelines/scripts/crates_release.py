@@ -12,7 +12,7 @@ ESRP publishes via the crates.io API, which -- unlike `cargo publish` -- does
 NOT enforce dependency order and offers no bulk sorting. Ordering is therefore
 our responsibility: the closure is released leaf-first (every crate after all of
 its first-party dependencies), one ESRP task per crate, and each crate is
-confirmed present on the crates.io index before its dependents publish.
+confirmed present on the Azure Artifacts feed before its dependents publish.
 
 Subcommands
 -----------
@@ -32,13 +32,13 @@ verify-order  Assert that a caller-supplied ordered crate-name list (the
 stage         Copy exactly one crate's `.crate` file (looked up in
               release-order.json) into a clean folder for a single ESRP task.
 
-wait          Poll the crates.io sparse index until <crate>@<version> is
-              visible, so the next (dependent) crate only publishes once this
-              one is resolvable. Runs after each ESRP publish.
+wait          Poll the Azure Artifacts feed's sparse index until
+              <crate>@<version> is visible, so the next (dependent) crate only
+              publishes once this one is resolvable. Runs after each ESRP publish.
 
 Packaging is source-only -- `--no-verify` skips the post-package verify compile
 -- and the whole closure is packaged in a single `cargo package` invocation so
-cargo resolves first-party deps from target/package/ instead of the crates.io
+cargo resolves first-party deps from target/package/ instead of the registry
 index. A non-leaf crate therefore packages fine even though its dependencies are
 not published yet; packaging them one crate at a time does NOT work.
 """
@@ -99,13 +99,25 @@ CRATES: list[str] = [
     "mxc-sdk",
 ]
 
-CRATES_IO_SPARSE_INDEX = "https://index.crates.io"
-PROPAGATION_TIMEOUT = 300  # seconds to wait for a publish to appear in the index
+# The official 1ES build runs network-isolated and CANNOT reach the public
+# crates.io index (https://index.crates.io). Version checks therefore query the
+# private Azure Artifacts feed's sparse index, which IS reachable in-pipeline and
+# is authenticated with the build's $(System.AccessToken) (mapped to
+# SYSTEM_ACCESSTOKEN in the task env). The feed serves the same Cargo sparse-index
+# layout as crates.io. See .azure-pipelines/.cargo/config.toml for the feed cargo
+# itself resolves against.
+AZURE_FEED_REGISTRY = "Mxc-Azure-Feed"
+AZURE_FEED_SPARSE_INDEX = (
+    "https://microsoft.pkgs.visualstudio.com/"
+    "Dart/_packaging/Mxc-Azure-Feed/Cargo/index"
+)
+SYSTEM_ACCESS_TOKEN_ENV = "SYSTEM_ACCESSTOKEN"
+PROPAGATION_TIMEOUT = 300  # seconds to wait for a publish to appear in the feed
 PROPAGATION_POLL = 5       # seconds between index polls
 
 
 def _sparse_index_path(name: str) -> str:
-    """Path the crates.io sparse index uses to locate a crate."""
+    """Path the Cargo sparse index uses to locate a crate (crates.io layout)."""
     name = name.lower()
     if len(name) == 1:
         return f"1/{name}"
@@ -116,10 +128,21 @@ def _sparse_index_path(name: str) -> str:
     return f"{name[:2]}/{name[2:4]}/{name}"
 
 
+def _feed_request(url: str) -> urllib.request.Request:
+    """Build an Azure Artifacts request authenticated by the pipeline token."""
+    token = os.environ.get(SYSTEM_ACCESS_TOKEN_ENV)
+    if not token:
+        raise RuntimeError(
+            f"{SYSTEM_ACCESS_TOKEN_ENV} is not set. Map $(System.AccessToken) "
+            f"to that environment variable in the pipeline task."
+        )
+    return urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+
+
 def _published_versions(crate: str) -> set[str]:
-    """Return the versions of `crate` already on crates.io (empty set if none)."""
-    url = f"{CRATES_IO_SPARSE_INDEX}/{_sparse_index_path(crate)}"
-    with urllib.request.urlopen(url, timeout=30) as response:
+    """Return the versions of `crate` already in the Azure Artifacts feed."""
+    url = f"{AZURE_FEED_SPARSE_INDEX}/{_sparse_index_path(crate)}"
+    with urllib.request.urlopen(_feed_request(url), timeout=30) as response:
         body = response.read().decode("utf-8")
     versions: set[str] = set()
     for line in body.splitlines():
@@ -174,10 +197,10 @@ def cmd_package(args: argparse.Namespace) -> int:
     # Package the whole closure in ONE `cargo package` invocation. With every
     # crate passed via -p in the same run, cargo resolves intra-closure path
     # dependencies against the crates being packaged (staged under
-    # target/package/) instead of the crates.io index -- so a non-leaf crate
+    # target/package/) instead of the registry index -- so a non-leaf crate
     # packages even though its first-party deps are not published yet. A
     # per-crate loop does NOT work here: packaging a crate on its own strips the
-    # path from each dependency and sends cargo to crates.io for a sibling that
+    # path from each dependency and sends cargo to the registry for a sibling that
     # does not exist there yet (e.g. wxc_common -> mxc_telemetry).
     #   --no-verify : source-only tar, no compile against unpublished deps.
     #   --allow-dirty: CI setup (e.g. appending the internal feed to
@@ -267,20 +290,20 @@ def cmd_wait(args: argparse.Namespace) -> int:
     while time.monotonic() < deadline:
         try:
             if version in _published_versions(crate):
-                print(f"OK    {crate} {version} is live on the crates.io index.")
+                print(f"OK    {crate} {version} is live on the Azure Artifacts feed.")
                 return 0
         except urllib.error.HTTPError as error:
             if error.code != 404:  # 404 == not indexed yet; keep polling
-                print(f"WARN  crates.io index HTTP {error.code} for {crate}; retrying")
+                print(f"WARN  feed index HTTP {error.code} for {crate}; retrying")
         except (urllib.error.URLError, TimeoutError) as error:
-            print(f"WARN  crates.io index unreachable for {crate}: {error}; retrying")
+            print(f"WARN  feed index unreachable for {crate}: {error}; retrying")
         time.sleep(args.poll)
 
     # ESRP ran with waitforreleasecompletion:true, so the publish itself already
     # completed; only index propagation is unconfirmed. Warn (don't fail the
     # release) and let the next crate proceed.
     print(f"##vso[task.logissue type=warning]{crate} {version} not confirmed on the "
-          f"crates.io index within {args.timeout}s; continuing (ESRP reported the "
+          f"Azure Artifacts feed within {args.timeout}s; continuing (ESRP reported the "
           f"publish complete).")
     return 0
 
@@ -306,7 +329,7 @@ def main() -> int:
     p_stg.add_argument("--out-dir", required=True)
     p_stg.set_defaults(func=cmd_stage)
 
-    p_wait = sub.add_parser("wait", help="poll the crates.io index for a crate version")
+    p_wait = sub.add_parser("wait", help="poll the Azure Artifacts feed for a crate version")
     p_wait.add_argument("--order-file", required=True)
     p_wait.add_argument("--crate", required=True)
     p_wait.add_argument("--timeout", type=int, default=PROPAGATION_TIMEOUT)

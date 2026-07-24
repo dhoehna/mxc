@@ -9,8 +9,8 @@
 #
 # ESRP publishes via the crates.io API, which does NOT enforce dependency order
 # and offers no bulk sorting (see the ESRP crates.io docs). We therefore emit
-# one EsrpRelease task per crate, leaf-first, and confirm each crate is on the
-# crates.io index before its dependents publish. A run-time guard asserts the
+# one EsrpRelease task per crate, leaf-first, and confirm each crate is in the
+# Azure Artifacts feed before its dependents publish. A run-time guard asserts the
 # compile-time `crateOrder` matches what was actually packaged.
 
 parameters:
@@ -86,4 +86,9 @@ jobs:
                 - script: |
                     set -euo pipefail
                     python3 "$(script)" wait --order-file "$(orderFile)" --crate "${{ crate }}"
-                  displayName: "Wait for ${{ crate }} on crates.io index"
+                  displayName: "Wait for ${{ crate }} on the Azure Artifacts feed"
+                  env:
+                    # `wait` queries the private feed's sparse index because the
+                    # network-isolated build cannot reach crates.io; it
+                    # authenticates with the build identity's OAuth token.
+                    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
