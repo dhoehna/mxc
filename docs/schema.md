@@ -59,7 +59,15 @@ production configs and the dev schema when working on experimental features:
 
     "processContainer": {                  // Process-based container-specific
         "leastPrivilege": false,
-        "capabilities": ["internetClient"]
+        "capabilities": ["internetClient"],
+        "captureDenials": {                // Windows-only: record the process's access
+            "mode": "block",               // "block" (default): access stays denied and
+                                           // is logged (deny-by-default preserved). "allow":
+                                           // access is allowed and logged (audit; relaxes
+                                           // deny-by-default, emits a security warning).
+            "outputPath": "C:\\logs\\denials.etl"  // attempts to a learning-mode ETL trace. The
+        }                                  // parent dir must already exist; omit outputPath
+                                           // for a managed per-run temp file.
     },
 
     "lxc": {                               // LXC-specific
@@ -75,7 +83,7 @@ production configs and the dev schema when working on experimental features:
             "memoryMb": 2048,              // Memory in MB for WSLC session
             "gpu": false,                  // GPU passthrough
             "storagePath": "C:\\wslc-storage",  // Image store path
-            "portMappings": [              // Host<->container port forwarding. TCP only -- the vendored WSLC SDK 2.8.1 runtime returns E_NOTIMPL for UDP, so the parser hard-rejects "udp" entries with a clear message.
+            "portMappings": [              // Host<->container port forwarding. TCP only -- the WSLC SDK runtime returns E_NOTIMPL for UDP, so the parser hard-rejects "udp" entries with a clear message.
                 { "windowsPort": 8080, "containerPort": 80, "protocol": "tcp" }
             ]
         },
