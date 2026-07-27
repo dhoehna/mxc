@@ -206,7 +206,18 @@ def cmd_package(args: argparse.Namespace) -> int:
     #   --allow-dirty: CI setup (e.g. appending the internal feed to
     #                  .cargo/config.toml) leaves the tree in a state cargo
     #                  considers dirty.
+    #   --registry crates-io: the pipeline's .cargo/config.toml replaces the
+    #                  crates-io source with the internal Mxc-Azure-Feed, so
+    #                  cargo refuses to `package` without an explicit target
+    #                  registry ("crates-io is replaced with remote registry
+    #                  Mxc-Azure-Feed; include --registry ..."). Package for
+    #                  crates-io -- the real publish target -- so intra-closure
+    #                  sibling deps are recorded as plain crates.io deps;
+    #                  packaging for the feed would embed a registry-index that
+    #                  crates.io rejects. The source replacement still serves the
+    #                  index reads offline (network-isolated build).
     package_args = ["cargo", "package", "--no-verify", "--allow-dirty",
+                    "--registry", "crates-io",
                     "--manifest-path", manifest]
     for crate in CRATES:
         package_args += ["-p", crate]
