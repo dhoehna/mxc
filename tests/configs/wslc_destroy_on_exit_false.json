@@ -9,9 +9,7 @@
   "lifecycle": {
     "destroyOnExit": false
   },
-  "network": {
-    "defaultPolicy": "block"
-  },
+  "network": {},
   "experimental": {
     "wslc": {
       "image": "alpine:latest"

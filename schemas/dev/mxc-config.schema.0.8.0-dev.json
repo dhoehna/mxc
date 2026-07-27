@@ -468,44 +468,6 @@
       "additionalProperties": false,
       "description": "Network access policy.",
       "properties": {
-        "allowLocalNetwork": {
-          "description": "Allow binding/listening on local IPs and accepting inbound connections (legacy schema).",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "allowedHosts": {
-          "description": "Hosts explicitly allowed (legacy schema).",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "blockedHosts": {
-          "description": "Hosts explicitly blocked (legacy schema).",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "defaultPolicy": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/NetworkPolicy"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Default outbound policy when no host rule matches (legacy schema)."
-        },
         "egress": {
           "anyOf": [
             {
@@ -517,17 +479,6 @@
           ],
           "description": "Outbound policy rules."
         },
-        "enforcementMode": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/NetworkEnforcement"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "How the policy is enforced."
-        },
         "ingress": {
           "anyOf": [
             {
@@ -538,17 +489,6 @@
             }
           ],
           "description": "Inbound policy."
-        },
-        "proxy": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Proxy"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Proxy configuration (one of localhost / builtinTestServer / url)."
         }
       },
       "type": "object"
@@ -609,32 +549,6 @@
       },
       "type": "object"
     },
-    "NetworkEnforcement": {
-      "description": "Network enforcement mechanism.",
-      "oneOf": [
-        {
-          "description": "Per-process capability-based filtering.",
-          "enum": [
-            "capabilities"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Host firewall rules.",
-          "enum": [
-            "firewall"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Both capability and firewall enforcement.",
-          "enum": [
-            "both"
-          ],
-          "type": "string"
-        }
-      ]
-    },
     "NetworkIngress": {
       "additionalProperties": false,
       "description": "Inbound policy.",
@@ -652,14 +566,6 @@
         }
       },
       "type": "object"
-    },
-    "NetworkPolicy": {
-      "description": "Default network policy.",
-      "enum": [
-        "allow",
-        "block"
-      ],
-      "type": "string"
     },
     "NetworkPort": {
       "additionalProperties": false,
@@ -843,6 +749,17 @@
             "null"
           ]
         },
+        "network": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProcessContainerNetwork"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Network settings specific to the processcontainer backend (loopback peer exemptions). Distinct from the shared top-level `network` policy."
+        },
         "ui": {
           "anyOf": [
             {
@@ -857,32 +774,17 @@
       },
       "type": "object"
     },
-    "Proxy": {
+    "ProcessContainerNetwork": {
       "additionalProperties": false,
-      "description": "Proxy configuration. Exactly one variant applies.",
+      "description": "ProcessContainer-specific network settings (Windows).",
       "properties": {
-        "builtinTestServer": {
-          "description": "Have wxc launch its own built-in test proxy.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "localhost": {
-          "description": "External localhost proxy port.",
-          "maximum": 65535.0,
-          "minimum": 1.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "url": {
-          "description": "Proxy URL (parsed into host:port).",
-          "type": [
-            "string",
-            "null"
-          ]
+        "allowedPeers": {
+          "default": [],
+          "description": "AppContainer friendly names whose loopback traffic is exempted (for example a caller-provided proxy container). MXC resolves each friendly name to a SID at launch to scope the loopback exemption rules.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"

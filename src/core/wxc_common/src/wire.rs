@@ -195,6 +195,21 @@ pub struct ProcessContainer {
     pub capabilities: Option<Vec<String>>,
     /// BaseProcessContainer UI settings (Windows).
     pub ui: Option<BaseProcessUi>,
+    /// Network settings specific to the processcontainer backend (loopback
+    /// peer exemptions). Distinct from the shared top-level `network` policy.
+    pub network: Option<ProcessContainerNetwork>,
+}
+
+/// ProcessContainer-specific network settings (Windows).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProcessContainerNetwork {
+    /// AppContainer friendly names whose loopback traffic is exempted (for
+    /// example a caller-provided proxy container). MXC resolves each friendly
+    /// name to a SID at launch to scope the loopback exemption rules.
+    #[serde(default)]
+    pub allowed_peers: Vec<String>,
 }
 
 /// BaseProcessContainer UI isolation settings.
@@ -273,22 +288,10 @@ pub struct Fallback {
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Network {
-    /// Default outbound policy when no host rule matches (legacy schema).
-    pub default_policy: Option<NetworkPolicy>,
-    /// How the policy is enforced.
-    pub enforcement_mode: Option<NetworkEnforcement>,
-    /// Allow binding/listening on local IPs and accepting inbound connections (legacy schema).
-    pub allow_local_network: Option<bool>,
-    /// Hosts explicitly allowed (legacy schema).
-    pub allowed_hosts: Option<Vec<String>>,
-    /// Hosts explicitly blocked (legacy schema).
-    pub blocked_hosts: Option<Vec<String>>,
     /// Outbound policy rules.
     pub egress: Option<NetworkEgress>,
     /// Inbound policy.
     pub ingress: Option<NetworkIngress>,
-    /// Proxy configuration (one of localhost / builtinTestServer / url).
-    pub proxy: Option<Proxy>,
 }
 
 /// Outbound policy rule set.

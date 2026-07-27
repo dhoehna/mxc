@@ -220,37 +220,13 @@ export interface Lxc {
  */
 export interface Network {
   /**
-   * Allow binding/listening on local IPs and accepting inbound connections (legacy schema).
-   */
-  allowLocalNetwork?: boolean | null;
-  /**
-   * Hosts explicitly allowed (legacy schema).
-   */
-  allowedHosts?: string[] | null;
-  /**
-   * Hosts explicitly blocked (legacy schema).
-   */
-  blockedHosts?: string[] | null;
-  /**
-   * Default outbound policy when no host rule matches (legacy schema).
-   */
-  defaultPolicy?: NetworkPolicy | null;
-  /**
    * Outbound policy rules.
    */
   egress?: NetworkEgress | null;
   /**
-   * How the policy is enforced.
-   */
-  enforcementMode?: NetworkEnforcement | null;
-  /**
    * Inbound policy.
    */
   ingress?: NetworkIngress | null;
-  /**
-   * Proxy configuration (one of localhost / builtinTestServer / url).
-   */
-  proxy?: Proxy | null;
 }
 
 /**
@@ -286,11 +262,6 @@ export interface NetworkEgress {
 }
 
 /**
- * Network enforcement mechanism.
- */
-export type NetworkEnforcement = "capabilities" | "firewall" | "both";
-
-/**
  * Inbound policy.
  */
 export interface NetworkIngress {
@@ -299,11 +270,6 @@ export interface NetworkIngress {
    */
   hostLoopback?: HostLoopbackPolicy | null;
 }
-
-/**
- * Default network policy.
- */
-export type NetworkPolicy = "allow" | "block";
 
 /**
  * Outbound port selector.
@@ -405,27 +371,23 @@ export interface ProcessContainer {
    */
   leastPrivilege?: boolean | null;
   /**
+   * Network settings specific to the processcontainer backend (loopback peer exemptions). Distinct from the shared top-level `network` policy.
+   */
+  network?: ProcessContainerNetwork | null;
+  /**
    * BaseProcessContainer UI settings (Windows).
    */
   ui?: BaseProcessUi | null;
 }
 
 /**
- * Proxy configuration. Exactly one variant applies.
+ * ProcessContainer-specific network settings (Windows).
  */
-export interface Proxy {
+export interface ProcessContainerNetwork {
   /**
-   * Have wxc launch its own built-in test proxy.
+   * AppContainer friendly names whose loopback traffic is exempted (for example a caller-provided proxy container). MXC resolves each friendly name to a SID at launch to scope the loopback exemption rules.
    */
-  builtinTestServer?: boolean | null;
-  /**
-   * External localhost proxy port.
-   */
-  localhost?: number | null;
-  /**
-   * Proxy URL (parsed into host:port).
-   */
-  url?: string | null;
+  allowedPeers?: string[];
 }
 
 /**
