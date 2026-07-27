@@ -48,47 +48,9 @@ export type ClipboardPolicy = "none" | "read" | "write" | "all";
 export type Containment = "process" | "processcontainer" | "vm" | "windows_sandbox" | "lxc" | "microvm" | "hyperlight" | "wslc" | "seatbelt" | "isolation_session" | "bubblewrap";
 
 /**
- * GA egress default outbound action applied when no egress rule matches.
+ * Egress default outbound action applied when no egress rule matches.
  */
 export type EgressDefault = "allow" | "deny";
-
-/**
- * GA outbound destination.
- */
-export interface EgressDestinationWire {
-  /**
-   * IPv4/IPv6 CIDR range, or a bare IP address.
-   */
-  cidr: string;
-}
-
-/**
- * GA outbound port selector.
- */
-export interface EgressPortWire {
-  /**
-   * Destination port. Must be omitted for `icmp` (which has no ports); the parser rejects a port paired with `icmp`. When omitted for `tcp`/`udp` the selector matches all ports for that protocol.
-   */
-  port?: number | null;
-  /**
-   * Transport protocol.
-   */
-  protocol: unknown;
-}
-
-/**
- * GA outbound policy rule.
- */
-export interface EgressRuleWire {
-  /**
-   * Destination ports and protocols. When omitted or empty, the rule matches all ports and all protocols to the listed destinations.
-   */
-  ports?: EgressPortWire[];
-  /**
-   * Destination CIDR ranges or bare IP addresses. DNS hostnames are rejected by the parser.
-   */
-  to: EgressDestinationWire[];
-}
 
 /**
  * Experimental features (only honored with `--experimental`). This block is intentionally **permissive** (no `deny_unknown_fields`): experimental backends are in flux, so the schema documents the known shapes for editor help without rejecting in-progress fields. The strict, closed contract is the stable (top-level) surface.
@@ -274,7 +236,7 @@ export interface Network {
    */
   defaultPolicy?: NetworkPolicy | null;
   /**
-   * GA outbound policy rules.
+   * Outbound policy rules.
    */
   egress?: NetworkEgress | null;
   /**
@@ -282,7 +244,7 @@ export interface Network {
    */
   enforcementMode?: NetworkEnforcement | null;
   /**
-   * GA inbound policy.
+   * Inbound policy.
    */
   ingress?: NetworkIngress | null;
   /**
@@ -292,21 +254,35 @@ export interface Network {
 }
 
 /**
- * GA outbound policy rule set.
+ * Outbound destination.
+ */
+export interface NetworkDestination {
+  /**
+   * IPv4/IPv6 CIDR range, or a bare IP address.
+   */
+  cidr: string;
+  /**
+   * Optional CIDR exclusions carved out of `cidr` (Kubernetes `ipBlock.except` style). Traffic to these ranges does not match this destination.
+   */
+  except?: string[];
+}
+
+/**
+ * Outbound policy rule set.
  */
 export interface NetworkEgress {
   /**
    * Rules that allow matching outbound connections.
    */
-  allow?: EgressRuleWire[];
+  allow?: NetworkRules[];
   /**
-   * Default outbound action when no egress rule matches (`allow` or `deny`). When omitted, defaults to `deny` (fail-closed). Setting `default: "allow"` expresses the "allow everything except this deny-list" model; when GA egress is present it supersedes the legacy `defaultPolicy`.
+   * Default outbound action when no egress rule matches (`allow` or `deny`). When omitted, defaults to `deny` (fail-closed). Setting `default: "allow"` expresses the "allow everything except this deny-list" model; when egress is present it supersedes the legacy `defaultPolicy`.
    */
   default?: EgressDefault | null;
   /**
    * Rules that deny matching outbound connections.
    */
-  deny?: EgressRuleWire[];
+  deny?: NetworkRules[];
 }
 
 /**
@@ -315,7 +291,7 @@ export interface NetworkEgress {
 export type NetworkEnforcement = "capabilities" | "firewall" | "both";
 
 /**
- * GA inbound policy.
+ * Inbound policy.
  */
 export interface NetworkIngress {
   /**
@@ -330,9 +306,41 @@ export interface NetworkIngress {
 export type NetworkPolicy = "allow" | "block";
 
 /**
- * GA outbound transport protocol.
+ * Outbound port selector.
  */
-export type NetworkProtocol = "tcp" | "udp" | "icmp";
+export interface NetworkPort {
+  /**
+   * End of an inclusive destination port range. When set, the selector matches `port..=endPort` and requires `port` with `endPort >= port`.
+   */
+  endPort?: number | null;
+  /**
+   * Destination port. Must be omitted for `icmp` (which has no ports); the parser rejects a port paired with `icmp`. When omitted for `tcp`/`udp` the selector matches all ports for that protocol. Acts as the start of an inclusive range when `endPort` is also set.
+   */
+  port?: number | null;
+  /**
+   * Transport protocol.
+   */
+  protocol: unknown;
+}
+
+/**
+ * Outbound transport protocol. `any` matches every protocol.
+ */
+export type NetworkProtocol = "tcp" | "udp" | "icmp" | "any";
+
+/**
+ * Outbound policy rule.
+ */
+export interface NetworkRules {
+  /**
+   * Destination ports and protocols. When omitted or empty, the rule matches all ports and all protocols to the listed destinations.
+   */
+  ports?: NetworkPort[];
+  /**
+   * Destination CIDR ranges or bare IP addresses. DNS hostnames are rejected by the parser.
+   */
+  to: NetworkDestination[];
+}
 
 /**
  * State-aware lifecycle phase.

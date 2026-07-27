@@ -137,78 +137,12 @@
       ]
     },
     "EgressDefault": {
-      "description": "GA egress default outbound action applied when no egress rule matches.",
+      "description": "Egress default outbound action applied when no egress rule matches.",
       "enum": [
         "allow",
         "deny"
       ],
       "type": "string"
-    },
-    "EgressDestinationWire": {
-      "additionalProperties": false,
-      "description": "GA outbound destination.",
-      "properties": {
-        "cidr": {
-          "description": "IPv4/IPv6 CIDR range, or a bare IP address.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "cidr"
-      ],
-      "type": "object"
-    },
-    "EgressPortWire": {
-      "additionalProperties": false,
-      "description": "GA outbound port selector.",
-      "properties": {
-        "port": {
-          "description": "Destination port. Must be omitted for `icmp` (which has no ports); the parser rejects a port paired with `icmp`. When omitted for `tcp`/`udp` the selector matches all ports for that protocol.",
-          "maximum": 65535.0,
-          "minimum": 1.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "protocol": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/NetworkProtocol"
-            }
-          ],
-          "description": "Transport protocol."
-        }
-      },
-      "required": [
-        "protocol"
-      ],
-      "type": "object"
-    },
-    "EgressRuleWire": {
-      "additionalProperties": false,
-      "description": "GA outbound policy rule.",
-      "properties": {
-        "ports": {
-          "default": [],
-          "description": "Destination ports and protocols. When omitted or empty, the rule matches all ports and all protocols to the listed destinations.",
-          "items": {
-            "$ref": "#/definitions/EgressPortWire"
-          },
-          "type": "array"
-        },
-        "to": {
-          "description": "Destination CIDR ranges or bare IP addresses. DNS hostnames are rejected by the parser.",
-          "items": {
-            "$ref": "#/definitions/EgressDestinationWire"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "to"
-      ],
-      "type": "object"
     },
     "Experimental": {
       "description": "Experimental features (only honored with `--experimental`). This block is intentionally **permissive** (no `deny_unknown_fields`): experimental backends are in flux, so the schema documents the known shapes for editor help without rejecting in-progress fields. The strict, closed contract is the stable (top-level) surface.",
@@ -581,7 +515,7 @@
               "type": "null"
             }
           ],
-          "description": "GA outbound policy rules."
+          "description": "Outbound policy rules."
         },
         "enforcementMode": {
           "anyOf": [
@@ -603,7 +537,7 @@
               "type": "null"
             }
           ],
-          "description": "GA inbound policy."
+          "description": "Inbound policy."
         },
         "proxy": {
           "anyOf": [
@@ -619,15 +553,37 @@
       },
       "type": "object"
     },
+    "NetworkDestination": {
+      "additionalProperties": false,
+      "description": "Outbound destination.",
+      "properties": {
+        "cidr": {
+          "description": "IPv4/IPv6 CIDR range, or a bare IP address.",
+          "type": "string"
+        },
+        "except": {
+          "default": [],
+          "description": "Optional CIDR exclusions carved out of `cidr` (Kubernetes `ipBlock.except` style). Traffic to these ranges does not match this destination.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cidr"
+      ],
+      "type": "object"
+    },
     "NetworkEgress": {
       "additionalProperties": false,
-      "description": "GA outbound policy rule set.",
+      "description": "Outbound policy rule set.",
       "properties": {
         "allow": {
           "default": [],
           "description": "Rules that allow matching outbound connections.",
           "items": {
-            "$ref": "#/definitions/EgressRuleWire"
+            "$ref": "#/definitions/NetworkRules"
           },
           "type": "array"
         },
@@ -640,13 +596,13 @@
               "type": "null"
             }
           ],
-          "description": "Default outbound action when no egress rule matches (`allow` or `deny`). When omitted, defaults to `deny` (fail-closed). Setting `default: \"allow\"` expresses the \"allow everything except this deny-list\" model; when GA egress is present it supersedes the legacy `defaultPolicy`."
+          "description": "Default outbound action when no egress rule matches (`allow` or `deny`). When omitted, defaults to `deny` (fail-closed). Setting `default: \"allow\"` expresses the \"allow everything except this deny-list\" model; when egress is present it supersedes the legacy `defaultPolicy`."
         },
         "deny": {
           "default": [],
           "description": "Rules that deny matching outbound connections.",
           "items": {
-            "$ref": "#/definitions/EgressRuleWire"
+            "$ref": "#/definitions/NetworkRules"
           },
           "type": "array"
         }
@@ -681,7 +637,7 @@
     },
     "NetworkIngress": {
       "additionalProperties": false,
-      "description": "GA inbound policy.",
+      "description": "Inbound policy.",
       "properties": {
         "hostLoopback": {
           "anyOf": [
@@ -705,14 +661,76 @@
       ],
       "type": "string"
     },
+    "NetworkPort": {
+      "additionalProperties": false,
+      "description": "Outbound port selector.",
+      "properties": {
+        "endPort": {
+          "description": "End of an inclusive destination port range. When set, the selector matches `port..=endPort` and requires `port` with `endPort >= port`.",
+          "maximum": 65535.0,
+          "minimum": 1.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "port": {
+          "description": "Destination port. Must be omitted for `icmp` (which has no ports); the parser rejects a port paired with `icmp`. When omitted for `tcp`/`udp` the selector matches all ports for that protocol. Acts as the start of an inclusive range when `endPort` is also set.",
+          "maximum": 65535.0,
+          "minimum": 1.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "protocol": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/NetworkProtocol"
+            }
+          ],
+          "description": "Transport protocol."
+        }
+      },
+      "required": [
+        "protocol"
+      ],
+      "type": "object"
+    },
     "NetworkProtocol": {
-      "description": "GA outbound transport protocol.",
+      "description": "Outbound transport protocol. `any` matches every protocol.",
       "enum": [
         "tcp",
         "udp",
-        "icmp"
+        "icmp",
+        "any"
       ],
       "type": "string"
+    },
+    "NetworkRules": {
+      "additionalProperties": false,
+      "description": "Outbound policy rule.",
+      "properties": {
+        "ports": {
+          "default": [],
+          "description": "Destination ports and protocols. When omitted or empty, the rule matches all ports and all protocols to the listed destinations.",
+          "items": {
+            "$ref": "#/definitions/NetworkPort"
+          },
+          "type": "array"
+        },
+        "to": {
+          "description": "Destination CIDR ranges or bare IP addresses. DNS hostnames are rejected by the parser.",
+          "items": {
+            "$ref": "#/definitions/NetworkDestination"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "to"
+      ],
+      "type": "object"
     },
     "Phase": {
       "description": "State-aware lifecycle phase.",

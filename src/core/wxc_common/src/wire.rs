@@ -283,34 +283,34 @@ pub struct Network {
     pub allowed_hosts: Option<Vec<String>>,
     /// Hosts explicitly blocked (legacy schema).
     pub blocked_hosts: Option<Vec<String>>,
-    /// GA outbound policy rules.
+    /// Outbound policy rules.
     pub egress: Option<NetworkEgress>,
-    /// GA inbound policy.
+    /// Inbound policy.
     pub ingress: Option<NetworkIngress>,
     /// Proxy configuration (one of localhost / builtinTestServer / url).
     pub proxy: Option<Proxy>,
 }
 
-/// GA outbound policy rule set.
+/// Outbound policy rule set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetworkEgress {
     /// Rules that allow matching outbound connections.
     #[serde(default)]
-    pub allow: Vec<EgressRuleWire>,
+    pub allow: Vec<NetworkRules>,
     /// Rules that deny matching outbound connections.
     #[serde(default)]
-    pub deny: Vec<EgressRuleWire>,
+    pub deny: Vec<NetworkRules>,
     /// Default outbound action when no egress rule matches (`allow` or `deny`).
     /// When omitted, defaults to `deny` (fail-closed). Setting `default: "allow"`
-    /// expresses the "allow everything except this deny-list" model; when GA
+    /// expresses the "allow everything except this deny-list" model; when
     /// egress is present it supersedes the legacy `defaultPolicy`.
     #[serde(rename = "default")]
     pub default_action: Option<EgressDefault>,
 }
 
-/// GA egress default outbound action applied when no egress rule matches.
+/// Egress default outbound action applied when no egress rule matches.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -319,43 +319,52 @@ pub enum EgressDefault {
     Deny,
 }
 
-/// GA outbound policy rule.
+/// Outbound policy rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EgressRuleWire {
+pub struct NetworkRules {
     /// Destination CIDR ranges or bare IP addresses. DNS hostnames are rejected by the parser.
-    pub to: Vec<EgressDestinationWire>,
+    pub to: Vec<NetworkDestination>,
     /// Destination ports and protocols. When omitted or empty, the rule matches
     /// all ports and all protocols to the listed destinations.
     #[serde(default)]
-    pub ports: Vec<EgressPortWire>,
+    pub ports: Vec<NetworkPort>,
 }
 
-/// GA outbound destination.
+/// Outbound destination.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EgressDestinationWire {
+pub struct NetworkDestination {
     /// IPv4/IPv6 CIDR range, or a bare IP address.
     pub cidr: String,
+    /// Optional CIDR exclusions carved out of `cidr` (Kubernetes `ipBlock.except`
+    /// style). Traffic to these ranges does not match this destination.
+    #[serde(default)]
+    pub except: Vec<String>,
 }
 
-/// GA outbound port selector.
+/// Outbound port selector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EgressPortWire {
+pub struct NetworkPort {
     /// Transport protocol.
     pub protocol: NetworkProtocol,
     /// Destination port. Must be omitted for `icmp` (which has no ports); the
     /// parser rejects a port paired with `icmp`. When omitted for `tcp`/`udp`
-    /// the selector matches all ports for that protocol.
+    /// the selector matches all ports for that protocol. Acts as the start of an
+    /// inclusive range when `endPort` is also set.
     #[cfg_attr(feature = "schema-gen", schemars(range(min = 1, max = 65535)))]
     pub port: Option<u16>,
+    /// End of an inclusive destination port range. When set, the selector matches
+    /// `port..=endPort` and requires `port` with `endPort >= port`.
+    #[cfg_attr(feature = "schema-gen", schemars(range(min = 1, max = 65535)))]
+    pub end_port: Option<u16>,
 }
 
-/// GA outbound transport protocol.
+/// Outbound transport protocol. `any` matches every protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -363,9 +372,10 @@ pub enum NetworkProtocol {
     Tcp,
     Udp,
     Icmp,
+    Any,
 }
 
-/// GA inbound policy.
+/// Inbound policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
