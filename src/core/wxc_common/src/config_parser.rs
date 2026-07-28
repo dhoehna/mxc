@@ -10,7 +10,7 @@ use crate::logger::Logger;
 use crate::models::{
     ContainerPolicy, ContainmentBackend, ExecutionRequest, ExperimentalConfig,
     IsolationSessionConfig, LifecycleConfig, LxcConfig, NetworkEnforcementMode, NetworkPolicy,
-    PortMapping, SeatbeltConfig, TelemetryConfig, TestFeatureConfig,
+    PortMapping, ProxyAddress, ProxyConfig, SeatbeltConfig, TelemetryConfig, TestFeatureConfig,
     UiPolicy, WindowsSandboxConfig, WslcConfig,
 };
 use crate::mxc_error::MxcError;
@@ -520,6 +520,77 @@ fn map_wire_containment(c: Option<&wire::Containment>) -> ContainmentBackend {
     }
 }
 
+fn convert_wire_proxy(proxy: wire::Proxy) -> Result<ProxyConfig, WxcError> {
+    // Destructure (no `..`) so a new wire field fails to compile until handled.
+    let wire::Proxy {
+        builtin_test_server,
+        localhost,
+        url,
+    } = proxy;
+    let mut proxy_addr = ProxyAddress::new("127.0.0.1".to_string(), 0);
+
+    if let Some(builtin) = builtin_test_server {
+        if !builtin {
+            return Err(WxcError::ConfigParse(
+                "runtimeConfig.networkProxy.builtinTestServer must be true when present"
+                    .to_string(),
+            ));
+        }
+        if localhost.is_some() || url.is_some() {
+            return Err(WxcError::ConfigParse(
+                "When builtinTestServer is true, no other proxy options may be set".to_string(),
+            ));
+        }
+        return Ok(ProxyConfig {
+            address: Some(proxy_addr),
+            builtin_test_server: true,
+        });
+    }
+
+    if let Some(port) = localhost {
+        if port == 0 {
+            return Err(WxcError::ConfigParse(
+                "runtimeConfig.networkProxy.localhost must be a port between 1 and 65535"
+                    .to_string(),
+            ));
+        }
+        proxy_addr.port = port;
+        return Ok(ProxyConfig {
+            address: Some(proxy_addr),
+            builtin_test_server: false,
+        });
+    }
+
+    if let Some(url_str) = url {
+        let parsed = url::Url::parse(&url_str).map_err(|e| {
+            WxcError::ConfigParse(format!("runtimeConfig.networkProxy.url is invalid: {e}"))
+        })?;
+
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| {
+                WxcError::ConfigParse(format!(
+                    "runtimeConfig.networkProxy.url must include a host (e.g., http://localhost:8080), got: {url_str}"
+                ))
+            })?
+            .to_string();
+        let port = parsed.port().ok_or_else(|| {
+            WxcError::ConfigParse(format!(
+                "runtimeConfig.networkProxy.url must include a port (e.g., http://localhost:8080), got: {url_str}"
+            ))
+        })?;
+
+        return Ok(ProxyConfig {
+            address: Some(ProxyAddress::from_url(&url_str, host, port)),
+            builtin_test_server: false,
+        });
+    }
+
+    Err(WxcError::ConfigParse(
+        "runtimeConfig.networkProxy must specify builtinTestServer, localhost, or url".to_string(),
+    ))
+}
+
 // `allow_missing_command` relaxes the `require_process == true` arms so that a
 // CLI command-line override (provided by the driver after parsing) can stand in
 // for `process.commandLine`. When set, a missing or empty `commandLine` is
@@ -711,13 +782,27 @@ fn convert_wire_config(
         }
     }
 
-    // Network section
-    //
-    // The legacy wire fields (`proxy`, `defaultPolicy`, `enforcementMode`,
-    // `allowLocalNetwork`, `allowedHosts`, `blockedHosts`) were dropped from the
-    // `network` schema, so there is nothing to read into the domain policy here;
-    // the corresponding `policy.*` fields keep their defaults. The backend guards
-    // below still reference those domain fields and are retained unchanged.
+    // Runtime config: network proxy.
+    if let Some(rc) = cfg.runtime_config {
+        if let Some(proxy) = rc.network_proxy {
+            let proxy_config = convert_wire_proxy(proxy)?;
+            if proxy_config.is_enabled()
+                && containment != ContainmentBackend::ProcessContainer
+                && containment != ContainmentBackend::Bubblewrap
+                && containment != ContainmentBackend::Seatbelt
+            {
+                let msg = "Network proxy is only supported with the 'processcontainer', \
+                           'bubblewrap', or 'seatbelt' containment backends";
+                logger.log_line(msg);
+                return Err(WxcError::ConfigParse(msg.to_string()));
+            }
+            policy.network_proxy = proxy_config;
+        }
+    }
+
+    // Backend compatibility guards for the network proxy. The proxy is read above
+    // from `runtimeConfig.networkProxy`; these guards reject proxy + enforcement
+    // combinations a backend cannot honor.
     if cfg.network.is_some() {
         // Bubblewrap is unprivileged by design; iptables-based enforcement
         // (firewall / both) requires CAP_NET_ADMIN, which defeats the backend's
@@ -729,7 +814,7 @@ fn convert_wire_config(
                 NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
             )
         {
-            let msg = "Bubblewrap: network.proxy cannot be combined with \
+            let msg = "Bubblewrap: runtimeConfig.networkProxy cannot be combined with \
                        network.enforcementMode='firewall' or 'both'. The cooperative \
                        env-var proxy enforces hosts at the proxy layer; iptables-based \
                        enforcement requires privilege and is mutually exclusive.";
@@ -749,7 +834,7 @@ fn convert_wire_config(
                 NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
             )
         {
-            let msg = "Seatbelt: network.proxy cannot be combined with \
+            let msg = "Seatbelt: runtimeConfig.networkProxy cannot be combined with \
                        network.enforcementMode='firewall' or 'both'. macOS Seatbelt \
                        enforces network policy through the sandbox profile and has no \
                        packet-filter layer, so a firewall mode cannot be honored.";
@@ -773,12 +858,12 @@ fn convert_wire_config(
                 .as_ref()
                 .is_some_and(|addr| !matches!(addr.host(), "127.0.0.1" | "::1" | "localhost"))
         {
-            let msg = "Seatbelt: a remote network.proxy (non-loopback host) cannot be \
+            let msg = "Seatbelt: a remote runtimeConfig.networkProxy (non-loopback host) cannot be \
                        combined with defaultPolicy='block'. Seatbelt cannot filter a remote \
                        proxy by host, so outbound reachability degrades to allow-all, \
                        silently weakening the deny for raw-socket clients that ignore \
                        HTTP_PROXY. Use a loopback proxy (127.0.0.1/::1/localhost) or \
-                       'network.proxy.builtinTestServer: true' for port-scoped reachability \
+                       'runtimeConfig.networkProxy.builtinTestServer: true' for port-scoped reachability \
                        under deny.";
             logger.log_line(msg);
             return Err(WxcError::ConfigParse(msg.to_string()));
@@ -795,11 +880,11 @@ fn convert_wire_config(
                 || !policy.blocked_hosts.is_empty()
                 || policy.default_network_policy == NetworkPolicy::Block)
         {
-            let msg = "Bubblewrap: an external network.proxy (url/localhost) cannot be \
+            let msg = "Bubblewrap: an external runtimeConfig.networkProxy (url/localhost) cannot be \
                        combined with allowedHosts, blockedHosts, or defaultPolicy='block'. \
                        The external proxy is expected to enforce its own host policy; \
                        MXC does not forward host lists to it. Use \
-                       'network.proxy.builtinTestServer: true' (testing only) for \
+                       'runtimeConfig.networkProxy.builtinTestServer: true' (testing only) for \
                        MXC-enforced host filtering, or remove the host policy.";
             logger.log_line(msg);
             return Err(WxcError::ConfigParse(msg.to_string()));
@@ -815,11 +900,11 @@ fn convert_wire_config(
             && policy.blocked_hosts.is_empty()
         {
             logger.log_line(
-                "WARNING: Bubblewrap network.proxy with defaultPolicy='block' is \
+                "WARNING: Bubblewrap runtimeConfig.networkProxy with defaultPolicy='block' is \
                  cooperative. HTTP_PROXY-aware clients (curl, requests, etc.) are \
                  denied at the proxy, but raw-socket clients that ignore HTTP_PROXY \
                  bypass the proxy and reach the host network. For strict isolation \
-                 of all clients, remove network.proxy so --unshare-net applies; for \
+                 of all clients, remove runtimeConfig.networkProxy so --unshare-net applies; for \
                  host-list enforcement, add allowedHosts (cooperative tools only).",
             );
         }
@@ -1126,16 +1211,12 @@ fn convert_wire_state_aware(
 
 #[cfg(test)]
 mod tests {
-    // SCOPE NOTE (GA network schema): tests below that feed legacy `network`
-    // fields -- `defaultPolicy`, `enforcementMode`, `allowLocalNetwork`,
-    // `allowedHosts`, `blockedHosts`, and `proxy` -- will FAIL. Those fields
-    // were removed from the wire schema in this PR (the GA schema exposes only
-    // `network.egress` / `network.ingress`, plus
-    // `processContainer.network.allowedPeers`), and `deny_unknown_fields` now
-    // rejects them at parse time. The legacy `proxy` field's GA home is
-    // `runtimeConfig.networkProxy`, which is intentionally out of this PR's
-    // scope. Migrating or removing these legacy-field tests is deliberately NOT
-    // part of this PR; getting them green is tracked as follow-up work.
+    // SCOPE NOTE: some tests below feed `network.defaultPolicy`,
+    // `network.enforcementMode`, `network.allowLocalNetwork`,
+    // `network.allowedHosts`, or `network.blockedHosts`. The parser does not
+    // accept those fields yet, so `deny_unknown_fields` rejects them at parse
+    // time and those tests FAIL. Wiring those fields is tracked as follow-up
+    // work and is deliberately out of scope here.
     use super::*;
     use crate::encoding::base64_encode;
     use crate::logger::Mode;
@@ -2068,8 +2149,7 @@ mod tests {
 
     #[test]
     fn no_proxy_leaves_default() {
-        let json =
-            r#"{"process": {"commandLine": "echo test"}, "network": {"defaultPolicy": "block"}}"#;
+        let json = r#"{"process": {"commandLine": "echo test"}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -2082,8 +2162,8 @@ mod tests {
         let json = r#"{
             "process": {"commandLine": "echo test"},
             "containment": "processcontainer",
-            "network": {
-                "proxy": { "localhost": 8080 }
+            "runtimeConfig": {
+                "networkProxy": { "localhost": 8080 }
             }
         }"#;
         let encoded = base64_encode(json.as_bytes());
@@ -2102,8 +2182,8 @@ mod tests {
         let json = r#"{
             "process": {"commandLine": "echo test"},
             "containment": "processcontainer",
-            "network": {
-                "proxy": { "url": "http://localhost:3128" }
+            "runtimeConfig": {
+                "networkProxy": { "url": "http://localhost:3128" }
             }
         }"#;
         let encoded = base64_encode(json.as_bytes());
@@ -2121,8 +2201,8 @@ mod tests {
         let json = r#"{
             "process": {"commandLine": "echo test"},
             "containment": "processcontainer",
-            "network": {
-                "proxy": { "url": "http://proxy.example.com:8080" }
+            "runtimeConfig": {
+                "networkProxy": { "url": "http://proxy.example.com:8080" }
             }
         }"#;
         let encoded = base64_encode(json.as_bytes());
@@ -2137,7 +2217,7 @@ mod tests {
     #[test]
     fn proxy_url_missing_port() {
         let json =
-            r#"{"process":{"commandLine":"x"},"network":{"proxy":{"url":"http://localhost"}}}"#;
+            r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":{"url":"http://localhost"}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -2150,8 +2230,8 @@ mod tests {
         let json = r#"{
             "process": {"commandLine": "echo test"},
             "containment": "processcontainer",
-            "network": {
-                "proxy": { "url": "http://[::1]:8080" }
+            "runtimeConfig": {
+                "networkProxy": { "url": "http://[::1]:8080" }
             }
         }"#;
         let encoded = base64_encode(json.as_bytes());
@@ -2187,7 +2267,7 @@ mod tests {
 
     #[test]
     fn proxy_rejected_with_non_processcontainer() {
-        let json = r#"{"process":{"commandLine":"x"},"containment":"lxc","network":{"proxy":{"localhost":8080}}}"#;
+        let json = r#"{"process":{"commandLine":"x"},"containment":"lxc","runtimeConfig":{"networkProxy":{"localhost":8080}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -2197,7 +2277,7 @@ mod tests {
 
     #[test]
     fn proxy_rejects_port_zero() {
-        let json = r#"{"process":{"commandLine":"x"},"network":{"proxy":{"localhost":0}}}"#;
+        let json = r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":{"localhost":0}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -2207,7 +2287,7 @@ mod tests {
 
     #[test]
     fn proxy_rejects_missing_localhost() {
-        let json = r#"{"process":{"commandLine":"x"},"network":{"proxy":{}}}"#;
+        let json = r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":{}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -2217,7 +2297,7 @@ mod tests {
 
     #[test]
     fn proxy_rejects_non_object() {
-        let json = r#"{"process":{"commandLine":"x"},"network":{"proxy":true}}"#;
+        let json = r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":true}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -2230,8 +2310,8 @@ mod tests {
         let json = r#"{
             "process": {"commandLine": "echo test"},
             "containment": "processcontainer",
-            "network": {
-                "proxy": { "builtinTestServer": true }
+            "runtimeConfig": {
+                "networkProxy": { "builtinTestServer": true }
             }
         }"#;
         let encoded = base64_encode(json.as_bytes());
@@ -2245,7 +2325,7 @@ mod tests {
 
     #[test]
     fn proxy_builtin_test_server_rejects_extra_keys() {
-        let json = r#"{"process":{"commandLine":"x"},"network":{"proxy":{"builtinTestServer":true,"localhost":8080}}}"#;
+        let json = r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":{"builtinTestServer":true,"localhost":8080}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -2256,7 +2336,7 @@ mod tests {
     #[test]
     fn proxy_builtin_test_server_rejects_false() {
         let json =
-            r#"{"process":{"commandLine":"x"},"network":{"proxy":{"builtinTestServer":false}}}"#;
+            r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":{"builtinTestServer":false}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -2266,8 +2346,8 @@ mod tests {
 
     #[test]
     fn proxy_builtin_test_server_rejected_with_non_processcontainer() {
-        // lxc is not allowed -- proxy is gated to processcontainer + bubblewrap.
-        let json = r#"{"process":{"commandLine":"x"},"containment":"lxc","network":{"proxy":{"builtinTestServer":true}}}"#;
+        // lxc is not allowed -- proxy is gated to processcontainer, bubblewrap, or seatbelt.
+        let json = r#"{"process":{"commandLine":"x"},"containment":"lxc","runtimeConfig":{"networkProxy":{"builtinTestServer":true}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -2281,7 +2361,7 @@ mod tests {
             "version": "0.6.0-alpha",
             "containment": "bubblewrap",
             "process": {"commandLine": "echo hi"},
-            "network": {"proxy": {"builtinTestServer": true}}
+            "runtimeConfig": {"networkProxy": {"builtinTestServer": true}}
         }"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
@@ -2297,7 +2377,7 @@ mod tests {
             "version": "0.7.0-alpha",
             "containment": "seatbelt",
             "process": {"commandLine": "echo hi"},
-            "network": {"proxy": {"builtinTestServer": true}}
+            "runtimeConfig": {"networkProxy": {"builtinTestServer": true}}
         }"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
@@ -2313,7 +2393,7 @@ mod tests {
             "version": "0.7.0-alpha",
             "containment": "seatbelt",
             "process": {"commandLine": "echo hi"},
-            "network": {"proxy": {"url": "http://127.0.0.1:8080"}}
+            "runtimeConfig": {"networkProxy": {"url": "http://127.0.0.1:8080"}}
         }"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
@@ -2754,7 +2834,7 @@ mod tests {
 
     #[test]
     fn nested_proxy_unknown_field_rejected() {
-        let json = r#"{"process": {"commandLine": "echo hi"}, "containment": "processcontainer", "network": {"proxy": {"localhost": 8080, "unexpected": true}}}"#;
+        let json = r#"{"process": {"commandLine": "echo hi"}, "containment": "processcontainer", "runtimeConfig": {"networkProxy": {"localhost": 8080, "unexpected": true}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 

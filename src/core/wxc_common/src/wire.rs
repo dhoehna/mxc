@@ -111,6 +111,9 @@ pub struct MxcConfig {
 
     /// Experimental features. Only honored when `--experimental` is passed.
     pub experimental: Option<Experimental>,
+
+    /// Runtime configuration applied to the launched container.
+    pub runtime_config: Option<RuntimeConfig>,
 }
 
 /// State-aware lifecycle phase.
@@ -431,6 +434,15 @@ pub struct Proxy {
     pub builtin_test_server: Option<bool>,
     /// Proxy URL (parsed into host:port).
     pub url: Option<String>,
+}
+
+/// Runtime configuration applied to the launched container.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// Network proxy the container's outbound traffic is routed through.
+    pub network_proxy: Option<Proxy>,
 }
 
 /// Cross-platform UI isolation policy.

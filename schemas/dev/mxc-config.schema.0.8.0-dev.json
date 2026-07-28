@@ -789,6 +789,54 @@
       },
       "type": "object"
     },
+    "Proxy": {
+      "additionalProperties": false,
+      "description": "Proxy configuration. Exactly one variant applies.",
+      "properties": {
+        "builtinTestServer": {
+          "description": "Have wxc launch its own built-in test proxy.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "localhost": {
+          "description": "External localhost proxy port.",
+          "maximum": 65535.0,
+          "minimum": 1.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "url": {
+          "description": "Proxy URL (parsed into host:port).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RuntimeConfig": {
+      "additionalProperties": false,
+      "description": "Runtime configuration applied to the launched container.",
+      "properties": {
+        "networkProxy": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Proxy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Network proxy the container's outbound traffic is routed through."
+        }
+      },
+      "type": "object"
+    },
     "Seatbelt": {
       "additionalProperties": false,
       "description": "macOS Seatbelt backend configuration.",
@@ -1151,6 +1199,17 @@
         }
       ],
       "description": "ProcessContainer-specific settings (Windows). Used when containment is `processcontainer`."
+    },
+    "runtimeConfig": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RuntimeConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Runtime configuration applied to the launched container."
     },
     "sandboxId": {
       "description": "Sandbox identifier returned by a prior provision request. Required for non-provision state-aware phases.",
