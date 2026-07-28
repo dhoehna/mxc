@@ -954,7 +954,8 @@ fn convert_wire_config(
                 || !policy.blocked_hosts.is_empty()
                 || policy.default_network_policy == NetworkPolicy::Block)
         {
-            let msg = "Bubblewrap: an external runtimeConfig.networkProxy (url/localhost) cannot be \
+            let msg =
+                "Bubblewrap: an external runtimeConfig.networkProxy (url/localhost) cannot be \
                        combined with allowedHosts, blockedHosts, or defaultPolicy='block'. \
                        The external proxy is expected to enforce its own host policy; \
                        MXC does not forward host lists to it. Use \
@@ -2477,8 +2478,7 @@ mod tests {
 
     #[test]
     fn proxy_url_missing_port() {
-        let json =
-            r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":{"url":"http://localhost"}}}"#;
+        let json = r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":{"url":"http://localhost"}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -2538,7 +2538,8 @@ mod tests {
 
     #[test]
     fn proxy_rejects_port_zero() {
-        let json = r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":{"localhost":0}}}"#;
+        let json =
+            r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":{"localhost":0}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -2596,8 +2597,7 @@ mod tests {
 
     #[test]
     fn proxy_builtin_test_server_rejects_false() {
-        let json =
-            r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":{"builtinTestServer":false}}}"#;
+        let json = r#"{"process":{"commandLine":"x"},"runtimeConfig":{"networkProxy":{"builtinTestServer":false}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
