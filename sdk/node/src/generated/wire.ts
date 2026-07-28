@@ -414,31 +414,13 @@ export interface ProcessContainerNetwork {
 }
 
 /**
- * Proxy configuration. Exactly one variant applies.
- */
-export interface Proxy {
-  /**
-   * Have wxc launch its own built-in test proxy.
-   */
-  builtinTestServer?: boolean | null;
-  /**
-   * External localhost proxy port.
-   */
-  localhost?: number | null;
-  /**
-   * Proxy URL (parsed into host:port).
-   */
-  url?: string | null;
-}
-
-/**
  * Runtime configuration applied to the launched container.
  */
 export interface RuntimeConfig {
   /**
-   * Network proxy the container's outbound traffic is routed through.
+   * Proxy URL the container's outbound traffic is routed through, e.g. `"http://127.0.0.1:8080"`. Per the GA network spec this is a bare URL string restricted to a loopback proxy: only `localhost:<port>`, `127.0.0.1:<port>` and `[::1]:<port>` are permitted.
    */
-  networkProxy?: Proxy | null;
+  networkProxy?: string | null;
 }
 
 /**

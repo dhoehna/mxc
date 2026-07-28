@@ -844,50 +844,16 @@
       },
       "type": "object"
     },
-    "Proxy": {
-      "additionalProperties": false,
-      "description": "Proxy configuration. Exactly one variant applies.",
-      "properties": {
-        "builtinTestServer": {
-          "description": "Have wxc launch its own built-in test proxy.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "localhost": {
-          "description": "External localhost proxy port.",
-          "maximum": 65535.0,
-          "minimum": 1.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "url": {
-          "description": "Proxy URL (parsed into host:port).",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
     "RuntimeConfig": {
       "additionalProperties": false,
       "description": "Runtime configuration applied to the launched container.",
       "properties": {
         "networkProxy": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Proxy"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Network proxy the container's outbound traffic is routed through."
+          "description": "Proxy URL the container's outbound traffic is routed through, e.g. `\"http://127.0.0.1:8080\"`. Per the GA network spec this is a bare URL string restricted to a loopback proxy: only `localhost:<port>`, `127.0.0.1:<port>` and `[::1]:<port>` are permitted.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"

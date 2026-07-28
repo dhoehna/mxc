@@ -467,27 +467,16 @@ pub enum NetworkEnforcement {
     Both,
 }
 
-/// Proxy configuration. Exactly one variant applies.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Proxy {
-    /// External localhost proxy port.
-    #[cfg_attr(feature = "schema-gen", schemars(range(min = 1, max = 65535)))]
-    pub localhost: Option<u16>,
-    /// Have wxc launch its own built-in test proxy.
-    pub builtin_test_server: Option<bool>,
-    /// Proxy URL (parsed into host:port).
-    pub url: Option<String>,
-}
-
 /// Runtime configuration applied to the launched container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeConfig {
-    /// Network proxy the container's outbound traffic is routed through.
-    pub network_proxy: Option<Proxy>,
+    /// Proxy URL the container's outbound traffic is routed through, e.g.
+    /// `"http://127.0.0.1:8080"`. Per the GA network spec this is a bare URL
+    /// string restricted to a loopback proxy: only `localhost:<port>`,
+    /// `127.0.0.1:<port>` and `[::1]:<port>` are permitted.
+    pub network_proxy: Option<String>,
 }
 
 /// Cross-platform UI isolation policy.

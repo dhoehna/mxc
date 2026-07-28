@@ -520,75 +520,50 @@ fn map_wire_containment(c: Option<&wire::Containment>) -> ContainmentBackend {
     }
 }
 
-fn convert_wire_proxy(proxy: wire::Proxy) -> Result<ProxyConfig, WxcError> {
-    // Destructure (no `..`) so a new wire field fails to compile until handled.
-    let wire::Proxy {
-        builtin_test_server,
-        localhost,
-        url,
-    } = proxy;
-    let mut proxy_addr = ProxyAddress::new("127.0.0.1".to_string(), 0);
+fn convert_wire_proxy(url_str: String) -> Result<ProxyConfig, WxcError> {
+    // GA `runtimeConfig.networkProxy` is a bare proxy URL string (e.g.
+    // "http://127.0.0.1:8080"), restricted to an http(s) proxy on the local
+    // loopback. The structured object / builtin test server form is not part of
+    // the GA wire contract.
+    let parsed = url::Url::parse(&url_str).map_err(|e| {
+        WxcError::ConfigParse(format!("runtimeConfig.networkProxy is not a valid URL: {e}"))
+    })?;
 
-    if let Some(builtin) = builtin_test_server {
-        if !builtin {
-            return Err(WxcError::ConfigParse(
-                "runtimeConfig.networkProxy.builtinTestServer must be true when present"
-                    .to_string(),
-            ));
-        }
-        if localhost.is_some() || url.is_some() {
-            return Err(WxcError::ConfigParse(
-                "When builtinTestServer is true, no other proxy options may be set".to_string(),
-            ));
-        }
-        return Ok(ProxyConfig {
-            address: Some(proxy_addr),
-            builtin_test_server: true,
-        });
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(WxcError::ConfigParse(format!(
+            "runtimeConfig.networkProxy must use the 'http' or 'https' scheme (got '{scheme}'): {url_str}"
+        )));
     }
 
-    if let Some(port) = localhost {
-        if port == 0 {
-            return Err(WxcError::ConfigParse(
-                "runtimeConfig.networkProxy.localhost must be a port between 1 and 65535"
-                    .to_string(),
-            ));
-        }
-        proxy_addr.port = port;
-        return Ok(ProxyConfig {
-            address: Some(proxy_addr),
-            builtin_test_server: false,
-        });
-    }
-
-    if let Some(url_str) = url {
-        let parsed = url::Url::parse(&url_str).map_err(|e| {
-            WxcError::ConfigParse(format!("runtimeConfig.networkProxy.url is invalid: {e}"))
-        })?;
-
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| {
-                WxcError::ConfigParse(format!(
-                    "runtimeConfig.networkProxy.url must include a host (e.g., http://localhost:8080), got: {url_str}"
-                ))
-            })?
-            .to_string();
-        let port = parsed.port().ok_or_else(|| {
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| {
             WxcError::ConfigParse(format!(
-                "runtimeConfig.networkProxy.url must include a port (e.g., http://localhost:8080), got: {url_str}"
+                "runtimeConfig.networkProxy must include a host (e.g., http://127.0.0.1:8080), got: {url_str}"
             ))
-        })?;
+        })?
+        .to_string();
 
-        return Ok(ProxyConfig {
-            address: Some(ProxyAddress::from_url(&url_str, host, port)),
-            builtin_test_server: false,
-        });
+    // Per GA, only a loopback proxy is permitted: localhost, 127.0.0.1 or [::1].
+    let host_norm = host.trim_start_matches('[').trim_end_matches(']');
+    if host_norm != "localhost" && host_norm != "127.0.0.1" && host_norm != "::1" {
+        return Err(WxcError::ConfigParse(format!(
+            "runtimeConfig.networkProxy must be a loopback proxy: only localhost:<port>, \
+             127.0.0.1:<port> and [::1]:<port> are allowed for GA (got host '{host}'): {url_str}"
+        )));
     }
 
-    Err(WxcError::ConfigParse(
-        "runtimeConfig.networkProxy must specify builtinTestServer, localhost, or url".to_string(),
-    ))
+    let port = parsed.port().ok_or_else(|| {
+        WxcError::ConfigParse(format!(
+            "runtimeConfig.networkProxy must include a port (e.g., http://127.0.0.1:8080), got: {url_str}"
+        ))
+    })?;
+
+    Ok(ProxyConfig {
+        address: Some(ProxyAddress::from_url(&url_str, host, port)),
+        builtin_test_server: false,
+    })
 }
 
 /// Validates a caller-specified `processContainer.captureDenials.outputPath`: it
