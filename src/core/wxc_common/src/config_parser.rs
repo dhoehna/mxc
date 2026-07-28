@@ -526,7 +526,9 @@ fn convert_wire_proxy(url_str: String) -> Result<ProxyConfig, WxcError> {
     // loopback. The structured object / builtin test server form is not part of
     // the GA wire contract.
     let parsed = url::Url::parse(&url_str).map_err(|e| {
-        WxcError::ConfigParse(format!("runtimeConfig.networkProxy is not a valid URL: {e}"))
+        WxcError::ConfigParse(format!(
+            "runtimeConfig.networkProxy is not a valid URL: {e}"
+        ))
     })?;
 
     let scheme = parsed.scheme();
