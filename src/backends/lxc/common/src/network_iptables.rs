@@ -6,7 +6,7 @@
 //!
 //! Implements the GA `ingress.hostLoopback` control for the LXC backend (and,
 //! when a netns target is supplied, Bubblewrap): host-to-container and
-//! external inbound traffic is dropped by default; `allowLocalNetwork` /
+//! external inbound traffic is dropped by default;
 //! `ingress.hostLoopback: "allow"` opens new inbound connections to the
 //! container's listening sockets.
 //!
@@ -24,7 +24,7 @@
 use std::process::Command;
 
 use wxc_common::logger::Logger;
-use wxc_common::models::{ContainerPolicy, NetworkEnforcementMode};
+use wxc_common::models::ContainerPolicy;
 
 /// Manages the container's inbound iptables `INPUT` chain.
 pub struct NetworkIptablesManager {
@@ -81,15 +81,13 @@ impl NetworkIptablesManager {
         policy: &ContainerPolicy,
         logger: &mut Logger,
     ) -> Result<bool, String> {
-        // Skip if network enforcement doesn't use a firewall.
-        let use_firewall = matches!(
-            policy.network_enforcement_mode,
-            NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-        );
-        if !use_firewall {
-            logger.log_line("Network enforcement mode does not use firewall, skipping iptables.");
-            return Ok(true);
-        }
+        // GA enforces LXC inbound as default-deny via the container's iptables
+        // INPUT chain, independent of any (legacy) enforcement mode: the chain is
+        // always applied, and `ingress.hostLoopback` only decides whether NEW
+        // inbound is accepted or dropped. The `network.enforcementMode` key was
+        // removed in the GA schema, so gating on `network_enforcement_mode` (now
+        // always its `Capabilities` default) would leave the inbound chain
+        // permanently disabled.
 
         if self.netns_pid.is_none() {
             // No container netns to target. Hooking the host's INPUT chain
@@ -136,7 +134,7 @@ impl NetworkIptablesManager {
     /// by the caller), so every packet it sees is destined *to a container
     /// socket*. Intra-container loopback and established/related return
     /// traffic always pass; a single `--state NEW` rule then accepts
-    /// (`allowLocalNetwork: true`) or drops (default) new inbound connections;
+    /// (`ingress.hostLoopback: "allow"`) or drops (default) new inbound connections;
     /// a terminal `DROP` makes inbound default-deny regardless of the egress
     /// policy. `hook` gates the `-I INPUT` jump so we never attach to the
     /// host's `INPUT` chain when there is no container netns to enter.
@@ -161,14 +159,32 @@ impl NetworkIptablesManager {
         // MUST precede the NEW-inbound decision below so container-initiated
         // flows survive an inbound DROP.
         rules.push(argv(&[
-            "-A", chain, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", accept,
+            "-A",
+            chain,
+            "-m",
+            "state",
+            "--state",
+            "ESTABLISHED,RELATED",
+            "-j",
+            accept,
         ]));
 
         // hostLoopback toggle: accept or drop NEW inbound connections to the
         // container's listening sockets.
-        let inbound_verb = if policy.allow_local_network { accept } else { drop };
+        let inbound_verb = if policy.allow_local_network {
+            accept
+        } else {
+            drop
+        };
         rules.push(argv(&[
-            "-A", chain, "-m", "state", "--state", "NEW", "-j", inbound_verb,
+            "-A",
+            chain,
+            "-m",
+            "state",
+            "--state",
+            "NEW",
+            "-j",
+            inbound_verb,
         ]));
 
         // Ingress default-deny: host/external inbound is blocked by default
@@ -380,7 +396,14 @@ mod tests {
         let est = pos(
             &rules,
             &[
-                "-A", "MXC-t", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT",
+                "-A",
+                "MXC-t",
+                "-m",
+                "state",
+                "--state",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
             ],
         )
         .expect("ESTABLISHED,RELATED rule must be emitted");
@@ -400,7 +423,9 @@ mod tests {
         let rules = build(true, true);
         let new = pos(
             &rules,
-            &["-A", "MXC-t", "-m", "state", "--state", "NEW", "-j", "ACCEPT"],
+            &[
+                "-A", "MXC-t", "-m", "state", "--state", "NEW", "-j", "ACCEPT",
+            ],
         )
         .expect("NEW rule must be emitted");
         let def =
@@ -467,6 +492,9 @@ mod tests {
     #[test]
     fn chain_is_created_first() {
         let rules = build(false, true);
-        assert!(is(&rules[0], &["-N", "MXC-t"]), "chain must be created first");
+        assert!(
+            is(&rules[0], &["-N", "MXC-t"]),
+            "chain must be created first"
+        );
     }
 }

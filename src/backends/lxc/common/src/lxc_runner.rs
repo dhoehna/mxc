@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use wxc_common::logger::Logger;
 use wxc_common::models::{
-    ExecutionRequest, LifecycleConfig, LxcConfig, NetworkEnforcementMode, ScriptResponse,
+    ExecutionRequest, LifecycleConfig, LxcConfig, ScriptResponse,
 };
 use wxc_common::script_runner::ScriptRunner;
 
@@ -192,13 +192,12 @@ impl LxcScriptRunner {
             let _ = writeln!(logger, "Container already running.");
         }
 
-        // Wait for network only when the config uses network features (firewall rules
-        // or allowed/blocked hosts).
-        let needs_network = matches!(
-            request.policy.network_enforcement_mode,
-            NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-        ) || !request.policy.allowed_hosts.is_empty()
-            || !request.policy.blocked_hosts.is_empty();
+        // Wait for the container's network (veth IP) to come up only when the GA
+        // policy makes it reachable for host inbound (`ingress.hostLoopback:
+        // allow`). The legacy `enforcementMode` / allowed/blocked-host keys were
+        // removed from the GA schema, so inbound is the only network feature that
+        // needs a ready interface here.
+        let needs_network = request.policy.allow_local_network;
 
         if needs_network {
             Self::wait_for_network(&container_name, Duration::from_secs(10), logger);
