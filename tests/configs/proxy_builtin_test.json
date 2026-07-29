@@ -16,11 +16,7 @@
       "C:\\Users\\AdminUser\\AppData\\Local\\Programs"
     ]
   },
-  "network": {
-    "proxy": {
-      "builtinTestServer": true
-    }
-  },
+  "network": {},
   "ui": {
     "disable": false
   }

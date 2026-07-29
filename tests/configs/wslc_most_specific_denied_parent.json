@@ -10,7 +10,9 @@
     "deniedPaths": ["C:\\wslcmsp\\data"]
   },
   "network": {
-    "defaultPolicy": "allow"
+    "egress": {
+      "default": "allow"
+    }
   },
   "experimental": {
     "wslc": {

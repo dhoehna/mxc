@@ -5,9 +5,7 @@
   "process": {
     "commandLine": "python3 -c \"import sys, platform; print(f'Hello from Python {sys.version}'); print(f'Platform: {platform.platform()}'); print('Script executed successfully in WSL Container')\""
   },
-  "network": {
-    "defaultPolicy": "block"
-  },
+  "network": {},
   "experimental": {
     "wslc": {
       "image": "python:3.12-alpine"

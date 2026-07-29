@@ -5,10 +5,5 @@
   "process": {
     "commandLine": "wget -qO- https://api.github.com/zen"
   },
-  "network": {
-    "defaultPolicy": "block",
-    "enforcementMode": "firewall",
-    "allowedHosts": ["api.github.com"],
-    "blockedHosts": ["evil.example.com"]
-  }
+  "network": {}
 }

@@ -9,7 +9,5 @@
   "processContainer": {
     "capabilities": ["internetClient"]
   },
-  "network": {
-    "proxy": { "builtinTestServer": true }
-  }
+  "network": {}
 }
