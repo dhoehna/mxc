@@ -900,6 +900,18 @@ enforced; access denials are recorded for diagnostics.\n",
         }
     }
 
+    // GA inbound policy: map `network.ingress.hostLoopback` onto the domain
+    // `allow_local_network` flag consumed by the LXC INPUT-chain builder
+    // (`network_iptables.rs`) and the Seatbelt inbound rule. `allow` opens
+    // host->sandbox loopback; `deny` or an absent `ingress` preserves the
+    // default-deny posture. Outbound `egress` mapping is tracked separately.
+    if let Some(net) = cfg.network.as_ref() {
+        if let Some(ingress) = net.ingress.as_ref() {
+            policy.allow_local_network =
+                matches!(ingress.host_loopback, Some(wire::HostLoopbackPolicy::Allow));
+        }
+    }
+
     // Backend compatibility guards for the network proxy. The proxy is read above
     // from `runtimeConfig.networkProxy`; these guards reject proxy + enforcement
     // combinations a backend cannot honor.
@@ -2651,17 +2663,29 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "AB#62830582: legacy network/proxy schema, re-enable after parser/SDK test migration"]
-    fn network_allow_local_network() {
+    fn network_ingress_host_loopback_allow() {
         let json = r#"{
             "process": {"commandLine": "print('test')"},
-            "network": {"allowLocalNetwork": true}
+            "network": {"ingress": {"hostLoopback": "allow"}}
         }"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
         let req = load_request(&encoded, &mut logger, true).unwrap();
         assert!(req.policy.allow_local_network);
+    }
+
+    #[test]
+    fn network_ingress_host_loopback_deny() {
+        let json = r#"{
+            "process": {"commandLine": "print('test')"},
+            "network": {"ingress": {"hostLoopback": "deny"}}
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert!(!req.policy.allow_local_network);
     }
 
     #[test]

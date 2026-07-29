@@ -16,8 +16,8 @@
     "readonlyPaths": ["/opt/mxc-netcheck"]
   },
   "network": {
-    "defaultPolicy": "block",
-    "enforcementMode": "firewall",
-    "allowLocalNetwork": true
+    "ingress": {
+      "hostLoopback": "allow"
+    }
   }
 }
