@@ -1,5 +1,5 @@
 #!/bin/bash
-# Behavioral + rule-level test for the LXC backend `network.ingress.hostLoopback` policy.
+# Behavioral + rule-level test for the LXC backend `allowLocalNetwork` field.
 #
 # Two independent layers are reported per config:
 #
@@ -7,8 +7,8 @@
 #       Runs each config, dumps the container's iptables chain from INSIDE the
 #       container's network namespace (via `nsenter -t <init-pid> -n`), and
 #       asserts the NEW-inbound decision that actually enforces the field:
-#           hostLoopback: allow       =>  -m state --state NEW -j ACCEPT
-#           hostLoopback: deny/absent =>  -m state --state NEW -j DROP  (default)
+#           allowLocalNetwork: true   =>  -m state --state NEW -j ACCEPT
+#           allowLocalNetwork: absent =>  -m state --state NEW -j DROP  (default)
 #       It also asserts loopback is an UNCONDITIONAL accept (`-i lo -j ACCEPT`)
 #       in both cases. The chain is hooked into the container's INPUT chain, so
 #       it governs NEW connections *destined to the container's sockets* — from
@@ -23,8 +23,8 @@
 #       `netcheck connect` against the server's IP. Peer->server traffic is
 #       inbound to the server container and therefore traverses the server's
 #       INPUT chain, so the NEW-inbound rule applies:
-#           hostLoopback: allow       =>  reachable
-#           hostLoopback: deny/absent =>  blocked
+#           allowLocalNetwork: true   =>  reachable
+#           allowLocalNetwork: absent =>  blocked
 #       Under the INPUT design a host->container-direct probe is now governed
 #       too (host-originated packets reach the container's INPUT); the peer
 #       container is kept as a representative external-inbound client. If the
@@ -98,9 +98,9 @@ write_client_config() {
     "readonlyPaths": ["$HELPER_DIR"]
   },
   "network": {
-    "ingress": {
-      "hostLoopback": "allow"
-    }
+    "defaultPolicy": "block",
+    "enforcementMode": "firewall",
+    "allowLocalNetwork": true
   }
 }
 EOF
@@ -155,7 +155,7 @@ run_case() {
         rule_ok=0
         echo "[RULE] FAIL  $chain NEW-inbound verb=$verb (expected $expect_verb)"
     fi
-    # Loopback must be an unconditional ACCEPT regardless of hostLoopback.
+    # Loopback must be an unconditional ACCEPT regardless of allowLocalNetwork.
     if ! echo "$dump" | grep -q -- '-i lo -j ACCEPT'; then
         rule_ok=0
         echo "[RULE] FAIL  $chain missing unconditional '-i lo -j ACCEPT'"
@@ -207,9 +207,9 @@ run_case() {
     wait "$mxc_pid" 2>/dev/null
 }
 
-run_case "hostLoopback: allow  (expect NEW ACCEPT, reachable)" \
+run_case "allowLocalNetwork: TRUE  (expect NEW ACCEPT, reachable)" \
     "$CONFIG_DIR/lxc_local_network_allow.json" "lxc-localnet-allow" "ACCEPT" "yes"
-run_case "hostLoopback: deny   (expect NEW DROP, blocked)" \
+run_case "allowLocalNetwork: FALSE (expect NEW DROP, blocked)" \
     "$CONFIG_DIR/lxc_local_network_deny.json" "lxc-localnet-deny" "DROP" "no"
 
 echo
