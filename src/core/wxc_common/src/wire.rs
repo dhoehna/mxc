@@ -35,7 +35,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schema-gen", schemars(title = "MXC Configuration"))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    expecting = "a configuration object"
+)]
 pub struct MxcConfig {
     /// Optional JSON Schema reference for editor validation. Accepted but
     /// ignored by the parser.
@@ -111,6 +115,9 @@ pub struct MxcConfig {
 
     /// Experimental features. Only honored when `--experimental` is passed.
     pub experimental: Option<Experimental>,
+
+    /// Runtime configuration applied to the launched container.
+    pub runtime_config: Option<RuntimeConfig>,
 }
 
 /// State-aware lifecycle phase.
@@ -189,12 +196,72 @@ pub struct Lifecycle {
 pub struct ProcessContainer {
     /// Enforce least-privilege mode.
     pub least_privilege: Option<bool>,
-    /// AppContainer permissive learning mode.
+    /// AppContainer learning mode (deny-and-record): failed access checks are
+    /// logged for diagnostics while the accesses stay denied; containment is
+    /// unchanged. Distinct from the allow-all `permissiveLearningMode`
+    /// capability, which is injected internally by the `--audit` CLI flag or
+    /// dedicated denial-capture configuration.
     pub learning_mode: Option<bool>,
     /// AppContainer capabilities (e.g. `internetClient`, `registryRead`).
+    /// Each array entry must contain exactly one capability name; commas are
+    /// rejected because BaseContainer uses commas as its wire delimiter.
+    /// `learningModeLogging` and `permissiveLearningMode` are reserved and
+    /// rejected here; use `learningMode`, `--audit`, or the dedicated denial
+    /// capture configuration instead.
     pub capabilities: Option<Vec<String>>,
+    /// Windows denial capture. When present, the runner records the sandboxed
+    /// process's access attempts to a learning-mode ETL trace for later
+    /// inspection. Requires a host that exposes the learning-mode OS API.
+    pub capture_denials: Option<CaptureDenials>,
     /// BaseProcessContainer UI settings (Windows).
     pub ui: Option<BaseProcessUi>,
+    /// Network settings specific to the processcontainer backend (loopback
+    /// peer exemptions). Distinct from the shared top-level `network` policy.
+    pub network: Option<ProcessContainerNetwork>,
+}
+
+/// ProcessContainer-specific network settings (Windows).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProcessContainerNetwork {
+    /// AppContainer friendly names whose loopback traffic is exempted (for
+    /// example a caller-provided proxy container). MXC resolves each friendly
+    /// name to a SID at launch to scope the loopback exemption rules.
+    #[serde(default)]
+    pub allowed_peers: Vec<String>,
+}
+
+/// Windows denial-capture settings. The presence of the `captureDenials`
+/// object enables capture; all fields are optional.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureDenials {
+    /// How each ungranted access check is handled while it is recorded. Both
+    /// modes log every access the policy does not grant to the ETL trace; the
+    /// mode only decides whether that access is blocked or allowed. Defaults to
+    /// `block` when omitted.
+    pub mode: Option<CaptureDenialsMode>,
+    /// Absolute path where the denial ETL trace is written. The caller names
+    /// the path; the OS opens it under the caller's own identity when the trace
+    /// is sealed. When omitted, MXC writes the trace to a managed per-run
+    /// temporary file. The parent directory must already exist.
+    pub output_path: Option<String>,
+}
+
+/// How `captureDenials` handles each ungranted access check while recording it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureDenialsMode {
+    /// `block` — the access stays **denied** and the denial is recorded.
+    /// Deny-by-default containment is preserved; this is the safe default.
+    Block,
+    /// `allow` — the access is **allowed** and recorded (audit mode).
+    /// This relaxes deny-by-default for the run, so it is a security-sensitive
+    /// choice and the runner emits a security warning.
+    Allow,
 }
 
 /// BaseProcessContainer UI isolation settings.
@@ -273,18 +340,113 @@ pub struct Fallback {
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Network {
-    /// Default outbound policy when no host rule matches.
-    pub default_policy: Option<NetworkPolicy>,
-    /// How the policy is enforced.
-    pub enforcement_mode: Option<NetworkEnforcement>,
-    /// Allow binding/listening on local IPs and accepting inbound connections.
-    pub allow_local_network: Option<bool>,
-    /// Hosts explicitly allowed.
-    pub allowed_hosts: Option<Vec<String>>,
-    /// Hosts explicitly blocked.
-    pub blocked_hosts: Option<Vec<String>>,
-    /// Proxy configuration (one of localhost / builtinTestServer / url).
-    pub proxy: Option<Proxy>,
+    /// Outbound policy rules.
+    pub egress: Option<NetworkEgress>,
+    /// Inbound policy.
+    pub ingress: Option<NetworkIngress>,
+}
+
+/// Outbound policy rule set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkEgress {
+    /// Rules that allow matching outbound connections.
+    #[serde(default)]
+    pub allow: Vec<NetworkRules>,
+    /// Rules that deny matching outbound connections.
+    #[serde(default)]
+    pub deny: Vec<NetworkRules>,
+    /// Default outbound action when no egress rule matches (`allow` or `deny`).
+    /// When omitted, defaults to `deny` (fail-closed). Setting `default: "allow"`
+    /// expresses the "allow everything except this deny-list" model; when
+    /// egress is present it supersedes the legacy `defaultPolicy`.
+    #[serde(rename = "default")]
+    pub default_action: Option<EgressDefault>,
+}
+
+/// Egress default outbound action applied when no egress rule matches.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum EgressDefault {
+    Allow,
+    Deny,
+}
+
+/// Outbound policy rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkRules {
+    /// Destination CIDR ranges or bare IP addresses. DNS hostnames are rejected by the parser.
+    pub to: Vec<NetworkDestination>,
+    /// Destination ports and protocols. When omitted or empty, the rule matches
+    /// all ports and all protocols to the listed destinations.
+    #[serde(default)]
+    pub ports: Vec<NetworkPort>,
+}
+
+/// Outbound destination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkDestination {
+    /// IPv4/IPv6 CIDR range, or a bare IP address.
+    pub cidr: String,
+    /// Optional CIDR exclusions carved out of `cidr` (Kubernetes `ipBlock.except`
+    /// style). Traffic to these ranges does not match this destination.
+    #[serde(default)]
+    pub except: Vec<String>,
+}
+
+/// Outbound port selector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkPort {
+    /// Transport protocol.
+    pub protocol: NetworkProtocol,
+    /// Destination port. Must be omitted for `icmp` (which has no ports); the
+    /// parser rejects a port paired with `icmp`. When omitted for `tcp`/`udp`
+    /// the selector matches all ports for that protocol. Acts as the start of an
+    /// inclusive range when `endPort` is also set.
+    #[cfg_attr(feature = "schema-gen", schemars(range(min = 1, max = 65535)))]
+    pub port: Option<u16>,
+    /// End of an inclusive destination port range. When set, the selector matches
+    /// `port..=endPort` and requires `port` with `endPort >= port`.
+    #[cfg_attr(feature = "schema-gen", schemars(range(min = 1, max = 65535)))]
+    pub end_port: Option<u16>,
+}
+
+/// Outbound transport protocol. `any` matches every protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkProtocol {
+    Tcp,
+    Udp,
+    Icmp,
+    Any,
+}
+
+/// Inbound policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkIngress {
+    /// Whether host loopback can connect inbound to the sandbox.
+    #[serde(rename = "hostLoopback")]
+    pub host_loopback: Option<HostLoopbackPolicy>,
+}
+
+/// Host loopback ingress policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum HostLoopbackPolicy {
+    Allow,
+    Deny,
 }
 
 /// Default network policy.
@@ -309,18 +471,16 @@ pub enum NetworkEnforcement {
     Both,
 }
 
-/// Proxy configuration. Exactly one variant applies.
+/// Runtime configuration applied to the launched container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Proxy {
-    /// External localhost proxy port.
-    #[cfg_attr(feature = "schema-gen", schemars(range(min = 1, max = 65535)))]
-    pub localhost: Option<u16>,
-    /// Have wxc launch its own built-in test proxy.
-    pub builtin_test_server: Option<bool>,
-    /// Proxy URL (parsed into host:port).
-    pub url: Option<String>,
+pub struct RuntimeConfig {
+    /// Proxy URL the container's outbound traffic is routed through, e.g.
+    /// `"http://127.0.0.1:8080"`. Per the GA network spec this is a bare URL
+    /// string restricted to a loopback proxy: only `localhost:<port>`,
+    /// `127.0.0.1:<port>` and `[::1]:<port>` are permitted.
+    pub network_proxy: Option<String>,
 }
 
 /// Cross-platform UI isolation policy.
@@ -386,6 +546,8 @@ pub enum LaunchMethod {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 pub struct Experimental {
+    // Keep every direct field optional: state-aware parsing temporarily
+    // substitutes `{}` while validating cross-cutting fields from source text.
     /// Placeholder feature for testing experimental infrastructure.
     pub test: Option<TestFeature>,
     /// Windows Sandbox backend config.
@@ -452,9 +614,9 @@ pub struct Wslc {
     pub gpu: Option<bool>,
     /// Storage path override.
     pub storage_path: Option<String>,
-    /// Host → container port forwards. Only TCP is currently supported by the
-    /// vendored WSLC SDK runtime (Microsoft.WSL.Containers 2.8.1); the parser
-    /// rejects `udp` because the shipped runtime returns `E_NOTIMPL`.
+    /// Host → container port forwards. Only TCP is currently supported; the
+    /// parser rejects `udp` because the WSLC SDK runtime returns `E_NOTIMPL`
+    /// for UDP port mappings.
     pub port_mappings: Option<Vec<PortMapping>>,
 }
 

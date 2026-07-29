@@ -23,9 +23,7 @@
             "~"
         ]
     },
-    "network": {
-        "defaultPolicy": "block"
-    },
+    "network": {},
     "seatbelt": {
         "guiAccess": true,
         "launchMethod": "open"

@@ -5,7 +5,5 @@
   "process": {
     "commandLine": "wget -qO- --timeout=3 https://api.github.com/zen 2>&1 || echo 'Network correctly blocked'"
   },
-  "network": {
-    "defaultPolicy": "block"
-  }
+  "network": {}
 }

@@ -6,9 +6,7 @@
         "commandLine": "/bin/sh -c 'echo sandbox_clip_test | /usr/bin/pbcopy; /usr/bin/pbpaste'",
         "timeout": 10000
     },
-    "network": {
-        "defaultPolicy": "block"
-    },
+    "network": {},
     "ui": {
         "disable": false,
         "clipboard": "all"

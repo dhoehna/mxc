@@ -6,7 +6,9 @@
     "commandLine": "echo 'Image pulled from GHCR' && cat /etc/alpine-release"
   },
   "network": {
-    "defaultPolicy": "allow"
+    "egress": {
+      "default": "allow"
+    }
   },
   "experimental": {
     "wslc": {

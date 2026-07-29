@@ -38,6 +38,25 @@ export interface BaseProcessUi {
 }
 
 /**
+ * Windows denial-capture settings. The presence of the `captureDenials` object enables capture; all fields are optional.
+ */
+export interface CaptureDenials {
+  /**
+   * How each ungranted access check is handled while it is recorded. Both modes log every access the policy does not grant to the ETL trace; the mode only decides whether that access is blocked or allowed. Defaults to `block` when omitted.
+   */
+  mode?: CaptureDenialsMode | null;
+  /**
+   * Absolute path where the denial ETL trace is written. The caller names the path; the OS opens it under the caller's own identity when the trace is sealed. When omitted, MXC writes the trace to a managed per-run temporary file. The parent directory must already exist.
+   */
+  outputPath?: string | null;
+}
+
+/**
+ * How `captureDenials` handles each ungranted access check while recording it.
+ */
+export type CaptureDenialsMode = "block" | "allow";
+
+/**
  * Clipboard access level.
  */
 export type ClipboardPolicy = "none" | "read" | "write" | "all";
@@ -46,6 +65,11 @@ export type ClipboardPolicy = "none" | "read" | "write" | "all";
  * Containment backend (abstract intent or concrete backend).
  */
 export type Containment = "process" | "processcontainer" | "vm" | "windows_sandbox" | "lxc" | "microvm" | "hyperlight" | "wslc" | "seatbelt" | "isolation_session" | "bubblewrap";
+
+/**
+ * Egress default outbound action applied when no egress rule matches.
+ */
+export type EgressDefault = "allow" | "deny";
 
 /**
  * Experimental features (only honored with `--experimental`). This block is intentionally **permissive** (no `deny_unknown_fields`): experimental backends are in flux, so the schema documents the known shapes for editor help without rejecting in-progress fields. The strict, closed contract is the stable (top-level) surface.
@@ -105,6 +129,11 @@ export interface Filesystem {
    */
   readwritePaths?: string[] | null;
 }
+
+/**
+ * Host loopback ingress policy.
+ */
+export type HostLoopbackPolicy = "allow" | "deny";
 
 /**
  * IsolationSession sizing profile.
@@ -210,40 +239,93 @@ export interface Lxc {
  */
 export interface Network {
   /**
-   * Allow binding/listening on local IPs and accepting inbound connections.
+   * Outbound policy rules.
    */
-  allowLocalNetwork?: boolean | null;
+  egress?: NetworkEgress | null;
   /**
-   * Hosts explicitly allowed.
+   * Inbound policy.
    */
-  allowedHosts?: string[] | null;
-  /**
-   * Hosts explicitly blocked.
-   */
-  blockedHosts?: string[] | null;
-  /**
-   * Default outbound policy when no host rule matches.
-   */
-  defaultPolicy?: NetworkPolicy | null;
-  /**
-   * How the policy is enforced.
-   */
-  enforcementMode?: NetworkEnforcement | null;
-  /**
-   * Proxy configuration (one of localhost / builtinTestServer / url).
-   */
-  proxy?: Proxy | null;
+  ingress?: NetworkIngress | null;
 }
 
 /**
- * Network enforcement mechanism.
+ * Outbound destination.
  */
-export type NetworkEnforcement = "capabilities" | "firewall" | "both";
+export interface NetworkDestination {
+  /**
+   * IPv4/IPv6 CIDR range, or a bare IP address.
+   */
+  cidr: string;
+  /**
+   * Optional CIDR exclusions carved out of `cidr` (Kubernetes `ipBlock.except` style). Traffic to these ranges does not match this destination.
+   */
+  except?: string[];
+}
 
 /**
- * Default network policy.
+ * Outbound policy rule set.
  */
-export type NetworkPolicy = "allow" | "block";
+export interface NetworkEgress {
+  /**
+   * Rules that allow matching outbound connections.
+   */
+  allow?: NetworkRules[];
+  /**
+   * Default outbound action when no egress rule matches (`allow` or `deny`). When omitted, defaults to `deny` (fail-closed). Setting `default: "allow"` expresses the "allow everything except this deny-list" model; when egress is present it supersedes the legacy `defaultPolicy`.
+   */
+  default?: EgressDefault | null;
+  /**
+   * Rules that deny matching outbound connections.
+   */
+  deny?: NetworkRules[];
+}
+
+/**
+ * Inbound policy.
+ */
+export interface NetworkIngress {
+  /**
+   * Whether host loopback can connect inbound to the sandbox.
+   */
+  hostLoopback?: HostLoopbackPolicy | null;
+}
+
+/**
+ * Outbound port selector.
+ */
+export interface NetworkPort {
+  /**
+   * End of an inclusive destination port range. When set, the selector matches `port..=endPort` and requires `port` with `endPort >= port`.
+   */
+  endPort?: number | null;
+  /**
+   * Destination port. Must be omitted for `icmp` (which has no ports); the parser rejects a port paired with `icmp`. When omitted for `tcp`/`udp` the selector matches all ports for that protocol. Acts as the start of an inclusive range when `endPort` is also set.
+   */
+  port?: number | null;
+  /**
+   * Transport protocol.
+   */
+  protocol: unknown;
+}
+
+/**
+ * Outbound transport protocol. `any` matches every protocol.
+ */
+export type NetworkProtocol = "tcp" | "udp" | "icmp" | "any";
+
+/**
+ * Outbound policy rule.
+ */
+export interface NetworkRules {
+  /**
+   * Destination ports and protocols. When omitted or empty, the rule matches all ports and all protocols to the listed destinations.
+   */
+  ports?: NetworkPort[];
+  /**
+   * Destination CIDR ranges or bare IP addresses. DNS hostnames are rejected by the parser.
+   */
+  to: NetworkDestination[];
+}
 
 /**
  * State-aware lifecycle phase.
@@ -296,11 +378,15 @@ export interface Process {
  */
 export interface ProcessContainer {
   /**
-   * AppContainer capabilities (e.g. `internetClient`, `registryRead`).
+   * AppContainer capabilities (e.g. `internetClient`, `registryRead`). Each array entry must contain exactly one capability name; commas are rejected because BaseContainer uses commas as its wire delimiter. `learningModeLogging` and `permissiveLearningMode` are reserved and rejected here; use `learningMode`, `--audit`, or the dedicated denial capture configuration instead.
    */
   capabilities?: string[] | null;
   /**
-   * AppContainer permissive learning mode.
+   * Windows denial capture. When present, the runner records the sandboxed process's access attempts to a learning-mode ETL trace for later inspection. Requires a host that exposes the learning-mode OS API.
+   */
+  captureDenials?: CaptureDenials | null;
+  /**
+   * AppContainer learning mode (deny-and-record): failed access checks are logged for diagnostics while the accesses stay denied; containment is unchanged. Distinct from the allow-all `permissiveLearningMode` capability, which is injected internally by the `--audit` CLI flag or dedicated denial-capture configuration.
    */
   learningMode?: boolean | null;
   /**
@@ -308,27 +394,33 @@ export interface ProcessContainer {
    */
   leastPrivilege?: boolean | null;
   /**
+   * Network settings specific to the processcontainer backend (loopback peer exemptions). Distinct from the shared top-level `network` policy.
+   */
+  network?: ProcessContainerNetwork | null;
+  /**
    * BaseProcessContainer UI settings (Windows).
    */
   ui?: BaseProcessUi | null;
 }
 
 /**
- * Proxy configuration. Exactly one variant applies.
+ * ProcessContainer-specific network settings (Windows).
  */
-export interface Proxy {
+export interface ProcessContainerNetwork {
   /**
-   * Have wxc launch its own built-in test proxy.
+   * AppContainer friendly names whose loopback traffic is exempted (for example a caller-provided proxy container). MXC resolves each friendly name to a SID at launch to scope the loopback exemption rules.
    */
-  builtinTestServer?: boolean | null;
+  allowedPeers?: string[];
+}
+
+/**
+ * Runtime configuration applied to the launched container.
+ */
+export interface RuntimeConfig {
   /**
-   * External localhost proxy port.
+   * Proxy URL the container's outbound traffic is routed through, e.g. `"http://127.0.0.1:8080"`. Per the GA network spec this is a bare URL string restricted to a loopback proxy: only `localhost:<port>`, `127.0.0.1:<port>` and `[::1]:<port>` are permitted.
    */
-  localhost?: number | null;
-  /**
-   * Proxy URL (parsed into host:port).
-   */
-  url?: string | null;
+  networkProxy?: string | null;
 }
 
 /**
@@ -455,7 +547,7 @@ export interface Wslc {
    */
   memoryMb?: number | null;
   /**
-   * Host → container port forwards. Only TCP is currently supported by the vendored WSLC SDK runtime (Microsoft.WSL.Containers 2.8.1); the parser rejects `udp` because the shipped runtime returns `E_NOTIMPL`.
+   * Host → container port forwards. Only TCP is currently supported; the parser rejects `udp` because the WSLC SDK runtime returns `E_NOTIMPL` for UDP port mappings.
    */
   portMappings?: PortMapping[] | null;
   /**
@@ -529,6 +621,10 @@ export interface MXCConfiguration {
    * ProcessContainer-specific settings (Windows). Used when containment is `processcontainer`.
    */
   processContainer?: ProcessContainer | null;
+  /**
+   * Runtime configuration applied to the launched container.
+   */
+  runtimeConfig?: RuntimeConfig | null;
   /**
    * Sandbox identifier returned by a prior provision request. Required for non-provision state-aware phases.
    */

@@ -14,10 +14,5 @@
             "/Users"
         ]
     },
-    "network": {
-        "defaultPolicy": "block",
-        "allowedHosts": [
-            "api.github.com"
-        ]
-    }
+    "network": {}
 }
