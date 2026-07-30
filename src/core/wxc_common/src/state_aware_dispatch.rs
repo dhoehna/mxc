@@ -122,6 +122,11 @@ pub fn dispatch_state_aware<B: StatefulSandboxBackend>(
         Phase::Exec => {
             let sandbox_id = parsed.sandbox_id_required()?.to_string();
             let config = parsed.deserialize_config::<B::ExecConfig>(B::BACKEND_KEY, "exec")?;
+            // Everything needed for exec is now owned (`request` clone, owned
+            // `sandbox_id`, owned `config`); drop the parsed request so its
+            // retained decoded source text and raw `experimental` tree are not
+            // held for the (potentially long) blocking child run + stdio relay.
+            drop(parsed);
             validate_exec_common(&request)?;
             backend.validate_exec(&sandbox_id, &request, config.as_ref())?;
             if dry_run {
@@ -497,6 +502,7 @@ mod tests {
             sandbox_id: sandbox_id.map(String::from),
             correlation_vector: None,
             experimental_raw: exp,
+            source_text: None,
         }
     }
 
@@ -658,6 +664,12 @@ mod tests {
         let p = parsed(Phase::Start, Some("typed:abc"), Some(exp));
         let err = dispatch_state_aware(&mut b, p, false).unwrap_err();
         assert_eq!(err.code, MxcErrorCode::MalformedRequest);
+        assert!(
+            err.message.contains("experimental.typed_stub.start"),
+            "expected envelope-ready error path, got: {}",
+            err.message
+        );
+        assert_eq!(b.captured_start_config.into_inner(), None);
     }
 
     // ---------- run_state_aware / resolve_backend ----------
@@ -673,6 +685,7 @@ mod tests {
             sandbox_id: None,
             correlation_vector: None,
             experimental_raw: None,
+            source_text: None,
         };
         let err = run_state_aware(p, false).unwrap_err();
         assert_eq!(err.code, MxcErrorCode::UnsupportedPhase);
@@ -687,6 +700,7 @@ mod tests {
             sandbox_id: None,
             correlation_vector: None,
             experimental_raw: None,
+            source_text: None,
         };
         let err = run_state_aware(p, false).unwrap_err();
         assert_eq!(err.code, MxcErrorCode::MalformedRequest);
@@ -701,6 +715,7 @@ mod tests {
             sandbox_id: Some("iso:wxc-abcd1234".into()),
             correlation_vector: None,
             experimental_raw: None,
+            source_text: None,
         };
         assert_eq!(
             resolve_backend(&p).unwrap(),
@@ -717,6 +732,7 @@ mod tests {
             sandbox_id: Some("lxc:mxc-abcd1234".into()),
             correlation_vector: None,
             experimental_raw: None,
+            source_text: None,
         };
         assert_eq!(resolve_backend(&p).unwrap(), ContainmentBackend::Lxc);
     }
@@ -730,6 +746,7 @@ mod tests {
             sandbox_id: Some("wsb:deadbeef".into()),
             correlation_vector: None,
             experimental_raw: None,
+            source_text: None,
         };
         assert_eq!(
             resolve_backend(&p).unwrap(),
@@ -746,6 +763,7 @@ mod tests {
             sandbox_id: Some("unknownxyz:abc".into()),
             correlation_vector: None,
             experimental_raw: None,
+            source_text: None,
         };
         let err = resolve_backend(&p).unwrap_err();
         assert_eq!(err.code, MxcErrorCode::UnsupportedContainment);
@@ -760,6 +778,7 @@ mod tests {
             sandbox_id: Some("no-colon".into()),
             correlation_vector: None,
             experimental_raw: None,
+            source_text: None,
         };
         let err = resolve_backend(&p).unwrap_err();
         assert_eq!(err.code, MxcErrorCode::MalformedId);

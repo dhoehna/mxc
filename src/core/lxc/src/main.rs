@@ -130,6 +130,15 @@ fn run_state_aware_main(
     // rather than calling dispatch directly, so a Linux lifecycle emits the same
     // events, carries the same MS-CV, and installs the same crash hook.
     let outcome = mxc_engine::run_state_aware_with_telemetry(parsed, dry_run, experimental, logger);
+
+    // Mirrors the wxc executor: on dispatch failure the error goes only to the
+    // auxiliary diagnostic sinks (log file / diagnostic pipe), never the primary
+    // buffer/stderr, so the stdout error envelope stays the single client-facing
+    // channel and is not shadowed by a duplicate on stderr.
+    if let Err(error) = &outcome {
+        logger.log_diagnostic_line(&error.to_string());
+    }
+
     let buffered = logger.get_buffer().to_string();
     if !buffered.is_empty() {
         eprint!("{}", buffered);
