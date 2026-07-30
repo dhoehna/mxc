@@ -38,6 +38,25 @@ export interface BaseProcessUi {
 }
 
 /**
+ * Windows denial-capture settings. The presence of the `captureDenials` object enables capture; all fields are optional.
+ */
+export interface CaptureDenials {
+  /**
+   * How each ungranted access check is handled while it is recorded. Both modes log every access the policy does not grant to the ETL trace; the mode only decides whether that access is blocked or allowed. Defaults to `block` when omitted.
+   */
+  mode?: CaptureDenialsMode | null;
+  /**
+   * Absolute path where the denial ETL trace is written. The caller names the path; the OS opens it under the caller's own identity when the trace is sealed. When omitted, MXC writes the trace to a managed per-run temporary file. The parent directory must already exist.
+   */
+  outputPath?: string | null;
+}
+
+/**
+ * How `captureDenials` handles each ungranted access check while recording it.
+ */
+export type CaptureDenialsMode = "block" | "allow";
+
+/**
  * Clipboard access level.
  */
 export type ClipboardPolicy = "none" | "read" | "write" | "all";
@@ -385,11 +404,15 @@ export interface Process {
  */
 export interface ProcessContainer {
   /**
-   * AppContainer capabilities (e.g. `internetClient`, `registryRead`).
+   * AppContainer capabilities (e.g. `internetClient`, `registryRead`). Each array entry must contain exactly one capability name; commas are rejected because BaseContainer uses commas as its wire delimiter. `learningModeLogging` and `permissiveLearningMode` are reserved and rejected here; use `learningMode`, `--audit`, or the dedicated denial capture configuration instead.
    */
   capabilities?: string[] | null;
   /**
-   * AppContainer permissive learning mode.
+   * Windows denial capture. When present, the runner records the sandboxed process's access attempts to a learning-mode ETL trace for later inspection. Requires a host that exposes the learning-mode OS API.
+   */
+  captureDenials?: CaptureDenials | null;
+  /**
+   * AppContainer learning mode (deny-and-record): failed access checks are logged for diagnostics while the accesses stay denied; containment is unchanged. Distinct from the allow-all `permissiveLearningMode` capability, which is injected internally by the `--audit` CLI flag or dedicated denial-capture configuration.
    */
   learningMode?: boolean | null;
   /**
@@ -548,7 +571,7 @@ export interface Wslc {
    */
   memoryMb?: number | null;
   /**
-   * Host → container port forwards. Only TCP is currently supported by the vendored WSLC SDK runtime (Microsoft.WSL.Containers 2.8.1); the parser rejects `udp` because the shipped runtime returns `E_NOTIMPL`.
+   * Host → container port forwards. Only TCP is currently supported; the parser rejects `udp` because the WSLC SDK runtime returns `E_NOTIMPL` for UDP port mappings.
    */
   portMappings?: PortMapping[] | null;
   /**

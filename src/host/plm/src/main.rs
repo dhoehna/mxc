@@ -245,15 +245,13 @@ enum Cmd {
         #[arg(long)]
         log_dir: Option<PathBuf>,
         /// Path treated as the application binary's location. Defaults
-        /// to the directory containing the plm executable.
+        /// to the directory containing the plm executable. Used as the
+        /// self-access filter root in the adjusted config.
         #[arg(long)]
         bin_path: Option<PathBuf>,
         /// Path to the MXC container config (JSON) to update.
         #[arg(long)]
         config_path: Option<PathBuf>,
-        /// Override for the adjusted config output path.
-        #[arg(long)]
-        adjusted_config_path: Option<PathBuf>,
         /// Re-process a previously captured .etl instead of stopping a
         /// live WPR session. When set, `wpr -stop` is skipped and the
         /// supplied file is parsed as-is.
@@ -384,7 +382,8 @@ fn main() -> Result<()> {
     // env-spoofable) plus the OS TrustedInstaller ACL on that
     // directory as the trust boundary; see `wpr_path` module docs for
     // why we do not run WinVerifyTrust on the resolved binary.
-    plm::wpr_path::verify_wpr_signed().map_err(|e| anyhow::anyhow!("wpr.exe check failed: {e}"))?;
+    plm::wpr_path::verify_wpr_present()
+        .map_err(|e| anyhow::anyhow!("wpr.exe check failed: {e}"))?;
 
     // Install the Ctrl+C handler unconditionally so signals during any
     // subcommand (in particular interactive `log`) tear down the WPR
@@ -415,7 +414,6 @@ fn main() -> Result<()> {
             log_dir,
             bin_path,
             config_path,
-            adjusted_config_path,
             trace_file,
             verbose_logging,
         } => {
@@ -425,7 +423,6 @@ fn main() -> Result<()> {
                     log_dir,
                     bin_path,
                     config_path,
-                    adjusted_config_path,
                     trace_file,
                     verbose: verbose_logging,
                 },
