@@ -18,6 +18,40 @@ struct ProxyEndpoint {
     port: u16,
 }
 
+/// Which firewall objects a single `apply` actually created.
+///
+/// Chain names are truncated to 20 sanitized characters (see
+/// [`NetworkIptablesManager::new`]), so two containers can collide on one name.
+/// Rolling back blindly after a failed `-N` would then flush and delete a chain
+/// owned by a *different, live* container, and leave its hooks pointing at an
+/// empty chain. Recording what this call created keeps the rollback to its own
+/// resources.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CreatedFirewallState {
+    v4_chain: bool,
+    v6_chain: bool,
+    v4_hooks: bool,
+    v6_hooks: bool,
+    v4_dhcp: bool,
+    v6_dhcp: bool,
+}
+
+impl CreatedFirewallState {
+    /// Everything this manager could have created. Used by the teardown paths
+    /// that run after a successful apply (and by `force_cleanup`), where the
+    /// manager owns all of it and iptables is the source of truth.
+    fn all() -> Self {
+        Self {
+            v4_chain: true,
+            v6_chain: true,
+            v4_hooks: true,
+            v6_hooks: true,
+            v4_dhcp: true,
+            v6_dhcp: true,
+        }
+    }
+}
+
 /// Manages iptables rules for an LXC container's network policy.
 pub struct NetworkIptablesManager {
     /// Chain name unique to this container (e.g., "MXC-<container-name>").
@@ -133,11 +167,9 @@ impl NetworkIptablesManager {
     /// Runs a harmless, read-only `ip6tables -S` (list the filter table). This
     /// fails both when the binary is missing (IPv4-only images) and when the
     /// kernel has IPv6 disabled (`ip6tables` reports the table cannot be
-    /// initialized). In either case the caller skips the parallel v6 chain and
-    /// warns, instead of aborting an otherwise-valid IPv4 policy — a hard
-    /// dependency on ip6tables would break pure-IPv4 hosts that worked before
-    /// dual-stack support was added. When IPv6 is disabled there is also no v6
-    /// egress to leak, so skipping is safe rather than fail-open.
+    /// initialized). The two cases are **not** equivalent, so callers must pair
+    /// this with [`Self::host_has_ipv6`]: skipping the v6 chain is safe only on
+    /// a host that has no IPv6 stack to leak through.
     fn ip6tables_available(logger: &mut Logger) -> bool {
         match Command::new("ip6tables").arg("-S").output() {
             Ok(output) if output.status.success() => true,
@@ -156,6 +188,27 @@ impl NetworkIptablesManager {
                 ));
                 false
             }
+        }
+    }
+
+    /// Whether this host has a live IPv6 stack.
+    ///
+    /// `/proc/net/if_inet6` exists only when the kernel's IPv6 support is
+    /// present, and lists one line per configured address — so it is empty when
+    /// IPv6 is administratively disabled everywhere
+    /// (`net.ipv6.conf.all.disable_ipv6=1`). Absent or empty therefore means
+    /// "no IPv6 egress to filter"; anything else means IPv6 is live.
+    ///
+    /// If the file exists but cannot be read we report `true` so the caller
+    /// fails closed rather than assuming away a family it cannot filter.
+    fn host_has_ipv6() -> bool {
+        let path = std::path::Path::new("/proc/net/if_inet6");
+        if !path.exists() {
+            return false;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(contents) => contents.lines().any(|line| !line.trim().is_empty()),
+            Err(_) => true,
         }
     }
 
@@ -189,31 +242,6 @@ impl NetworkIptablesManager {
         Self::run_ip6tables(&refs, logger)
     }
 
-    /// Rules every chain opens with, identical in both address families: allow
-    /// loopback and already-established/related flows.
-    fn build_base_chain_rule_args(chain_name: &str) -> Vec<Vec<String>> {
-        vec![
-            vec![
-                "-A".to_string(),
-                chain_name.to_string(),
-                "-i".to_string(),
-                "lo".to_string(),
-                "-j".to_string(),
-                "ACCEPT".to_string(),
-            ],
-            vec![
-                "-A".to_string(),
-                chain_name.to_string(),
-                "-m".to_string(),
-                "state".to_string(),
-                "--state".to_string(),
-                "ESTABLISHED,RELATED".to_string(),
-                "-j".to_string(),
-                "ACCEPT".to_string(),
-            ],
-        ]
-    }
-
     /// The closing catch-all rule appended to a chain.
     fn build_default_rule_arg(chain_name: &str, action: &str) -> Vec<String> {
         vec![
@@ -237,7 +265,25 @@ impl NetworkIptablesManager {
         }
     }
 
-    fn build_ordered_egress_rules(
+    /// Build the **complete** ordered rule list for a container's chain.
+    ///
+    /// The chain is only ever reached from a hook scoped to the container's
+    /// host-side veth (`-i <veth>`), so every packet that enters it originates
+    /// in the container. Two consequences shape this list:
+    ///
+    /// * There is **no `ESTABLISHED,RELATED` accept.** Return traffic arrives
+    ///   on `-o <veth>` and never traverses this chain, so such a rule would
+    ///   not help reply packets — it would only let flows the container opened
+    ///   *before* the chain was installed keep running afterwards, straight
+    ///   through a deny-all posture. Every rule below matches on destination,
+    ///   which holds for every packet of a flow, so permitted traffic works
+    ///   without any conntrack exemption.
+    /// * There is **no `-i lo` accept.** The input interface is `<veth>` by
+    ///   construction, so a loopback match can never fire here.
+    ///
+    /// Deny rules are emitted before any accept (including the DNS accept) so
+    /// that under first-match-wins a destination named in both lists is denied.
+    fn build_chain_rules(
         chain_name: &str,
         blocked_ips: &[String],
         allowed_ips: &[String],
@@ -276,6 +322,27 @@ impl NetworkIptablesManager {
                 ip.clone(),
                 "-j".to_string(),
                 "DROP".to_string(),
+            ]);
+        }
+
+        // Outbound DNS, opened only outside proxy mode where the hostname
+        // allow/block lists require the container to resolve names. Under
+        // "deny-all-except-proxy" the proxy is resolved host-side and the
+        // container is handed the literal address (see
+        // `pin_proxy_to_resolved_ip`), so it never needs a resolver and an
+        // unscoped port-53 accept would just be a standing DNS-tunnel exfil
+        // path through a posture whose whole point is that the proxy is the
+        // only reachable destination.
+        for protocol in ["udp", "tcp"] {
+            rules.push(vec![
+                "-A".to_string(),
+                chain_name.to_string(),
+                "-p".to_string(),
+                protocol.to_string(),
+                "--dport".to_string(),
+                "53".to_string(),
+                "-j".to_string(),
+                "ACCEPT".to_string(),
             ]);
         }
 
@@ -451,33 +518,40 @@ impl NetworkIptablesManager {
             );
         }
 
-        match self.apply_firewall_rules_inner(policy, logger) {
+        let mut created = CreatedFirewallState::default();
+        match self.apply_firewall_rules_inner(policy, logger, &mut created) {
             Ok(()) => {
                 self.rules_applied = true;
                 Ok(true)
             }
             Err(e) => {
-                // Roll back whatever was created before the failure. Without
-                // this, `remove_firewall_rules` short-circuits on
+                // Roll back what *this call* created, and only that. Without a
+                // rollback, `remove_firewall_rules` short-circuits on
                 // `rules_applied == false` and the orphan chain(s) survive, so
                 // the next attempt fails permanently on `-N` ("chain already
-                // exists") until someone cleans up by hand.
+                // exists"). But an unconditional teardown is just as wrong:
+                // chain names are truncated to 20 sanitized characters, so a
+                // different live container can already own this name, and a
+                // failed `-N` would then have us flush and delete *its* rules.
                 logger.log_line(&format!(
                     "Firewall setup failed: {}. Cleaning up partial iptables state.",
                     e
                 ));
-                self.teardown_chains(logger);
+                self.teardown_created(created, logger);
                 Err(e)
             }
         }
     }
 
     /// Fallible body of [`Self::apply_firewall_rules`]. Kept separate so the
-    /// public method can roll back partial state on the error path.
+    /// public method can roll back partial state on the error path; every
+    /// object actually created is recorded in `created` so that rollback
+    /// removes only this call's own state.
     fn apply_firewall_rules_inner(
         &self,
         policy: &ContainerPolicy,
         logger: &mut Logger,
+        created: &mut CreatedFirewallState,
     ) -> Result<(), String> {
         let iface = self.veth_interface.as_ref().ok_or_else(|| {
             "No veth interface set for container; cannot scope iptables FORWARD hook".to_string()
@@ -488,59 +562,52 @@ impl NetworkIptablesManager {
             self.chain_name
         ));
 
-        // Probe ip6tables once. On IPv4-only hosts (binary absent or IPv6
-        // disabled in the kernel) enforce the v4 policy and skip the v6 chain
-        // rather than failing a policy that worked before dual-stack support.
-        // Such a host has no IPv6 egress to leak in the first place.
-        let ipv6_enabled = Self::ip6tables_available(logger);
-
-        // Create custom chains.
-        Self::run_iptables(&["-N", &self.chain_name], logger)?;
-        if ipv6_enabled {
-            Self::run_ip6tables(&["-N", &self.chain_name], logger)?;
-        }
-
-        // Always allow loopback and established connections, in both families.
-        let base_rules = Self::build_base_chain_rule_args(&self.chain_name);
-        for args in &base_rules {
-            Self::run_iptables_args(args, logger)?;
-        }
-        if ipv6_enabled {
-            for args in &base_rules {
-                Self::run_ip6tables_args(args, logger)?;
-            }
-        }
-
         let proxy_endpoints = Self::resolve_proxy_endpoints(policy, logger)?;
         let proxy_enabled = !proxy_endpoints.is_empty();
 
-        // Outbound DNS (port 53) is opened only outside proxy mode, where the
-        // hostname allow/block lists require the container to resolve names.
-        //
-        // Under "deny-all-except-proxy" DNS stays shut: the proxy endpoint is
-        // resolved host-side and the container is handed that literal address
-        // (see `pin_proxy_to_resolved_ip`), so it never needs a resolver. An
-        // unscoped port-53 ACCEPT would otherwise leave a standing DNS-tunnel
-        // exfil path straight through a posture whose whole point is that the
-        // proxy is the only reachable destination.
-        let allow_dns = !proxy_enabled;
-
-        if allow_dns {
-            for protocol in ["udp", "tcp"] {
-                Self::run_iptables(
-                    &[
-                        "-A",
-                        &self.chain_name,
-                        "-p",
-                        protocol,
-                        "--dport",
-                        "53",
-                        "-j",
-                        "ACCEPT",
-                    ],
-                    logger,
-                )?;
+        // Probe ip6tables once. Being unable to run it is only safe when the
+        // host has no IPv6 stack; on a host with live IPv6 it means we cannot
+        // filter a whole address family. Skipping the v6 chain there would be
+        // fail-open — the container would get unrestricted IPv6 egress while
+        // the policy claims everything but the proxy is dropped — so a policy
+        // whose v6 stance is DROP fails setup instead.
+        let ipv6_enabled = Self::ip6tables_available(logger);
+        let ipv6_stance_is_drop =
+            proxy_enabled || matches!(policy.default_network_policy, NetworkPolicy::Block);
+        if !ipv6_enabled {
+            if ipv6_stance_is_drop {
+                if Self::host_has_ipv6() {
+                    return Err(format!(
+                        "ip6tables is unusable on this host but IPv6 is live \
+                         (/proc/net/if_inet6 lists addresses), so IPv6 egress for container \
+                         '{}' cannot be filtered. Refusing to start with an unenforceable \
+                         network policy: disable IPv6 on the host, or install/enable \
+                         ip6tables.",
+                        self.chain_name
+                    ));
+                }
+                logger.log_line(
+                    "ip6tables unusable and no live IPv6 stack on this host; enforcing the \
+                     IPv4 policy only.",
+                );
+            } else {
+                logger.log_line(
+                    "ip6tables unusable; enforcing the IPv4 policy only. The default IPv6 \
+                     stance is ACCEPT, so no IPv6 restriction is being dropped.",
+                );
             }
+        }
+
+        // Create custom chains. A failure here means the name is already taken
+        // (chain names are truncated, so a collision with another live
+        // container is possible), which is why `created` is only marked after
+        // the command succeeds — the rollback must not touch a chain we did
+        // not make.
+        Self::run_iptables(&["-N", &self.chain_name], logger)?;
+        created.v4_chain = true;
+        if ipv6_enabled {
+            Self::run_ip6tables(&["-N", &self.chain_name], logger)?;
+            created.v6_chain = true;
         }
 
         let (blocked_ips, allowed_ips) = if proxy_enabled {
@@ -556,7 +623,7 @@ impl NetworkIptablesManager {
             )
         };
 
-        for args in Self::build_ordered_egress_rules(
+        for args in Self::build_chain_rules(
             &self.chain_name,
             &blocked_ips,
             &allowed_ips,
@@ -582,26 +649,60 @@ impl NetworkIptablesManager {
                 &Self::build_default_rule_arg(&self.chain_name, ipv6_default),
                 logger,
             )?;
-        } else if proxy_enabled {
-            logger.log_line(
-                "Warning: ip6tables unavailable, so the deny-all-except-proxy rule set is \
-                 IPv4-only; IPv6 egress is unfiltered if the host has IPv6 connectivity.",
-            );
         }
 
-        // Hook the chains into FORWARD for the container's egress traffic.
-        // Packets originating in the container arrive at the host on the
-        // host-side veth, so they match FORWARD by input interface (`-i`);
-        // `-o` would instead match traffic flowing toward the container and
-        // leave container egress — the thing this policy exists to restrict —
+        // Hook the chains for the container's egress traffic.
+        //
+        // FORWARD covers traffic being routed *through* the host to somewhere
+        // else. Packets originating in the container arrive at the host on the
+        // host-side veth, so they match by input interface (`-i`); `-o` would
+        // instead match traffic flowing toward the container and leave
+        // container egress — the thing this policy exists to restrict —
         // entirely unfiltered.
+        //
+        // INPUT covers traffic addressed to the *host itself*. Netfilter sends
+        // locally-destined packets to INPUT and never to FORWARD, so hooking
+        // only FORWARD would leave the bridge gateway and every service on the
+        // host reachable from inside the container — a hole straight through
+        // "the proxy is the only destination you can reach". The same chain is
+        // reused, so a host-local proxy is still permitted by its own ACCEPT
+        // rule while everything else on the host is dropped.
+        // Flags are set *before* the inserts: every hook delete is scoped to
+        // this container's own veth, so a `-D` for a rule that was never
+        // inserted is a harmless no-op, whereas marking afterwards would leak
+        // the FORWARD hook if the INPUT insert failed. (The chain flags are the
+        // opposite case — `-F`/`-X` are name-scoped and can hit another
+        // container, so those are only set once `-N` has succeeded.)
+        created.v4_hooks = true;
+        for hook in ["FORWARD", "INPUT"] {
+            Self::run_iptables(&["-I", hook, "-i", iface, "-j", &self.chain_name], logger)?;
+        }
+
+        // DHCP must survive the INPUT hook or the container loses its lease on
+        // renewal: `lxc-net` runs dnsmasq on the bridge, so DHCPREQUEST is
+        // addressed to the host and would otherwise hit the chain's DROP. `-I`
+        // pushes this ahead of the jump inserted above. It is a link-local
+        // exchange with the bridge, not an egress path, so it does not weaken
+        // the deny-all posture.
+        created.v4_dhcp = true;
         Self::run_iptables(
-            &["-I", "FORWARD", "-i", iface, "-j", &self.chain_name],
+            &[
+                "-I", "INPUT", "-i", iface, "-p", "udp", "--dport", "67", "-j", "ACCEPT",
+            ],
             logger,
         )?;
+
         if ipv6_enabled {
+            created.v6_hooks = true;
+            for hook in ["FORWARD", "INPUT"] {
+                Self::run_ip6tables(&["-I", hook, "-i", iface, "-j", &self.chain_name], logger)?;
+            }
+
+            created.v6_dhcp = true;
             Self::run_ip6tables(
-                &["-I", "FORWARD", "-i", iface, "-j", &self.chain_name],
+                &[
+                    "-I", "INPUT", "-i", iface, "-p", "udp", "--dport", "547", "-j", "ACCEPT",
+                ],
                 logger,
             )?;
         }
@@ -609,30 +710,67 @@ impl NetworkIptablesManager {
         Ok(())
     }
 
-    /// Best-effort removal of the FORWARD hooks and per-container chains in
-    /// both tables. Safe to call even when only part of the state was created
-    /// (a missing rule/chain just makes the individual `-D`/`-F`/`-X` call a
-    /// no-op), so it doubles as the rollback path for a failed apply.
+    /// Best-effort removal of every hook and chain this manager could have
+    /// created, in both tables. Used by the post-apply teardown paths, where
+    /// the manager owns all of it and iptables is the source of truth.
     fn teardown_chains(&self, logger: &mut Logger) {
-        // Remove from FORWARD (only if we had a veth interface and hooked it).
-        // Must match the `-i` direction used at insertion so the delete finds
-        // the rule; a `-o` delete would silently leak the FORWARD hook.
+        self.teardown_created(CreatedFirewallState::all(), logger);
+    }
+
+    /// Remove exactly the objects flagged in `created`.
+    ///
+    /// A missing rule/chain only makes the individual `-D`/`-F`/`-X` a no-op,
+    /// so this is safe to call on a partially-built state — but the flags still
+    /// matter: they keep a rollback from flushing a same-named chain that
+    /// belongs to a different container (see [`Self::apply_firewall_rules`]).
+    fn teardown_created(&self, created: CreatedFirewallState, logger: &mut Logger) {
+        // Remove the hooks (only if we had a veth interface and installed
+        // them). Must match the `-i` direction used at insertion so the delete
+        // finds the rule; a `-o` delete would silently leak the hook.
         if let Some(ref iface) = self.veth_interface {
-            let _ = Self::run_iptables(
-                &["-D", "FORWARD", "-i", iface, "-j", &self.chain_name],
-                logger,
-            );
-            let _ = Self::run_ip6tables(
-                &["-D", "FORWARD", "-i", iface, "-j", &self.chain_name],
-                logger,
-            );
+            if created.v4_dhcp {
+                let _ = Self::run_iptables(
+                    &[
+                        "-D", "INPUT", "-i", iface, "-p", "udp", "--dport", "67", "-j", "ACCEPT",
+                    ],
+                    logger,
+                );
+            }
+            if created.v4_hooks {
+                for hook in ["FORWARD", "INPUT"] {
+                    let _ = Self::run_iptables(
+                        &["-D", hook, "-i", iface, "-j", &self.chain_name],
+                        logger,
+                    );
+                }
+            }
+            if created.v6_dhcp {
+                let _ = Self::run_ip6tables(
+                    &[
+                        "-D", "INPUT", "-i", iface, "-p", "udp", "--dport", "547", "-j", "ACCEPT",
+                    ],
+                    logger,
+                );
+            }
+            if created.v6_hooks {
+                for hook in ["FORWARD", "INPUT"] {
+                    let _ = Self::run_ip6tables(
+                        &["-D", hook, "-i", iface, "-j", &self.chain_name],
+                        logger,
+                    );
+                }
+            }
         }
 
         // Flush and delete the chains.
-        let _ = Self::run_iptables(&["-F", &self.chain_name], logger);
-        let _ = Self::run_iptables(&["-X", &self.chain_name], logger);
-        let _ = Self::run_ip6tables(&["-F", &self.chain_name], logger);
-        let _ = Self::run_ip6tables(&["-X", &self.chain_name], logger);
+        if created.v4_chain {
+            let _ = Self::run_iptables(&["-F", &self.chain_name], logger);
+            let _ = Self::run_iptables(&["-X", &self.chain_name], logger);
+        }
+        if created.v6_chain {
+            let _ = Self::run_ip6tables(&["-F", &self.chain_name], logger);
+            let _ = Self::run_ip6tables(&["-X", &self.chain_name], logger);
+        }
     }
 
     /// Remove all iptables/ip6tables rules created by this manager.
@@ -719,17 +857,27 @@ mod tests {
     }
 
     #[test]
-    fn base_chain_rules_are_family_agnostic() {
-        // The same argv is replayed against iptables and ip6tables, so it must
-        // not name an address family (no -4/-6, no literal addresses).
-        let rules = NetworkIptablesManager::build_base_chain_rule_args("MXC-test");
-        assert_eq!(rules.len(), 2);
+    fn egress_chain_has_no_conntrack_or_loopback_accept() {
+        // The chain is only reached from hooks scoped to `-i <veth>`, so reply
+        // traffic never traverses it and the input interface is never `lo`. An
+        // ESTABLISHED,RELATED accept would therefore do nothing for replies and
+        // would instead let flows opened before the chain existed keep running
+        // straight through the deny-all policy.
+        let rules = NetworkIptablesManager::build_chain_rules(
+            "MXC-test",
+            &["10.0.0.5".to_string()],
+            &["10.0.0.9".to_string()],
+            NetworkPolicy::Block,
+            &[],
+        );
+
         for rule in &rules {
-            assert_eq!(rule[0], "-A");
-            assert_eq!(rule[1], "MXC-test");
             assert!(
-                !rule.iter().any(|a| a == "-4" || a == "-6" || a == "-d"),
-                "base rule must be family-agnostic: {rule:?}"
+                !rule.iter().any(|a| a == "ESTABLISHED,RELATED"
+                    || a == "--state"
+                    || a == "--ctstate"
+                    || a == "lo"),
+                "egress chain must not exempt conntrack state or loopback: {rule:?}"
             );
         }
     }
@@ -740,7 +888,7 @@ mod tests {
             ip: "10.1.2.3".to_string(),
             port: 8080,
         }];
-        let rules = NetworkIptablesManager::build_ordered_egress_rules(
+        let rules = NetworkIptablesManager::build_chain_rules(
             "MXC-test",
             &[],
             &[],
@@ -897,7 +1045,7 @@ mod tests {
         let blocked = vec!["10.0.0.5".to_string()];
         let allowed = vec!["10.0.0.0".to_string()];
 
-        let rules = NetworkIptablesManager::build_ordered_egress_rules(
+        let rules = NetworkIptablesManager::build_chain_rules(
             "MXC-test",
             &blocked,
             &allowed,
@@ -905,13 +1053,40 @@ mod tests {
             &[],
         );
 
+        // Deny first, then the DNS carve-out, then allows, then the default.
+        // DNS sits after the deny list so a blocked destination stays blocked
+        // even on port 53.
         assert_eq!(
             rules,
             vec![
                 vec!["-A", "MXC-test", "-d", "10.0.0.5", "-j", "DROP"],
+                vec!["-A", "MXC-test", "-p", "udp", "--dport", "53", "-j", "ACCEPT"],
+                vec!["-A", "MXC-test", "-p", "tcp", "--dport", "53", "-j", "ACCEPT"],
                 vec!["-A", "MXC-test", "-d", "10.0.0.0", "-j", "ACCEPT"],
                 vec!["-A", "MXC-test", "-j", "DROP"],
             ]
+        );
+    }
+
+    #[test]
+    fn proxy_mode_opens_no_dns_port() {
+        // Deny-all-except-proxy pins the proxy to a literal address host-side,
+        // so the container never needs a resolver and port 53 must stay shut —
+        // otherwise the posture carries a standing DNS-tunnel exfil path.
+        let rules = NetworkIptablesManager::build_chain_rules(
+            "MXC-test",
+            &[],
+            &[],
+            NetworkPolicy::Block,
+            &[ProxyEndpoint {
+                ip: "10.1.2.3".to_string(),
+                port: 3128,
+            }],
+        );
+
+        assert!(
+            !rules.iter().any(|r| r.contains(&"53".to_string())),
+            "proxy mode must not open DNS: {rules:?}"
         );
     }
 
@@ -924,7 +1099,7 @@ mod tests {
             port: 8080,
         }];
 
-        let rules = NetworkIptablesManager::build_ordered_egress_rules(
+        let rules = NetworkIptablesManager::build_chain_rules(
             "MXC-test",
             &blocked,
             &allowed,
@@ -950,5 +1125,35 @@ mod tests {
                 vec!["-A", "MXC-test", "-j", "DROP"],
             ]
         );
+    }
+
+    #[test]
+    fn rollback_state_starts_empty_so_a_failed_chain_create_touches_nothing() {
+        // Chain names are truncated to 20 sanitized characters, so a different
+        // live container can already own this name. If `-N` fails because the
+        // chain exists, nothing has been created yet and the rollback must be a
+        // no-op — otherwise it flushes and deletes the other container's rules.
+        let created = CreatedFirewallState::default();
+
+        assert!(!created.v4_chain);
+        assert!(!created.v6_chain);
+        assert!(!created.v4_hooks);
+        assert!(!created.v6_hooks);
+        assert!(!created.v4_dhcp);
+        assert!(!created.v6_dhcp);
+    }
+
+    #[test]
+    fn full_teardown_state_covers_every_created_object() {
+        // `teardown_chains` (post-success cleanup and `force_cleanup`) must
+        // remove everything an apply can install, or cleanup leaks rules.
+        let all = CreatedFirewallState::all();
+
+        assert!(all.v4_chain);
+        assert!(all.v6_chain);
+        assert!(all.v4_hooks);
+        assert!(all.v6_hooks);
+        assert!(all.v4_dhcp);
+        assert!(all.v6_dhcp);
     }
 }
