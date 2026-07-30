@@ -3359,6 +3359,32 @@ mod tests {
     }
 
     #[test]
+    fn external_http_proxy_with_bubblewrap_and_default_block_is_rejected() {
+        // The `http` proxy form is external too, so it must trip the same
+        // Bubblewrap guard as `url` / `localhost` rather than silently
+        // delegating a hard-block intent to a proxy MXC does not control.
+        let json = r#"{
+            "version": "0.6.0-alpha",
+            "containment": "bubblewrap",
+            "process": {"commandLine": "echo hi"},
+            "network": {
+                "proxy": {"http": "http://127.0.0.1:8080"},
+                "defaultPolicy": "block"
+            }
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let err = load_request(&encoded, &mut logger, true).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("defaultPolicy"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("external network.proxy"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn builtin_proxy_with_bubblewrap_and_host_policy_is_accepted() {
         // The builtin proxy DOES enforce host lists at the proxy layer, so
         // combining it with allowedHosts is fine.

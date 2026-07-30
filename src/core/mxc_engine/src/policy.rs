@@ -1234,7 +1234,13 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn build_request_maps_http_proxy_without_egress() {
+        // `allow_outbound` maps to defaultPolicy 'allow'. It is required here
+        // because `build_request` resolves the backend from the host platform,
+        // and on Linux that is Bubblewrap, which rejects an external proxy
+        // combined with defaultPolicy 'block' (the implicit default). Without
+        // it this test only passes on Windows.
         let policy = policy_with_network(NetworkSection {
+            allow_outbound: true,
             proxy: Some(ProxySpec::Http("http://127.0.0.1:8080".to_string())),
             ..Default::default()
         });
