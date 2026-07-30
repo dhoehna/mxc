@@ -14,9 +14,7 @@ use serde::Serialize;
 
 use wxc_common::id::mint_random_token;
 use wxc_common::logger::{Logger, Mode};
-use wxc_common::models::{
-    ContainerPolicy, ExecutionRequest, LxcConfig, NetworkEnforcementMode, NetworkPolicy,
-};
+use wxc_common::models::{ContainerPolicy, ExecutionRequest, LxcConfig, NetworkEnforcementMode};
 use wxc_common::mxc_error::MxcError;
 use wxc_common::state_aware_backend::{
     null_pipe_handle, DeprovisionResult, ExecHandle, ProvisionResult, StartResult,
@@ -138,17 +136,24 @@ fn has_network_policy(policy: &ContainerPolicy) -> bool {
         || policy.network_proxy.is_enabled()
 }
 
-/// `true` when the policy asks for a network restriction that LXC can only
-/// deliver through iptables.
+/// Whether `policy` expresses a network restriction that LXC can only deliver
+/// through iptables.
 ///
 /// LXC has no capability-based network enforcement, so under
 /// `NetworkEnforcementMode::Capabilities` — the default when `enforcementMode`
 /// is omitted — `apply_firewall_rules` returns a successful no-op. Any
 /// restriction expressed here would therefore be silently unenforced.
+///
+/// Deliberately ignores `default_network_policy`, matching
+/// [`has_network_policy`]. `NetworkPolicy::default()` is `Block`, so by the time
+/// the wire `network` block has been flattened into `ContainerPolicy` a
+/// requested `defaultPolicy: "block"` is indistinguishable from no `network`
+/// block at all. Treating it as an explicit restriction would reject every
+/// plain start that never asked for network policy — including the basic
+/// lifecycle in `run_lxc_state_aware_test.sh`. Only the host lists, which are
+/// empty unless the caller populated them, are evidence of an actual request.
 fn requires_firewall_enforcement(policy: &ContainerPolicy) -> bool {
-    !policy.allowed_hosts.is_empty()
-        || !policy.blocked_hosts.is_empty()
-        || matches!(policy.default_network_policy, NetworkPolicy::Block)
+    !policy.allowed_hosts.is_empty() || !policy.blocked_hosts.is_empty()
 }
 
 fn uses_firewall_mode(policy: &ContainerPolicy) -> bool {
@@ -242,7 +247,7 @@ fn apply_network_policy(
         return Err(MxcError::policy_validation(format!(
             "LXC state-aware start cannot enforce this network policy under \
              enforcementMode {:?}: LXC has no capability-based network enforcement, \
-             so allowedHosts/blockedHosts/defaultPolicy 'block' would be ignored. \
+             so allowedHosts/blockedHosts would be ignored. \
              Use enforcementMode 'firewall' or 'both'.",
             policy.network_enforcement_mode
         )));
@@ -542,6 +547,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
 mod tests {
     use super::*;
     use wxc_common::models::LifecycleConfig;
+    use wxc_common::models::NetworkPolicy;
     use wxc_common::mxc_error::MxcErrorCode;
 
     fn provision_config() -> LxcConfig {
@@ -560,14 +566,32 @@ mod tests {
 
     #[test]
     fn restrictions_require_firewall_enforcement() {
-        // allowedHosts / blockedHosts / defaultPolicy=block are only ever
-        // enforced through iptables on this backend.
+        // Explicit host lists are only ever enforced through iptables on this
+        // backend.
         assert!(requires_firewall_enforcement(&restrictive_policy()));
         assert!(requires_firewall_enforcement(&ContainerPolicy {
             allowed_hosts: vec!["example.com".to_string()],
             ..Default::default()
         }));
-        assert!(requires_firewall_enforcement(&ContainerPolicy {
+    }
+
+    #[test]
+    fn default_policy_alone_does_not_require_firewall_enforcement() {
+        // `NetworkPolicy::default()` is `Block`, so a default-constructed
+        // policy is exactly what a start with no `network` block produces.
+        // Treating that as an explicit restriction would reject every plain
+        // start, including the basic lifecycle in run_lxc_state_aware_test.sh.
+        let no_network_block = ContainerPolicy::default();
+        assert_eq!(
+            no_network_block.default_network_policy,
+            NetworkPolicy::Block
+        );
+        assert!(!requires_firewall_enforcement(&no_network_block));
+
+        // Same for an explicitly-requested `defaultPolicy: "block"`: it is
+        // indistinguishable from the above once flattened, so it cannot be the
+        // trigger.
+        assert!(!requires_firewall_enforcement(&ContainerPolicy {
             default_network_policy: NetworkPolicy::Block,
             ..Default::default()
         }));
@@ -608,6 +632,18 @@ mod tests {
             };
             assert!(uses_firewall_mode(&policy));
         }
+    }
+
+    #[test]
+    fn plain_start_with_no_network_block_is_not_rejected() {
+        // The exact policy a start with no `network` block produces. This is
+        // the basic lifecycle run_lxc_state_aware_test.sh exercises, so it must
+        // pass the enforceability gate in `apply_network_policy`.
+        let policy = ContainerPolicy::default();
+        assert!(!requires_firewall_enforcement(&policy) || uses_firewall_mode(&policy));
+        // And it must not trip the veth-discovery failure either, which is
+        // scoped to the firewall modes.
+        assert!(!uses_firewall_mode(&policy));
     }
 
     #[test]

@@ -1576,13 +1576,20 @@ raw-JSON caller that sends it is not rejected.
 | `ui` | ignored | ignored | ignored | ignored | ignored |
 
 > **LXC `network` constraints.** `network.proxy` is rejected at start. LXC enforces
-> network policy only through iptables, so a policy carrying `allowedHosts`,
-> `blockedHosts`, or `defaultPolicy: "block"` must set `enforcementMode` to
-> `"firewall"` or `"both"`; under `"capabilities"` (the default when the field is
-> omitted) start fails rather than silently leaving the container unfiltered. Start
-> also fails if the container's host-side veth cannot be discovered, since the chain
-> could not then be scoped to the container. `allowLocalNetwork` and
-> `removeRulesOnExit` are not part of the LXC surface (see `LxcNetworkConfig`).
+> network policy only through iptables, so a policy carrying `allowedHosts` or
+> `blockedHosts` must set `enforcementMode` to `"firewall"` or `"both"`; under
+> `"capabilities"` (the default when the field is omitted) start fails rather than
+> silently leaving the container unfiltered. Start also fails if the container's
+> host-side veth cannot be discovered *in a firewall mode*, since the chain could not
+> then be scoped to the container. `allowLocalNetwork` and `removeRulesOnExit` are not
+> part of the LXC surface (see `LxcNetworkConfig`).
+>
+> `defaultPolicy: "block"` on its own is **not** enough to trigger that rejection, and
+> is **not** enforced under `"capabilities"`. `block` is the default value of the
+> field, so once the request is parsed an explicitly requested `"block"` is
+> indistinguishable from a start that supplied no `network` block at all; rejecting on
+> it would fail every plain start. To get a default-deny container, set
+> `enforcementMode` to `"firewall"` or `"both"` explicitly.
 
 - **Compile-time enforcement at the SDK.** Each per-(backend, phase) Config (§6.1)
   declares only the cross-cutting fields the matrix marks as `applied` for that phase
