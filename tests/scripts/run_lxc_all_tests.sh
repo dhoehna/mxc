@@ -48,6 +48,7 @@ run_test "LXC Denied Masking" "$SCRIPT_DIR/run_lxc_denied_masking_test.sh"
 run_test "LXC Network" "$SCRIPT_DIR/run_lxc_network_test.sh"
 run_test "LXC Timeout" "$SCRIPT_DIR/run_lxc_timeout_test.sh"
 run_test "LXC Env+Cwd" "$SCRIPT_DIR/run_lxc_env_cwd_test.sh"
+run_test "LXC State-Aware Lifecycle" "$SCRIPT_DIR/run_lxc_state_aware_test.sh"
 
 echo "================================"
 echo "Results: $PASSED passed, $FAILED failed"
