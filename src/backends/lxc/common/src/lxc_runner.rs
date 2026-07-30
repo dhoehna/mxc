@@ -208,6 +208,27 @@ impl LxcScriptRunner {
         // Configure network rules
         let mut fw_manager = NetworkIptablesManager::new(&container_name);
 
+        // Pin a hostname proxy to the address the host resolved, once, before
+        // anything consumes it. The firewall ACCEPT and the HTTP(S)_PROXY handed
+        // to the container must name the same endpoint: if the container
+        // re-resolved the hostname itself it could pick a different address
+        // under round-robin or split-horizon DNS and be dropped by its own
+        // policy. Pinning also means the container never needs a resolver, so
+        // DNS stays closed under deny-all-except-proxy.
+        let mut effective_policy = request.policy.clone();
+        match NetworkIptablesManager::pin_proxy_to_resolved_ip(
+            &effective_policy.network_proxy,
+            logger,
+        ) {
+            Ok(pinned) => effective_policy.network_proxy = pinned,
+            Err(e) => {
+                if self.destroy_on_exit || container_created {
+                    let _ = container.destroy();
+                }
+                return ScriptResponse::error(&format!("Network policy error: {}", e));
+            }
+        }
+
         // Try to discover the container's veth interface for scoped rules
         if let Some(veth) = NetworkIptablesManager::discover_veth_interface(&container_name) {
             let _ = writeln!(logger, "Discovered veth interface: {}", veth);
@@ -219,7 +240,7 @@ impl LxcScriptRunner {
             }
         }
 
-        match fw_manager.apply_firewall_rules(&request.policy, logger) {
+        match fw_manager.apply_firewall_rules(&effective_policy, logger) {
             Ok(true) => {}
             Ok(false) => {
                 if self.destroy_on_exit || container_created {
@@ -245,7 +266,7 @@ impl LxcScriptRunner {
         let _ = writeln!(logger, "Executing script inside container...");
         let mut exec_env = request.env.clone();
         let force_clear_env =
-            wxc_common::proxy_env::apply_proxy_env(&mut exec_env, &request.policy.network_proxy);
+            wxc_common::proxy_env::apply_proxy_env(&mut exec_env, &effective_policy.network_proxy);
         let result = container.attach_run(
             &request.script_code,
             &request.working_directory,

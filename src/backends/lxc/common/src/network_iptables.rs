@@ -10,7 +10,7 @@ use std::net::ToSocketAddrs;
 use std::process::Command;
 
 use wxc_common::logger::Logger;
-use wxc_common::models::{ContainerPolicy, NetworkEnforcementMode, NetworkPolicy};
+use wxc_common::models::{ContainerPolicy, NetworkEnforcementMode, NetworkPolicy, ProxyConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProxyEndpoint {
@@ -120,14 +120,58 @@ impl NetworkIptablesManager {
 
     /// Run an iptables command and return success/failure.
     fn run_iptables(args: &[&str], logger: &mut Logger) -> Result<bool, String> {
-        let output = Command::new("iptables")
+        Self::run_firewall_command("iptables", args, logger)
+    }
+
+    /// Run an ip6tables command and return success/failure.
+    fn run_ip6tables(args: &[&str], logger: &mut Logger) -> Result<bool, String> {
+        Self::run_firewall_command("ip6tables", args, logger)
+    }
+
+    /// Probe whether `ip6tables` can be used on this host.
+    ///
+    /// Runs a harmless, read-only `ip6tables -S` (list the filter table). This
+    /// fails both when the binary is missing (IPv4-only images) and when the
+    /// kernel has IPv6 disabled (`ip6tables` reports the table cannot be
+    /// initialized). In either case the caller skips the parallel v6 chain and
+    /// warns, instead of aborting an otherwise-valid IPv4 policy — a hard
+    /// dependency on ip6tables would break pure-IPv4 hosts that worked before
+    /// dual-stack support was added. When IPv6 is disabled there is also no v6
+    /// egress to leak, so skipping is safe rather than fail-open.
+    fn ip6tables_available(logger: &mut Logger) -> bool {
+        match Command::new("ip6tables").arg("-S").output() {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                logger.log_line(&format!(
+                    "ip6tables unavailable ({}); skipping IPv6 firewall rules.",
+                    stderr.trim()
+                ));
+                false
+            }
+            Err(e) => {
+                logger.log_line(&format!(
+                    "ip6tables not found ({}); skipping IPv6 firewall rules.",
+                    e
+                ));
+                false
+            }
+        }
+    }
+
+    fn run_firewall_command(
+        command: &str,
+        args: &[&str],
+        logger: &mut Logger,
+    ) -> Result<bool, String> {
+        let output = Command::new(command)
             .args(args)
             .output()
-            .map_err(|e| format!("Failed to run iptables: {}", e))?;
+            .map_err(|e| format!("Failed to run {}: {}", command, e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let msg = format!("iptables {} failed: {}", args.join(" "), stderr);
+            let msg = format!("{} {} failed: {}", command, args.join(" "), stderr);
             logger.log_line(&msg);
             return Err(msg);
         }
@@ -138,6 +182,59 @@ impl NetworkIptablesManager {
     fn run_iptables_args(args: &[String], logger: &mut Logger) -> Result<bool, String> {
         let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
         Self::run_iptables(&refs, logger)
+    }
+
+    fn run_ip6tables_args(args: &[String], logger: &mut Logger) -> Result<bool, String> {
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        Self::run_ip6tables(&refs, logger)
+    }
+
+    /// Rules every chain opens with, identical in both address families: allow
+    /// loopback and already-established/related flows.
+    fn build_base_chain_rule_args(chain_name: &str) -> Vec<Vec<String>> {
+        vec![
+            vec![
+                "-A".to_string(),
+                chain_name.to_string(),
+                "-i".to_string(),
+                "lo".to_string(),
+                "-j".to_string(),
+                "ACCEPT".to_string(),
+            ],
+            vec![
+                "-A".to_string(),
+                chain_name.to_string(),
+                "-m".to_string(),
+                "state".to_string(),
+                "--state".to_string(),
+                "ESTABLISHED,RELATED".to_string(),
+                "-j".to_string(),
+                "ACCEPT".to_string(),
+            ],
+        ]
+    }
+
+    /// The closing catch-all rule appended to a chain.
+    fn build_default_rule_arg(chain_name: &str, action: &str) -> Vec<String> {
+        vec![
+            "-A".to_string(),
+            chain_name.to_string(),
+            "-j".to_string(),
+            action.to_string(),
+        ]
+    }
+
+    /// The catch-all action for a chain. Proxy mode is "deny all except the
+    /// proxy", so it always closes with DROP regardless of the configured
+    /// default policy.
+    fn default_policy_action(default_policy: NetworkPolicy, proxy_enabled: bool) -> &'static str {
+        if proxy_enabled {
+            return "DROP";
+        }
+        match default_policy {
+            NetworkPolicy::Block => "DROP",
+            NetworkPolicy::Allow => "ACCEPT",
+        }
     }
 
     fn build_ordered_egress_rules(
@@ -164,12 +261,10 @@ impl NetworkIptablesManager {
                     "ACCEPT".to_string(),
                 ]);
             }
-            rules.push(vec![
-                "-A".to_string(),
-                chain_name.to_string(),
-                "-j".to_string(),
-                "DROP".to_string(),
-            ]);
+            rules.push(Self::build_default_rule_arg(
+                chain_name,
+                Self::default_policy_action(default_policy, true),
+            ));
             return rules;
         }
 
@@ -195,16 +290,10 @@ impl NetworkIptablesManager {
             ]);
         }
 
-        let default_action = match default_policy {
-            NetworkPolicy::Block => "DROP",
-            NetworkPolicy::Allow => "ACCEPT",
-        };
-        rules.push(vec![
-            "-A".to_string(),
-            chain_name.to_string(),
-            "-j".to_string(),
-            default_action.to_string(),
-        ]);
+        rules.push(Self::build_default_rule_arg(
+            chain_name,
+            Self::default_policy_action(default_policy, false),
+        ));
 
         rules
     }
@@ -236,6 +325,66 @@ impl NetworkIptablesManager {
             .and_then(|h| h.strip_suffix(']'))
             .unwrap_or(host);
         candidate.parse::<std::net::IpAddr>().is_ok()
+    }
+
+    /// Pin an enabled, hostname-addressed proxy to a single host-resolved IPv4
+    /// address.
+    ///
+    /// Model 2 ("deny-all-except-proxy") allows exactly one destination, so the
+    /// firewall rule and the `HTTP(S)_PROXY` handed to the container must name
+    /// the *same* endpoint. Resolving host-side and injecting the resulting IP
+    /// achieves that and removes the container's need to resolve anything, so
+    /// DNS can stay closed — closing the DNS-tunnel exfil path that an open
+    /// port 53 would otherwise leave in a deny-all posture.
+    ///
+    /// Returns the config unchanged when the proxy is disabled, has no address
+    /// (built-in test server), or is already an IP literal. Multi-A-record
+    /// hostnames collapse to the first resolved address, which is the point:
+    /// both sides then agree on one IP instead of racing DNS.
+    pub fn pin_proxy_to_resolved_ip(
+        proxy: &ProxyConfig,
+        logger: &mut Logger,
+    ) -> Result<ProxyConfig, String> {
+        if !proxy.is_enabled() {
+            return Ok(proxy.clone());
+        }
+
+        let Some(address) = proxy.address.as_ref() else {
+            return Ok(proxy.clone());
+        };
+
+        if Self::host_is_ip_literal(address.host()) {
+            return Ok(proxy.clone());
+        }
+
+        let ips = Self::resolve_host(address.host());
+        let Some(ip) = ips.first() else {
+            return Err(format!(
+                "Could not resolve network proxy host '{}' to an IPv4 address",
+                address.host()
+            ));
+        };
+
+        if ips.len() > 1 {
+            logger.log_line(&format!(
+                "Network proxy host '{}' resolved to {} addresses; pinning to {} so the \
+                 firewall rule and the injected HTTP(S)_PROXY agree.",
+                address.host(),
+                ips.len(),
+                ip
+            ));
+        } else {
+            logger.log_line(&format!(
+                "Pinning network proxy '{}' to resolved address {}.",
+                address.host(),
+                ip
+            ));
+        }
+
+        Ok(ProxyConfig {
+            address: Some(address.pinned_to_ip(ip)),
+            builtin_test_server: proxy.builtin_test_server,
+        })
     }
 
     fn resolve_proxy_endpoints(
@@ -295,103 +444,116 @@ impl NetworkIptablesManager {
             return Ok(true);
         }
 
-        let Some(ref iface) = self.veth_interface else {
+        if self.veth_interface.is_none() {
             return Err(
                 "No veth interface set for container; cannot scope iptables FORWARD hook"
                     .to_string(),
             );
-        };
+        }
 
-        logger.log_line(&format!("Creating iptables chain: {}", self.chain_name));
+        match self.apply_firewall_rules_inner(policy, logger) {
+            Ok(()) => {
+                self.rules_applied = true;
+                Ok(true)
+            }
+            Err(e) => {
+                // Roll back whatever was created before the failure. Without
+                // this, `remove_firewall_rules` short-circuits on
+                // `rules_applied == false` and the orphan chain(s) survive, so
+                // the next attempt fails permanently on `-N` ("chain already
+                // exists") until someone cleans up by hand.
+                logger.log_line(&format!(
+                    "Firewall setup failed: {}. Cleaning up partial iptables state.",
+                    e
+                ));
+                self.teardown_chains(logger);
+                Err(e)
+            }
+        }
+    }
 
-        // Create custom chain
+    /// Fallible body of [`Self::apply_firewall_rules`]. Kept separate so the
+    /// public method can roll back partial state on the error path.
+    fn apply_firewall_rules_inner(
+        &self,
+        policy: &ContainerPolicy,
+        logger: &mut Logger,
+    ) -> Result<(), String> {
+        let iface = self.veth_interface.as_ref().ok_or_else(|| {
+            "No veth interface set for container; cannot scope iptables FORWARD hook".to_string()
+        })?;
+
+        logger.log_line(&format!(
+            "Creating iptables/ip6tables chain: {}",
+            self.chain_name
+        ));
+
+        // Probe ip6tables once. On IPv4-only hosts (binary absent or IPv6
+        // disabled in the kernel) enforce the v4 policy and skip the v6 chain
+        // rather than failing a policy that worked before dual-stack support.
+        // Such a host has no IPv6 egress to leak in the first place.
+        let ipv6_enabled = Self::ip6tables_available(logger);
+
+        // Create custom chains.
         Self::run_iptables(&["-N", &self.chain_name], logger)?;
+        if ipv6_enabled {
+            Self::run_ip6tables(&["-N", &self.chain_name], logger)?;
+        }
 
-        // Always allow loopback and established connections
-        Self::run_iptables(
-            &["-A", &self.chain_name, "-i", "lo", "-j", "ACCEPT"],
-            logger,
-        )?;
-        Self::run_iptables(
-            &[
-                "-A",
-                &self.chain_name,
-                "-m",
-                "state",
-                "--state",
-                "ESTABLISHED,RELATED",
-                "-j",
-                "ACCEPT",
-            ],
-            logger,
-        )?;
+        // Always allow loopback and established connections, in both families.
+        let base_rules = Self::build_base_chain_rule_args(&self.chain_name);
+        for args in &base_rules {
+            Self::run_iptables_args(args, logger)?;
+        }
+        if ipv6_enabled {
+            for args in &base_rules {
+                Self::run_ip6tables_args(args, logger)?;
+            }
+        }
 
         let proxy_endpoints = Self::resolve_proxy_endpoints(policy, logger)?;
         let proxy_enabled = !proxy_endpoints.is_empty();
 
-        // Decide whether outbound DNS (port 53) may be opened.
+        // Outbound DNS (port 53) is opened only outside proxy mode, where the
+        // hostname allow/block lists require the container to resolve names.
         //
-        // In proxy mode the posture is "deny-all-except-proxy", so DNS is only
-        // opened when the proxy is addressed by hostname (the container has to
-        // resolve it). When the proxy is an IP literal no resolution is needed,
-        // so DNS stays closed and nothing but the proxy endpoint is reachable.
-        // Outside proxy mode DNS is required for the hostname-based allow/block
-        // lists, so it is always opened.
-        let allow_dns = if proxy_enabled {
-            policy
-                .network_proxy
-                .address
-                .as_ref()
-                .is_some_and(|addr| !Self::host_is_ip_literal(addr.host()))
-        } else {
-            true
-        };
+        // Under "deny-all-except-proxy" DNS stays shut: the proxy endpoint is
+        // resolved host-side and the container is handed that literal address
+        // (see `pin_proxy_to_resolved_ip`), so it never needs a resolver. An
+        // unscoped port-53 ACCEPT would otherwise leave a standing DNS-tunnel
+        // exfil path straight through a posture whose whole point is that the
+        // proxy is the only reachable destination.
+        let allow_dns = !proxy_enabled;
 
         if allow_dns {
-            // Allow DNS (needed for hostname resolution)
-            Self::run_iptables(
-                &[
-                    "-A",
-                    &self.chain_name,
-                    "-p",
-                    "udp",
-                    "--dport",
-                    "53",
-                    "-j",
-                    "ACCEPT",
-                ],
-                logger,
-            )?;
-            Self::run_iptables(
-                &[
-                    "-A",
-                    &self.chain_name,
-                    "-p",
-                    "tcp",
-                    "--dport",
-                    "53",
-                    "-j",
-                    "ACCEPT",
-                ],
-                logger,
-            )?;
+            for protocol in ["udp", "tcp"] {
+                Self::run_iptables(
+                    &[
+                        "-A",
+                        &self.chain_name,
+                        "-p",
+                        protocol,
+                        "--dport",
+                        "53",
+                        "-j",
+                        "ACCEPT",
+                    ],
+                    logger,
+                )?;
+            }
         }
 
-        let (blocked_ips, allowed_ips) = if !proxy_enabled {
+        let (blocked_ips, allowed_ips) = if proxy_enabled {
+            logger.log_line(
+                "Network proxy enabled: allowing proxy egress only and dropping all other \
+                 outbound traffic (including DNS).",
+            );
+            (Vec::new(), Vec::new())
+        } else {
             (
                 Self::resolve_policy_hosts(&policy.blocked_hosts, "Blocking", logger),
                 Self::resolve_policy_hosts(&policy.allowed_hosts, "Allowing", logger),
             )
-        } else if allow_dns {
-            logger.log_line(
-                "Network proxy enabled: allowing proxy egress plus DNS (for proxy hostname resolution) and dropping all other outbound traffic.",
-            );
-            (Vec::new(), Vec::new())
-        } else {
-            logger.log_line(
-                "Network proxy enabled: allowing proxy egress only and dropping all other outbound traffic (including DNS).",
-            );
-            (Vec::new(), Vec::new())
         };
 
         for args in Self::build_ordered_egress_rules(
@@ -404,35 +566,87 @@ impl NetworkIptablesManager {
             Self::run_iptables_args(&args, logger)?;
         }
 
-        // Hook the chain into FORWARD for the container's traffic
+        // Mirror the closing stance into ip6tables.
+        //
+        // Every destination rule above is IPv4 (`resolve_host` keeps only v4
+        // addresses, and the proxy endpoint is a v4 literal), so the v6 chain
+        // carries no per-destination rules — just the same default stance. In
+        // proxy mode that is DROP, which is what actually closes the model-2
+        // bypass: without a v6 chain, a dual-stack container could reach the
+        // internet over IPv6 while the v4 chain dropped everything.
+        if ipv6_enabled {
+            let ipv6_default =
+                Self::default_policy_action(policy.default_network_policy.clone(), proxy_enabled);
+            logger.log_line(&format!("IPv6 default egress policy: {}", ipv6_default));
+            Self::run_ip6tables_args(
+                &Self::build_default_rule_arg(&self.chain_name, ipv6_default),
+                logger,
+            )?;
+        } else if proxy_enabled {
+            logger.log_line(
+                "Warning: ip6tables unavailable, so the deny-all-except-proxy rule set is \
+                 IPv4-only; IPv6 egress is unfiltered if the host has IPv6 connectivity.",
+            );
+        }
+
+        // Hook the chains into FORWARD for the container's egress traffic.
+        // Packets originating in the container arrive at the host on the
+        // host-side veth, so they match FORWARD by input interface (`-i`);
+        // `-o` would instead match traffic flowing toward the container and
+        // leave container egress — the thing this policy exists to restrict —
+        // entirely unfiltered.
         Self::run_iptables(
-            &["-I", "FORWARD", "-o", iface, "-j", &self.chain_name],
+            &["-I", "FORWARD", "-i", iface, "-j", &self.chain_name],
             logger,
         )?;
+        if ipv6_enabled {
+            Self::run_ip6tables(
+                &["-I", "FORWARD", "-i", iface, "-j", &self.chain_name],
+                logger,
+            )?;
+        }
 
-        self.rules_applied = true;
-        Ok(true)
+        Ok(())
     }
 
-    /// Remove all iptables rules created by this manager.
+    /// Best-effort removal of the FORWARD hooks and per-container chains in
+    /// both tables. Safe to call even when only part of the state was created
+    /// (a missing rule/chain just makes the individual `-D`/`-F`/`-X` call a
+    /// no-op), so it doubles as the rollback path for a failed apply.
+    fn teardown_chains(&self, logger: &mut Logger) {
+        // Remove from FORWARD (only if we had a veth interface and hooked it).
+        // Must match the `-i` direction used at insertion so the delete finds
+        // the rule; a `-o` delete would silently leak the FORWARD hook.
+        if let Some(ref iface) = self.veth_interface {
+            let _ = Self::run_iptables(
+                &["-D", "FORWARD", "-i", iface, "-j", &self.chain_name],
+                logger,
+            );
+            let _ = Self::run_ip6tables(
+                &["-D", "FORWARD", "-i", iface, "-j", &self.chain_name],
+                logger,
+            );
+        }
+
+        // Flush and delete the chains.
+        let _ = Self::run_iptables(&["-F", &self.chain_name], logger);
+        let _ = Self::run_iptables(&["-X", &self.chain_name], logger);
+        let _ = Self::run_ip6tables(&["-F", &self.chain_name], logger);
+        let _ = Self::run_ip6tables(&["-X", &self.chain_name], logger);
+    }
+
+    /// Remove all iptables/ip6tables rules created by this manager.
     pub fn remove_firewall_rules(&mut self, logger: &mut Logger) -> Result<(), String> {
         if !self.rules_applied {
             return Ok(());
         }
 
-        logger.log_line(&format!("Removing iptables chain: {}", self.chain_name));
+        logger.log_line(&format!(
+            "Removing iptables/ip6tables chain: {}",
+            self.chain_name
+        ));
 
-        // Remove from FORWARD (only if we had a veth interface and hooked it)
-        if let Some(ref iface) = self.veth_interface {
-            let _ = Self::run_iptables(
-                &["-D", "FORWARD", "-o", iface, "-j", &self.chain_name],
-                logger,
-            );
-        }
-
-        // Flush and delete the chain
-        let _ = Self::run_iptables(&["-F", &self.chain_name], logger);
-        let _ = Self::run_iptables(&["-X", &self.chain_name], logger);
+        self.teardown_chains(logger);
 
         self.rules_applied = false;
         Ok(())
@@ -469,6 +683,132 @@ impl Drop for NetworkIptablesManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wxc_common::models::{ProxyAddress, ProxyConfig};
+
+    fn test_logger() -> Logger {
+        Logger::new(wxc_common::logger::Mode::Buffer)
+    }
+
+    fn proxy_from_url(url: &str, host: &str, port: u16) -> ProxyConfig {
+        ProxyConfig {
+            address: Some(ProxyAddress::from_url(url, host.to_string(), port)),
+            builtin_test_server: false,
+        }
+    }
+
+    #[test]
+    fn proxy_mode_default_action_is_drop_regardless_of_default_policy() {
+        // Model 2 is "deny all except the proxy": even an explicit
+        // defaultPolicy=allow must not reopen the chain.
+        assert_eq!(
+            NetworkIptablesManager::default_policy_action(NetworkPolicy::Allow, true),
+            "DROP"
+        );
+        assert_eq!(
+            NetworkIptablesManager::default_policy_action(NetworkPolicy::Block, true),
+            "DROP"
+        );
+        assert_eq!(
+            NetworkIptablesManager::default_policy_action(NetworkPolicy::Allow, false),
+            "ACCEPT"
+        );
+        assert_eq!(
+            NetworkIptablesManager::default_policy_action(NetworkPolicy::Block, false),
+            "DROP"
+        );
+    }
+
+    #[test]
+    fn base_chain_rules_are_family_agnostic() {
+        // The same argv is replayed against iptables and ip6tables, so it must
+        // not name an address family (no -4/-6, no literal addresses).
+        let rules = NetworkIptablesManager::build_base_chain_rule_args("MXC-test");
+        assert_eq!(rules.len(), 2);
+        for rule in &rules {
+            assert_eq!(rule[0], "-A");
+            assert_eq!(rule[1], "MXC-test");
+            assert!(
+                !rule.iter().any(|a| a == "-4" || a == "-6" || a == "-d"),
+                "base rule must be family-agnostic: {rule:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_endpoint_rule_is_followed_by_drop() {
+        let endpoints = vec![ProxyEndpoint {
+            ip: "10.1.2.3".to_string(),
+            port: 8080,
+        }];
+        let rules = NetworkIptablesManager::build_ordered_egress_rules(
+            "MXC-test",
+            &[],
+            &[],
+            NetworkPolicy::Allow,
+            &endpoints,
+        );
+
+        assert_eq!(rules.len(), 2, "expected one ACCEPT plus the closing DROP");
+        assert!(rules[0].contains(&"10.1.2.3".to_string()));
+        assert!(rules[0].contains(&"8080".to_string()));
+        assert_eq!(rules[0].last().unwrap(), "ACCEPT");
+        assert_eq!(rules[1].last().unwrap(), "DROP");
+    }
+
+    #[test]
+    fn pin_proxy_rewrites_hostname_to_resolved_ip() {
+        // localhost is the one hostname guaranteed resolvable in CI, so it is
+        // used here as a stand-in for any A-record proxy host.
+        let proxy = proxy_from_url("http://localhost:8080", "localhost", 8080);
+        let mut logger = test_logger();
+
+        let pinned = NetworkIptablesManager::pin_proxy_to_resolved_ip(&proxy, &mut logger)
+            .expect("localhost should resolve");
+        let address = pinned.address.expect("pinned proxy keeps an address");
+
+        assert_eq!(address.host(), "127.0.0.1");
+        assert_eq!(address.port(), 8080);
+        // The injected HTTP(S)_PROXY must name the same literal the firewall
+        // ACCEPT was written for — not the original hostname.
+        assert_eq!(address.to_url(), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn pin_proxy_leaves_ip_literals_untouched() {
+        let proxy = proxy_from_url("http://10.0.0.9:3128", "10.0.0.9", 3128);
+        let mut logger = test_logger();
+
+        let pinned = NetworkIptablesManager::pin_proxy_to_resolved_ip(&proxy, &mut logger)
+            .expect("IP literals need no resolution");
+        let address = pinned.address.expect("address preserved");
+
+        assert_eq!(address.host(), "10.0.0.9");
+        assert_eq!(address.to_url(), "http://10.0.0.9:3128");
+    }
+
+    #[test]
+    fn pin_proxy_is_a_noop_when_disabled() {
+        let mut logger = test_logger();
+        let pinned =
+            NetworkIptablesManager::pin_proxy_to_resolved_ip(&ProxyConfig::default(), &mut logger)
+                .expect("disabled proxy is not an error");
+        assert!(!pinned.is_enabled());
+    }
+
+    #[test]
+    fn pin_proxy_errors_when_hostname_does_not_resolve() {
+        // Fail closed: model 2 allows exactly one destination, so an
+        // unresolvable proxy must abort setup rather than silently produce a
+        // chain that drops everything.
+        let proxy = proxy_from_url(
+            "http://proxy.invalid:8080",
+            "this-host-does-not-exist.invalid",
+            8080,
+        );
+        let mut logger = test_logger();
+
+        assert!(NetworkIptablesManager::pin_proxy_to_resolved_ip(&proxy, &mut logger).is_err());
+    }
 
     #[test]
     fn chain_name_sanitization() {
