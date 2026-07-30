@@ -137,7 +137,7 @@ extends:
               waitforreleasecompletion: true
               serviceendpointurl: 'https://api.esrp.microsoft.com'
               mainpublisher: ESRPRELPACMAN
-              domaintenantid: ${{ parameters.ESRPInfo.tenantId }} 
+              domaintenantid: ${{ parameters.ESRPInfo.tenantId }}
 
     - ${{ if parameters.publishCrates }}:
       - stage: Publish_to_CratesIo
