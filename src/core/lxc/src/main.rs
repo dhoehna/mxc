@@ -126,7 +126,10 @@ fn run_state_aware_main(
     parsed.request.testing_features_enabled = testing_features;
     parsed.request.dry_run = dry_run;
 
-    let outcome = mxc_engine::run_state_aware(parsed, dry_run);
+    // Shares the `wxc` executor's telemetry / correlation-vector orchestration
+    // rather than calling dispatch directly, so a Linux lifecycle emits the same
+    // events, carries the same MS-CV, and installs the same crash hook.
+    let outcome = mxc_engine::run_state_aware_with_telemetry(parsed, dry_run, experimental, logger);
     let buffered = logger.get_buffer().to_string();
     if !buffered.is_empty() {
         eprint!("{}", buffered);
