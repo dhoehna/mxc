@@ -14,6 +14,13 @@ parameters:
     type: boolean
     default: false
 
+  # Opt-in while multi-package `cargo package` is blocked by
+  # https://github.com/rust-lang/cargo/issues/17196 when crates.io is replaced
+  # by the private ingestion feed.
+  - name: packageCrates
+    type: boolean
+    default: false
+
   - name: ESRPInfo
     type: object
     default:
@@ -82,9 +89,9 @@ stages:
 
   - template: Mxc.Binary.Packaging.Job.yml
 
-# Crate packaging only runs on the official (signed) build -- PR/CI builds have
-# no reason to produce the crates.io release artifact.
-- ${{ if parameters.isOfficialBuild }}:
+# Crate packaging is official-build-only and explicitly opt-in until Cargo
+# #17196 is fixed or the packaging implementation no longer depends on it.
+- ${{ if and(parameters.isOfficialBuild, parameters.packageCrates) }}:
   - stage: Package_Crates
     displayName: 'Package Crates'
     # Source-only (no binaries), so it does not depend on Build_Binaries. Produces

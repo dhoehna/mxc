@@ -11,8 +11,11 @@
 #
 # One-time enablement (out of band): OSPO OSS-release registration, crate-name
 # reservation under `microsoft-oss-releases`, and ESRP `Rust` content-type
-# onboarding for the ESRP client id (see the ESRP crates.io docs). No
-# CARGO_REGISTRY_TOKEN or variable group is needed -- ESRP owns the credentials.
+# onboarding for the ESRP client id (see the ESRP crates.io docs). The release
+# pool's network-isolation policy must also allow read-only HTTPS access to
+# `index.crates.io`; build-time dependency consumption remains on the private
+# Mxc-Azure-Feed. No CARGO_REGISTRY_TOKEN or variable group is needed -- ESRP
+# owns the credentials.
 
 trigger: none
 name: $(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
@@ -47,24 +50,26 @@ parameters:
   # .azure-pipelines/scripts/crates_release.py; verified at run time by
   # `verify-order`, which fails the release if the two disagree.
   #
-  # WARNING: this default is a KNOWN-INCOMPLETE placeholder (an outdated 10-crate
-  # closure). The real mxc-sdk closure is 17 crates -- a refactor added the
-  # `mxc_engine` hub crate. Do NOT set publishCrates=true until this list is
-  # reconciled to the final closure AND the blockers in crates_release.py's CRATES
-  # comment are resolved (7 path deps missing `version`; isolation_session_bindings
-  # is publish=false; OSPO OSS-release setup + crate-name reservation).
   - name: crateOrder
     type: object
     default:
-      - mxc_telemetry
       - nanvix_common
-      - mxc_pty
-      - sandbox_spec
+      - mxc_telemetry
       - wxc_common
+      - nanvix_runner
+      - hyperlight_common
+      - mxc_pty
       - lxc_common
-      - seatbelt_common
-      - appcontainer_common
       - bwrap_common
+      - seatbelt_common
+      - sandbox_spec
+      - appcontainer_common
+      - isolation_session_bindings
+      - isolation_session_common
+      - windows_sandbox_common
+      - windows_sandbox_lifecycle
+      - wslc_common
+      - mxc_engine
       - mxc-sdk
   - name: ESRPInfo
     type: object

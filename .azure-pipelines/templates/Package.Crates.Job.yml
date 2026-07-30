@@ -7,10 +7,11 @@
 #
 # Source-only: unlike the npm SDK this needs no built binaries, only a cargo
 # toolchain plus the internal Mxc-Azure-Feed for dependency resolution.
-# `cargo package --no-verify` tars each crate's source without compiling, so a
-# non-leaf crate packages even though its first-party deps are not yet on
-# crates.io. Source replacement in .cargo/config.toml is a resolution-time
-# concern only and is never written into the produced `.crate` manifests.
+# `cargo package --no-verify` tars each crate's source without compiling, while
+# the helper validates that the complete first-party dependency graph is
+# publishable and leaf-first. This job is currently opt-in because Cargo
+# https://github.com/rust-lang/cargo/issues/17196 prevents multi-package
+# packaging when crates.io is replaced by the private feed.
 #
 # The helper script is copied into the artifact so the release job can run its
 # `stage`/`wait`/`verify-order` subcommands without checking out the source.
@@ -37,8 +38,8 @@ jobs:
           targetTriple: x86_64-unknown-linux-gnu
 
       # Resolve dependencies through the internal feed (official build has the
-      # System.AccessToken needed to authenticate). Only affects resolution;
-      # the packaged .crate files still reference crates.io.
+      # System.AccessToken needed to authenticate). Cargo #17196 currently
+      # causes unpublished workspace siblings to be looked up in this feed.
       - template: Cargo.Setup.Private.yml@self
 
       - script: |
