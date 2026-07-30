@@ -115,13 +115,30 @@ export interface LxcProvisionConfig {
 }
 
 /**
- * Network policy accepted by LXC state-aware `start`. Structurally
- * `NetworkConfig` minus `proxy`: the Rust LXC state-aware runner rejects
- * `network.proxy` at start (`apply_network_policy` returns a policy-validation
- * error), so excluding it here surfaces the constraint at compile time instead
- * of pushing a preventable failure to runtime.
+ * Network policy accepted by LXC state-aware `start`.
+ *
+ * Deliberately narrowed to the fields this backend actually honors, rather
+ * than derived from `NetworkConfig`, so configurations that would fail or be
+ * silently ignored are caught at compile time:
+ *
+ * - `proxy` is rejected at start (`apply_network_policy` returns a
+ *   policy-validation error).
+ * - `removeRulesOnExit` is an SDK-only field emitted inside the top-level
+ *   `network` object. Rust's `wire::Network` is `deny_unknown_fields`, so
+ *   sending it fails the whole request.
+ * - `allowLocalNetwork` deserializes, but the LXC backend never translates it
+ *   into an iptables rule, so it would be silently ignored.
+ * - `enforcementMode` is restricted to the firewall modes. LXC has no
+ *   capability-based network enforcement, so `'capabilities'` cannot enforce
+ *   anything; start rejects it when the policy carries any restriction.
  */
-export type LxcNetworkConfig = Omit<NetworkConfig, 'proxy'>;
+export type LxcNetworkConfig = Pick<
+  NetworkConfig,
+  'defaultPolicy' | 'allowedHosts' | 'blockedHosts'
+> & {
+  /** LXC enforces network policy only via iptables. */
+  enforcementMode?: 'firewall' | 'both';
+};
 
 export interface LxcStartConfig {
   /** Schema version (semver). */

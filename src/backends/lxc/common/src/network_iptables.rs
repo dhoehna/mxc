@@ -231,10 +231,16 @@ impl NetworkIptablesManager {
         logger.log_line(&format!("Default network policy: {}", default_action));
         Self::run_iptables(&["-A", &self.chain_name, "-j", default_action], logger)?;
 
-        // Hook the chain into FORWARD for the container's traffic
+        // Hook the chain into FORWARD for the container's egress traffic.
+        //
+        // Packets originating in the container arrive at the host on the
+        // host-side veth, so container egress matches FORWARD by *input*
+        // interface (`-i`). `-o <veth>` matches traffic flowing the other way,
+        // toward the container, which leaves container egress — the thing this
+        // policy exists to restrict — entirely unfiltered.
         if let Some(ref iface) = self.veth_interface {
             Self::run_iptables(
-                &["-I", "FORWARD", "-o", iface, "-j", &self.chain_name],
+                &["-I", "FORWARD", "-i", iface, "-j", &self.chain_name],
                 logger,
             )?;
         } else {
@@ -258,10 +264,12 @@ impl NetworkIptablesManager {
 
         logger.log_line(&format!("Removing iptables chain: {}", self.chain_name));
 
-        // Remove from FORWARD (only if we had a veth interface and hooked it)
+        // Remove from FORWARD (only if we had a veth interface and hooked it).
+        // Must match the `-i` direction used at insertion, or the delete finds
+        // no rule and the FORWARD hook leaks.
         if let Some(ref iface) = self.veth_interface {
             let _ = Self::run_iptables(
-                &["-D", "FORWARD", "-o", iface, "-j", &self.chain_name],
+                &["-D", "FORWARD", "-i", iface, "-j", &self.chain_name],
                 logger,
             );
         }

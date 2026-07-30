@@ -14,11 +14,13 @@ use serde::Serialize;
 
 use wxc_common::id::mint_random_token;
 use wxc_common::logger::{Logger, Mode};
-use wxc_common::models::{ContainerPolicy, ExecutionRequest, LxcConfig, NetworkEnforcementMode};
+use wxc_common::models::{
+    ContainerPolicy, ExecutionRequest, LxcConfig, NetworkEnforcementMode, NetworkPolicy,
+};
 use wxc_common::mxc_error::MxcError;
 use wxc_common::state_aware_backend::{
-    DeprovisionResult, ExecHandle, ProvisionResult, StartResult, StatefulSandboxBackend,
-    StopResult, null_pipe_handle,
+    null_pipe_handle, DeprovisionResult, ExecHandle, ProvisionResult, StartResult,
+    StatefulSandboxBackend, StopResult,
 };
 
 use crate::filesystem_mounts;
@@ -136,6 +138,26 @@ fn has_network_policy(policy: &ContainerPolicy) -> bool {
         || policy.network_proxy.is_enabled()
 }
 
+/// `true` when the policy asks for a network restriction that LXC can only
+/// deliver through iptables.
+///
+/// LXC has no capability-based network enforcement, so under
+/// `NetworkEnforcementMode::Capabilities` — the default when `enforcementMode`
+/// is omitted — `apply_firewall_rules` returns a successful no-op. Any
+/// restriction expressed here would therefore be silently unenforced.
+fn requires_firewall_enforcement(policy: &ContainerPolicy) -> bool {
+    !policy.allowed_hosts.is_empty()
+        || !policy.blocked_hosts.is_empty()
+        || matches!(policy.default_network_policy, NetworkPolicy::Block)
+}
+
+fn uses_firewall_mode(policy: &ContainerPolicy) -> bool {
+    matches!(
+        policy.network_enforcement_mode,
+        NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
+    )
+}
+
 fn reject_start_policy_on_other_phase(
     phase: &str,
     policy: &ContainerPolicy,
@@ -211,13 +233,40 @@ fn apply_network_policy(
     }
 
     let policy = normalized_policy(request, logger)?;
+
+    // Reject a policy this backend cannot enforce, rather than reporting a
+    // successful start that silently leaves the container unfiltered. LXC
+    // enforces network policy only through iptables, and `apply_firewall_rules`
+    // treats any non-firewall mode as a successful no-op.
+    if requires_firewall_enforcement(&policy) && !uses_firewall_mode(&policy) {
+        return Err(MxcError::policy_validation(format!(
+            "LXC state-aware start cannot enforce this network policy under \
+             enforcementMode {:?}: LXC has no capability-based network enforcement, \
+             so allowedHosts/blockedHosts/defaultPolicy 'block' would be ignored. \
+             Use enforcementMode 'firewall' or 'both'.",
+            policy.network_enforcement_mode
+        )));
+    }
+
     if has_network_policy(&policy) {
         let _ = wait_for_network(container, Duration::from_secs(10));
     }
 
     let mut fw_manager = NetworkIptablesManager::new(container.name());
-    if let Some(veth) = NetworkIptablesManager::discover_veth_interface(container.name()) {
-        fw_manager.set_veth_interface(&veth);
+    match NetworkIptablesManager::discover_veth_interface(container.name()) {
+        Some(veth) => fw_manager.set_veth_interface(&veth),
+        // Without the host-side veth the chain cannot be hooked into FORWARD,
+        // so the rules are built but never consulted. `apply_firewall_rules`
+        // only warns in that case, so catch it here: a default-deny policy must
+        // not fail open.
+        None if uses_firewall_mode(&policy) => {
+            return Err(MxcError::policy_validation(
+                "LXC state-aware start could not discover the container's host-side veth \
+                 interface, so iptables rules cannot be scoped to the container and the \
+                 network policy would not be enforced",
+            ));
+        }
+        None => {}
     }
 
     match fw_manager.apply_firewall_rules(&policy, logger) {
@@ -499,6 +548,65 @@ mod tests {
         LxcConfig {
             distribution: "alpine".to_string(),
             release: "3.20".to_string(),
+        }
+    }
+
+    fn restrictive_policy() -> ContainerPolicy {
+        ContainerPolicy {
+            blocked_hosts: vec!["evil.example.com".to_string()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn restrictions_require_firewall_enforcement() {
+        // allowedHosts / blockedHosts / defaultPolicy=block are only ever
+        // enforced through iptables on this backend.
+        assert!(requires_firewall_enforcement(&restrictive_policy()));
+        assert!(requires_firewall_enforcement(&ContainerPolicy {
+            allowed_hosts: vec!["example.com".to_string()],
+            ..Default::default()
+        }));
+        assert!(requires_firewall_enforcement(&ContainerPolicy {
+            default_network_policy: NetworkPolicy::Block,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn unrestricted_policy_does_not_require_firewall_enforcement() {
+        let policy = ContainerPolicy {
+            default_network_policy: NetworkPolicy::Allow,
+            ..Default::default()
+        };
+        assert!(!requires_firewall_enforcement(&policy));
+    }
+
+    #[test]
+    fn capabilities_mode_cannot_carry_lxc_network_restrictions() {
+        // `Capabilities` is the default when `enforcementMode` is omitted, and
+        // LXC has no capability-based network enforcement. A restrictive policy
+        // under that mode must be rejected rather than reported as a successful
+        // start that leaves the container unfiltered.
+        let policy = ContainerPolicy {
+            network_enforcement_mode: NetworkEnforcementMode::Capabilities,
+            ..restrictive_policy()
+        };
+        assert!(requires_firewall_enforcement(&policy));
+        assert!(!uses_firewall_mode(&policy));
+    }
+
+    #[test]
+    fn firewall_modes_are_accepted_for_restrictive_policies() {
+        for mode in [
+            NetworkEnforcementMode::Firewall,
+            NetworkEnforcementMode::Both,
+        ] {
+            let policy = ContainerPolicy {
+                network_enforcement_mode: mode,
+                ..restrictive_policy()
+            };
+            assert!(uses_firewall_mode(&policy));
         }
     }
 

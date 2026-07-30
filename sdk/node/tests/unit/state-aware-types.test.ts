@@ -159,14 +159,15 @@ describe('IsolationSessionStopConfig and IsolationSessionDeprovisionConfig', () 
 });
 
 describe('LxcStartConfig', () => {
-  it('accepts network fields other than proxy', () => {
+  it('accepts the network fields LXC actually enforces', () => {
     const cfg: StartConfigFor<'lxc'> = {
       version: '0.6.0-alpha',
       filesystem: { readwritePaths: ['/workspace'] },
       network: {
+        enforcementMode: 'firewall',
         defaultPolicy: 'block',
         allowedHosts: ['example.com'],
-        removeRulesOnExit: true,
+        blockedHosts: ['blocked.example.com'],
       },
     };
     assert.strictEqual(cfg.network?.defaultPolicy, 'block');
@@ -177,6 +178,38 @@ describe('LxcStartConfig', () => {
       network: {
         // @ts-expect-error — LXC state-aware start does not support network.proxy.
         proxy: { builtinTestServer: true },
+      },
+    };
+    assert.ok(cfg);
+  });
+
+  it('rejects removeRulesOnExit, which Rust would reject as an unknown field', () => {
+    // `wire::Network` is `deny_unknown_fields` and has no `removeRulesOnExit`,
+    // so emitting it inside the top-level `network` object fails the request.
+    const cfg: StartConfigFor<'lxc'> = {
+      network: {
+        // @ts-expect-error — SDK-only field; not part of the LXC wire surface.
+        removeRulesOnExit: true,
+      },
+    };
+    assert.ok(cfg);
+  });
+
+  it('rejects allowLocalNetwork, which the LXC backend never enforces', () => {
+    const cfg: StartConfigFor<'lxc'> = {
+      network: {
+        // @ts-expect-error — accepted by the wire type but ignored by LXC.
+        allowLocalNetwork: true,
+      },
+    };
+    assert.ok(cfg);
+  });
+
+  it("rejects enforcementMode 'capabilities', which LXC cannot implement", () => {
+    const cfg: StartConfigFor<'lxc'> = {
+      network: {
+        // @ts-expect-error — LXC enforces network policy only via iptables.
+        enforcementMode: 'capabilities',
       },
     };
     assert.ok(cfg);
