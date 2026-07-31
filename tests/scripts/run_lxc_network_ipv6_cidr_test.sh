@@ -26,6 +26,7 @@ if [ ! -f "$LXC_EXEC" ]; then
 fi
 
 CONFIG="$REPO_DIR/tests/configs/lxc_network_ipv6_cidr.json"
+CHAIN_NAME="MXC-CLI-LXC-Network-IPv6"
 EXPECTED_HOSTS=(
     "140.82.112.0/20"
     "2606:50c0::/32"
@@ -38,6 +39,15 @@ EXPECTED_HOSTS=(
 fail() {
     echo "FAIL: $1"
     exit 1
+}
+
+assert_firewall_chain_cleaned_up() {
+    if sudo -n iptables -S "$CHAIN_NAME" >/dev/null 2>&1; then
+        fail "iptables chain '$CHAIN_NAME' was left behind after lxc-exec completed."
+    fi
+    if sudo -n ip6tables -S "$CHAIN_NAME" >/dev/null 2>&1; then
+        fail "ip6tables chain '$CHAIN_NAME' was left behind after lxc-exec completed."
+    fi
 }
 
 load_config_hosts() {
@@ -74,7 +84,7 @@ echo "Running LXC IPv6/CIDR network filtering test..."
 
 # The container command may fail on a host with no outbound route; the firewall
 # assertions below are what this test is about.
-OUTPUT=$("$LXC_EXEC" "$CONFIG" 2>&1 || true)
+OUTPUT=$("$LXC_EXEC" --debug "$CONFIG" 2>&1 || true)
 echo "$OUTPUT"
 
 # Every allow/block entry must survive resolution. An unparsed CIDR or IPv6
@@ -99,6 +109,8 @@ fi
 if echo "$OUTPUT" | grep -q "IPv6 firewall rule(s) not applied"; then
     fail "IPv6 rules were skipped; ip6tables is unusable on this host."
 fi
+
+assert_firewall_chain_cleaned_up
 
 echo "PASS: IPv6 and CIDR entries were resolved and programmed."
 echo "LXC IPv6/CIDR network filtering test complete."

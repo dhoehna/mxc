@@ -21,6 +21,7 @@ if [ ! -f "$LXC_EXEC" ]; then
 fi
 
 CONFIG="$REPO_DIR/tests/configs/lxc_network_dualstack_hostname.json"
+CHAIN_NAME="MXC-CLI-LXC-Network-Dual"
 EXPECTED_ALLOWED_HOST_COUNT=5
 EXPECTED_BLOCKED_HOST_COUNT=2
 EXPECTED_ALLOWED_HOSTS=(
@@ -49,6 +50,15 @@ OFFLINE_SAFE_HOSTS=(
 fail() {
     echo "FAIL: $1"
     exit 1
+}
+
+assert_firewall_chain_cleaned_up() {
+    if sudo -n iptables -S "$CHAIN_NAME" >/dev/null 2>&1; then
+        fail "iptables chain '$CHAIN_NAME' was left behind after lxc-exec completed."
+    fi
+    if sudo -n ip6tables -S "$CHAIN_NAME" >/dev/null 2>&1; then
+        fail "ip6tables chain '$CHAIN_NAME' was left behind after lxc-exec completed."
+    fi
 }
 
 load_config_counts() {
@@ -135,7 +145,7 @@ echo "Running LXC dual-stack hostname network filtering test..."
 
 # The container command may fail if the host has no outbound route; this test is
 # only asserting firewall setup and hostname family handling.
-OUTPUT=$("$LXC_EXEC" "$CONFIG" 2>&1 || true)
+OUTPUT=$("$LXC_EXEC" --debug "$CONFIG" 2>&1 || true)
 echo "$OUTPUT"
 
 for host in "${ASSERT_RESOLVED_HOSTS[@]}"; do
@@ -157,6 +167,8 @@ fi
 if grep -Fq "IPv6 firewall rule(s) not applied" <<<"$OUTPUT"; then
     fail "IPv6 rules were skipped; the dual-stack bypass is still open on this run."
 fi
+
+assert_firewall_chain_cleaned_up
 
 echo "PASS: dual-stack hostnames and mixed-family destinations were resolved and programmed."
 echo "LXC dual-stack hostname network filtering test complete."

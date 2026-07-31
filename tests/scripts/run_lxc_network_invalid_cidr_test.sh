@@ -19,6 +19,7 @@ if [ ! -f "$LXC_EXEC" ]; then
 fi
 
 CONFIG="$REPO_DIR/tests/configs/lxc_network_invalid_cidr.json"
+CHAIN_NAME="MXC-CLI-LXC-Network-Inva"
 INVALID_HOSTS=(
     "140.82.112.0/33"
     "2606:50c0::/129"
@@ -30,11 +31,20 @@ fail() {
     exit 1
 }
 
+assert_firewall_chain_cleaned_up() {
+    if sudo -n iptables -S "$CHAIN_NAME" >/dev/null 2>&1; then
+        fail "iptables chain '$CHAIN_NAME' was left behind after lxc-exec completed."
+    fi
+    if sudo -n ip6tables -S "$CHAIN_NAME" >/dev/null 2>&1; then
+        fail "ip6tables chain '$CHAIN_NAME' was left behind after lxc-exec completed."
+    fi
+}
+
 echo "Running LXC invalid CIDR network filtering test..."
 
 # The process may fail because the default policy blocks egress; this test is
 # only asserting firewall validation and setup behavior.
-OUTPUT=$("$LXC_EXEC" "$CONFIG" 2>&1 || true)
+OUTPUT=$("$LXC_EXEC" --debug "$CONFIG" 2>&1 || true)
 echo "$OUTPUT"
 
 for host in "${INVALID_HOSTS[@]}"; do
@@ -52,6 +62,8 @@ fi
 if ! echo "$OUTPUT" | grep -q "Default network policy: DROP"; then
     fail "default-deny policy was not applied."
 fi
+
+assert_firewall_chain_cleaned_up
 
 echo "PASS: invalid CIDR entries were warned about without failing firewall setup."
 echo "LXC invalid CIDR network filtering test complete."

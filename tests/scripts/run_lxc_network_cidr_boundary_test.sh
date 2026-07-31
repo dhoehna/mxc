@@ -27,6 +27,7 @@ if [ ! -f "$LXC_EXEC" ]; then
 fi
 
 CONFIG="$REPO_DIR/tests/configs/lxc_network_cidr_boundary.json"
+CHAIN_NAME="MXC-CLI-LXC-Network-CIDR"
 EXPECTED_ALLOWED_HOSTS=(
     "0.0.0.0/0"
     "::/0"
@@ -45,6 +46,15 @@ EXPECTED_BLOCKED_HOSTS=(
 fail() {
     echo "FAIL: $1"
     exit 1
+}
+
+assert_firewall_chain_cleaned_up() {
+    if sudo -n iptables -S "$CHAIN_NAME" >/dev/null 2>&1; then
+        fail "iptables chain '$CHAIN_NAME' was left behind after lxc-exec completed."
+    fi
+    if sudo -n ip6tables -S "$CHAIN_NAME" >/dev/null 2>&1; then
+        fail "ip6tables chain '$CHAIN_NAME' was left behind after lxc-exec completed."
+    fi
 }
 
 load_config_hosts() {
@@ -107,7 +117,7 @@ ALL_CONFIG_HOSTS=("${CONFIG_ALLOWED_HOSTS[@]}" "${CONFIG_BLOCKED_HOSTS[@]}")
 echo "Running LXC CIDR boundary network filtering test..."
 
 set +e
-OUTPUT=$("$LXC_EXEC" "$CONFIG" 2>&1)
+OUTPUT=$("$LXC_EXEC" --debug "$CONFIG" 2>&1)
 STATUS=$?
 set -e
 echo "$OUTPUT"
@@ -142,6 +152,8 @@ fi
 if echo "$OUTPUT" | grep -qE "^(ip6?tables) .* failed:|Firewall setup failed:"; then
     fail "iptables/ip6tables rejected a boundary-valid rule."
 fi
+
+assert_firewall_chain_cleaned_up
 
 echo "PASS: CIDR boundary entries were resolved and programmed with default allow."
 echo "LXC CIDR boundary network filtering test complete."
