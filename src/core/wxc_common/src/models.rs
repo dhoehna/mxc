@@ -394,6 +394,11 @@ pub enum RuleAction {
 }
 
 /// A destination port selector: a single port or an inclusive range.
+///
+/// Interim shape. The sandbox policy spec expresses ranges as flat
+/// `ports[].port` + `ports[].endPort` (Kubernetes `endPort` style); this
+/// enum will be reconciled to that shape once the schema work lands and
+/// there is a parser that populates `egress_rules`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum PortSpec {

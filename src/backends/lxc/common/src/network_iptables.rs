@@ -397,19 +397,27 @@ impl NetworkIptablesManager {
         args
     }
 
-    /// Invalid port ranges are skipped instead of being passed to iptables,
-    /// which would reject the command and roll back the whole firewall apply.
-    fn log_invalid_port_selectors(policy: &ContainerPolicy, logger: &mut Logger) {
+    /// Reject a policy containing a malformed port selector instead of
+    /// dropping the offending rule. Skipping is unsafe for a `Deny` rule: the
+    /// traffic it was meant to block would fall through to the default policy,
+    /// which silently widens access under `defaultPolicy: allow`. The sandbox
+    /// policy spec takes the same position — a configuration a backend cannot
+    /// enforce is rejected rather than run advisory.
+    ///
+    /// Called before any chain is created so a bad policy fails before it
+    /// mutates host firewall state.
+    fn validate_port_selectors(policy: &ContainerPolicy) -> Result<(), String> {
         for rule in &policy.egress_rules {
             for port in rule.ports.iter().filter(|port| !port.is_valid()) {
                 if let PortSpec::Range { start, end } = port {
-                    logger.log_line(&format!(
-                        "Warning: skipping invalid egress port range '{}:{}' (start > end)",
+                    return Err(format!(
+                        "invalid egress port range '{}:{}': start must not be greater than end",
                         start, end
                     ));
                 }
             }
         }
+        Ok(())
     }
 
     /// Build the allow/deny rule args for a container policy.
@@ -575,6 +583,10 @@ impl NetworkIptablesManager {
             self.chain_name
         ));
 
+        // Reject a malformed policy before creating any chain, so nothing has
+        // to be rolled back and a Deny rule is never silently dropped.
+        Self::validate_port_selectors(policy)?;
+
         // Probe ip6tables once. On IPv4-only hosts (binary absent or IPv6
         // disabled in the kernel) enforce the v4 policy and skip the v6 chain
         // rather than failing setup for a policy that worked before dual-stack.
@@ -601,8 +613,6 @@ impl NetworkIptablesManager {
                 logger.log_line(&format!("Warning: could not resolve host '{}'", host));
             }
         }
-
-        Self::log_invalid_port_selectors(policy, logger);
 
         let policy_rules = Self::build_policy_rule_args(&self.chain_name, policy);
         Self::run_iptables_rule_args(&policy_rules.ipv4, logger)?;
@@ -1014,6 +1024,41 @@ mod tests {
                 "DROP",
             ])]
         );
+    }
+
+    #[test]
+    fn validate_port_selectors_rejects_inverted_range() {
+        let policy = ContainerPolicy {
+            egress_rules: vec![EgressRule {
+                destinations: vec!["10.0.0.1".to_string()],
+                ports: vec![range(9000, 8000)],
+                action: RuleAction::Deny,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let err = NetworkIptablesManager::validate_port_selectors(&policy)
+            .expect_err("an inverted port range must be rejected, not silently skipped");
+        assert!(
+            err.contains("9000:8000"),
+            "error should name the offending range, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_port_selectors_accepts_valid_and_single_value_ranges() {
+        let policy = ContainerPolicy {
+            egress_rules: vec![EgressRule {
+                destinations: vec!["10.0.0.1".to_string()],
+                ports: vec![single(443), range(8000, 8999), range(443, 443)],
+                action: RuleAction::Allow,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(NetworkIptablesManager::validate_port_selectors(&policy).is_ok());
     }
 
     #[test]
