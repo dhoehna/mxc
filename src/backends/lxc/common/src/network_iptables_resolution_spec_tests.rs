@@ -183,6 +183,55 @@ fn empty_input_resolves_to_nothing() {
     assert_destination_family("", None);
 }
 
+/// Every string in a bucket must be a destination of that bucket's family.
+///
+/// This is the invariant that keeps an AAAA record from being handed to
+/// `iptables` (and an A record to `ip6tables`). It is asserted as a property so
+/// it holds whatever the resolver happens to return.
+fn assert_buckets_are_family_pure(input: &str, resolved: &ResolvedDestinations) {
+    for destination in &resolved.ipv4 {
+        assert_eq!(
+            NetworkIptablesManager::destination_family(destination),
+            Some(IpFamily::V4),
+            "{input:?}: {destination:?} is in the ipv4 bucket but is not an IPv4 destination"
+        );
+    }
+    for destination in &resolved.ipv6 {
+        assert_eq!(
+            NetworkIptablesManager::destination_family(destination),
+            Some(IpFamily::V6),
+            "{input:?}: {destination:?} is in the ipv6 bucket but is not an IPv6 destination"
+        );
+    }
+}
+
+// The DNS branch is where the dual-stack bypass lived: AAAA records must land in
+// the v6 bucket. `localhost` alone cannot pin this -- on many hosts it resolves
+// to 127.0.0.1 only, leaving the v6 DNS arm unexecuted -- so this uses
+// well-known dual-stack names and asserts family purity on whatever comes back.
+//
+// If no name yields an AAAA record the environment has no v6 DNS. The purity
+// assertions still run and the shortfall is reported loudly rather than passing
+// silently. End-to-end coverage lives in run_lxc_network_dualstack_test.sh.
+#[test]
+fn aaaa_records_land_in_the_v6_bucket_and_never_in_the_v4_bucket() {
+    let hosts = ["dns.google", "one.one.one.one", "localhost"];
+    let mut saw_v6 = false;
+
+    for host in hosts {
+        let resolved = NetworkIptablesManager::resolve_host(host);
+        assert_buckets_are_family_pure(host, &resolved);
+        saw_v6 |= !resolved.ipv6.is_empty();
+    }
+
+    if !saw_v6 {
+        eprintln!(
+            "WARNING: no AAAA record resolved for any of {hosts:?}; the IPv6 DNS \
+             arm of resolve_host was not exercised by this run."
+        );
+    }
+}
+
 #[test]
 fn localhost_resolution_populates_available_loopback_families() {
     let resolved = NetworkIptablesManager::resolve_host("localhost");
@@ -207,6 +256,7 @@ fn localhost_resolution_populates_available_loopback_families() {
         "localhost IPv6 results should all be ::1, got {:?}",
         resolved.ipv6
     );
+    assert_buckets_are_family_pure("localhost", &resolved);
 }
 
 #[test]
