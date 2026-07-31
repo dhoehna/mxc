@@ -12,11 +12,18 @@
 use std::ffi::c_void;
 use std::fmt::Write;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::ptr;
+use std::sync::Arc;
+
+use learning_mode_windows::{
+    CaptureSession, LearningModeApi, SecurityEnvironmentApi, SecurityEnvironmentStartupInfo,
+    PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
+};
 
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, SetHandleInformation, ERROR_CALL_NOT_IMPLEMENTED, E_NOTIMPL, HANDLE,
-    HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, SetHandleInformation, ERROR_CALL_NOT_IMPLEMENTED,
+    ERROR_NOT_SUPPORTED, E_NOTIMPL, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -25,10 +32,11 @@ use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, TerminateProcess, WaitForSingleObject, PROCESS_INFORMATION,
+    CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
     STARTF_USESTDHANDLES, STARTUPINFOW,
 };
-use windows_core::PCWSTR;
+use windows_core::{PCWSTR, PWSTR};
 
 use crate::job_object::UiJobObject;
 use crate::launch_diagnostics::{
@@ -107,6 +115,83 @@ type PfnCreateProcessInSandbox = unsafe extern "system" fn(
 /// ambiguous and must not be read as "sandbox unsupported".
 type PfnQuerySandboxSupport = unsafe extern "system" fn(capabilities: *mut u64) -> i32;
 
+struct SandboxLaunchArgs<'a> {
+    api: PfnCreateProcessInSandbox,
+    command_line: &'a mut [u16],
+    current_directory: *const u16,
+    startup_info: &'a STARTUPINFOW,
+    identity: &'a [u16],
+    sandbox_specification: &'a [u8],
+    no_window_flag: u32,
+}
+
+impl SandboxLaunchArgs<'_> {
+    /// Launches through the one-shot API, retrying once without the
+    /// environment block on downlevel systems that reject that parameter.
+    fn launch_with_environment_fallback(
+        &mut self,
+        creation_flags: u32,
+        environment: *const c_void,
+        process_information: &mut PROCESS_INFORMATION,
+        logger: &mut Logger,
+    ) -> (i32, Option<windows::Win32::Foundation::WIN32_ERROR>) {
+        let mut current_creation_flags = creation_flags;
+        let mut current_environment = environment;
+        let mut retries_remaining = 1;
+
+        loop {
+            *process_information = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                (self.api)(
+                    ptr::null(),
+                    self.command_line.as_mut_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    i32::from(false),
+                    current_creation_flags,
+                    current_environment,
+                    self.current_directory,
+                    self.startup_info,
+                    self.identity.as_ptr(),
+                    self.sandbox_specification.as_ptr(),
+                    self.sandbox_specification.len() as u32,
+                    process_information,
+                )
+            };
+            if result != 0 {
+                return (result, None);
+            }
+
+            let error = unsafe { GetLastError() };
+            if retries_remaining == 0
+                || !is_environment_not_supported(error.0, !current_environment.is_null())
+            {
+                return (result, Some(error));
+            }
+            retries_remaining -= 1;
+
+            unsafe {
+                if !process_information.hProcess.is_invalid() {
+                    let _ = CloseHandle(process_information.hProcess);
+                }
+                if !process_information.hThread.is_invalid() {
+                    let _ = CloseHandle(process_information.hThread);
+                }
+            }
+
+            let diagnostic = diagnose_environment_not_supported();
+            let _ = writeln!(
+                logger,
+                "{EMOJI_WARNING} Launch diagnostic [{}]: {}",
+                diagnostic.kind, diagnostic.message
+            );
+
+            current_environment = ptr::null();
+            current_creation_flags = CREATE_SUSPENDED.0 | self.no_window_flag;
+        }
+    }
+}
+
 /// `SANDBOX_CAP_CREATE_PROCESS_IN_SANDBOX`: when clear, Tier 1 is unusable.
 const SANDBOX_CAP_CREATE_PROCESS_IN_SANDBOX: u64 = 0x0000_0000_0000_0001;
 
@@ -116,6 +201,14 @@ const SANDBOX_CAP_CREATE_PROCESS_IN_SANDBOX: u64 = 0x0000_0000_0000_0001;
 /// assumed bit 1). When clear, `deniedPaths` is rejected at launch and callers
 /// must rely on default-deny plus explicit `readwrite`/`readonly` grants.
 const SANDBOX_CAP_FS_DENY: u64 = 0x0000_0000_0000_0002;
+const CAPTURE_API_AVAILABLE_LOG: &str =
+    "captureDenials: learning-mode trace API available (processmodel.dll)";
+const CAPTURE_SECURITY_ENVIRONMENT_CLEANUP_DEFERRED_REASON: &str =
+    "capture teardown failed and the process security environment may still be live";
+const CLOSE_PROCESS_SECURITY_ENVIRONMENT_API: &str = "CloseProcessSecurityEnvironment";
+const CREATE_PROCESS_IN_SANDBOX_API: &str = "Experimental_CreateProcessInSandbox";
+const CREATE_PROCESS_IN_SECURITY_ENVIRONMENT_API: &str =
+    "CreateProcessW(PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT)";
 
 /// True when a Win32 error code signals the BaseContainer feature is not
 /// enabled on this build (symbol present, capability gated off).
@@ -123,11 +216,108 @@ fn is_api_not_implemented(err: u32) -> bool {
     err == ERROR_CALL_NOT_IMPLEMENTED.0 || err == E_NOTIMPL.0 as u32
 }
 
+fn learning_mode_api_not_implemented(error: &learning_mode_windows::LearningModeError) -> bool {
+    match error {
+        learning_mode_windows::LearningModeError::DllLoad(_)
+        | learning_mode_windows::LearningModeError::ExportMissing { .. } => true,
+        learning_mode_windows::LearningModeError::ApiCall { code, .. } => {
+            is_api_not_implemented(*code) || *code == ERROR_NOT_SUPPORTED.0
+        }
+        learning_mode_windows::LearningModeError::CleanupFailed { primary, .. } => {
+            learning_mode_api_not_implemented(primary)
+        }
+        _ => false,
+    }
+}
+
+fn learning_mode_cleanup_failed(error: &learning_mode_windows::LearningModeError) -> bool {
+    match error {
+        learning_mode_windows::LearningModeError::ApiCall { function, .. } => {
+            *function == CLOSE_PROCESS_SECURITY_ENVIRONMENT_API
+        }
+        learning_mode_windows::LearningModeError::CleanupFailed { primary, cleanup } => {
+            learning_mode_cleanup_failed(primary) || learning_mode_cleanup_failed(cleanup)
+        }
+        _ => false,
+    }
+}
+
+fn combine_capture_operation_and_cleanup_errors(
+    primary: learning_mode_windows::LearningModeError,
+    cleanup: Result<(), learning_mode_windows::LearningModeError>,
+) -> learning_mode_windows::LearningModeError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => learning_mode_windows::LearningModeError::CleanupFailed {
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        },
+    }
+}
+
+trait CaptureSessionOps {
+    fn environment(&self) -> HANDLE;
+    fn finish(
+        self: Box<Self>,
+        output_path: Option<&std::path::Path>,
+    ) -> Result<(), learning_mode_windows::LearningModeError>;
+}
+
+impl CaptureSessionOps for CaptureSession {
+    fn environment(&self) -> HANDLE {
+        self.environment()
+    }
+
+    fn finish(
+        self: Box<Self>,
+        output_path: Option<&std::path::Path>,
+    ) -> Result<(), learning_mode_windows::LearningModeError> {
+        (*self).finish(output_path)
+    }
+}
+
+trait CaptureSessionFactory: Send + Sync {
+    fn begin(
+        &self,
+        sandbox_specification: &[u8],
+        flags: u32,
+    ) -> Result<Box<dyn CaptureSessionOps>, learning_mode_windows::LearningModeError>;
+}
+
+struct RealCaptureSessionFactory;
+
+impl CaptureSessionFactory for RealCaptureSessionFactory {
+    fn begin(
+        &self,
+        sandbox_specification: &[u8],
+        flags: u32,
+    ) -> Result<Box<dyn CaptureSessionOps>, learning_mode_windows::LearningModeError> {
+        let security_environment_api = SecurityEnvironmentApi::load()?;
+        let learning_mode_api = LearningModeApi::load()?;
+        CaptureSession::begin(
+            security_environment_api,
+            learning_mode_api,
+            sandbox_specification,
+            flags,
+        )
+        .map(|session| Box::new(session) as Box<dyn CaptureSessionOps>)
+    }
+}
+
 /// Script runner that uses `Experimental_CreateProcessInSandbox` API
 /// to launch a sandboxed process.
-#[derive(Default)]
 pub struct BaseContainerRunner {
     proxy_coordinator: ProxyCoordinator,
+    capture_factory: Arc<dyn CaptureSessionFactory>,
+}
+
+impl Default for BaseContainerRunner {
+    fn default() -> Self {
+        Self {
+            proxy_coordinator: ProxyCoordinator::default(),
+            capture_factory: Arc::new(RealCaptureSessionFactory),
+        }
+    }
 }
 
 /// SandboxSpec FlatBuffer schema version embedded in every spec payload.
@@ -153,6 +343,42 @@ fn run_sandbox_cleanup(
 impl BaseContainerRunner {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn with_capture_factory(capture_factory: Arc<dyn CaptureSessionFactory>) -> Self {
+        Self {
+            proxy_coordinator: ProxyCoordinator::default(),
+            capture_factory,
+        }
+    }
+
+    fn cleanup_capture_prelaunch_failure(
+        &mut self,
+        cleanup_error: Option<&learning_mode_windows::LearningModeError>,
+        request: &ExecutionRequest,
+        sid_string: &str,
+        logger: &mut Logger,
+    ) {
+        // This cannot be deferred to BaseContainerRunner::drop: the runner may
+        // outlive a failed spawn, and the exact error determines whether
+        // profile deletion is safe or recovery tracking must be retained.
+        if request.lifecycle.destroy_on_exit {
+            if cleanup_error.is_some_and(learning_mode_cleanup_failed) {
+                sandbox_tracking::mark_cleanup_deferred(
+                    sid_string,
+                    CAPTURE_SECURITY_ENVIRONMENT_CLEANUP_DEFERRED_REASON,
+                    logger,
+                );
+            } else {
+                // CaptureSession::begin receives the sandbox specification,
+                // not the later process identity. Once its environment is
+                // closed, only the pre-launch tracking entry needs removal.
+                sandbox_tracking::remove_tracking_entry(sid_string, logger);
+            }
+            sandbox_tracking::unregister_ctrl_c_cleanup();
+        }
+        self.proxy_coordinator.stop(logger);
     }
 
     /// Pre-flight probe: check whether the current OS build exports the
@@ -661,6 +887,25 @@ impl BaseContainerRunner {
 
         Self::log_sandbox_spec(&spec_bytes, logger);
 
+        let capture_denials = request.policy.capture_denials.clone();
+        if capture_denials.is_some() {
+            let _ = writeln!(logger, "{EMOJI_SECTION} SECTION: captureDenials");
+        }
+
+        // Resolve the ETL output path: caller-specified when provided, else a
+        // managed per-run temp file the runner names (parsed / cleaned up by the
+        // consume + analyze stages).
+        let capture_output_path: Option<PathBuf> = capture_denials
+            .as_ref()
+            .map(|cd| {
+                cd.output_path
+                    .clone()
+                    .map(PathBuf::from)
+                    .map(Ok)
+                    .unwrap_or_else(managed_capture_output_path)
+            })
+            .transpose()?;
+
         let _ = writeln!(logger, "{EMOJI_SECTION} SECTION: Load API");
 
         // 2. Dynamically load the API from processmodel.dll.
@@ -893,13 +1138,22 @@ impl BaseContainerRunner {
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
         // Environment block for the sandboxed child.
-        // If the caller specified explicit env vars, use only those.
-        // Otherwise, pass NULL to let the OS provide the default environment
-        // for the sandbox (CreateProcessInSandbox handles this internally).
+        // Explicit variables are always isolated from the parent environment.
+        // The one-shot API supplies its own default when this is NULL, but the
+        // attribute-based CreateProcessW capture path must receive an explicit
+        // clean block or it would inherit all wxc-exec process variables.
         let env_block: Option<Vec<u16>> = if request.env.is_empty() {
-            // TODO: consider calling CreateEnvironmentBlock(NULL, FALSE) here
-            // for a cleansed default env if the OS API doesn't do it for us.
-            None
+            if capture_denials.is_some() {
+                let entries =
+                    crate::appcontainer_runner::create_default_env_entries().map_err(|error| {
+                        ScriptResponse::error(&format!(
+                            "captureDenials failed to create a clean child environment: {error}"
+                        ))
+                    })?;
+                Some(crate::appcontainer_runner::encode_env_block(&entries))
+            } else {
+                None
+            }
         } else {
             Some(encode_env_block(&request.env))
         };
@@ -957,78 +1211,143 @@ impl BaseContainerRunner {
         //    If the OS returns ERROR_NOT_SUPPORTED (0x32) and we passed a non-null
         //    environment block, this is a downlevel build that doesn't support the
         //    `environment` parameter. Retry once without it.
-        let mut current_env_ptr = env_ptr;
-        let mut current_creation_flags = creation_flags;
-        let mut retries_remaining: u32 = 1;
+        let current_env_ptr = env_ptr;
+        let current_creation_flags = creation_flags;
 
-        // The loop yields (api_return_code, last_win32_error_on_failure).
-        let (success, last_error) = loop {
+        // When captureDenials is active, launch inside a process security
+        // environment that already has a learning-mode trace started against it,
+        // instead of the one-shot CreateProcessInSandbox. `begin` creates the
+        // environment and starts the trace *before* the child launches (so no
+        // early denials are missed); the environment handle is attached to a
+        // normal CreateProcessW call via PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT.
+        // On any early return below, `capture_session` drops and its Drop
+        // discards the trace and closes the environment (no broker leak).
+        let mut capture_session: Option<Box<dyn CaptureSessionOps>> = None;
+        if capture_denials.is_some() {
+            match self
+                .capture_factory
+                .begin(&spec_bytes, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE)
+            {
+                Ok(session) => {
+                    let _ = writeln!(
+                        logger,
+                        "{CAPTURE_API_AVAILABLE_LOG}; security environment and trace started"
+                    );
+                    capture_session = Some(session);
+                }
+                Err(e) => {
+                    let msg = format!("captureDenials: failed to start learning-mode capture: {e}");
+                    let _ = writeln!(logger, "Error: {msg}");
+                    let failure_phase = if learning_mode_api_not_implemented(&e) {
+                        FailurePhase::BackendUnavailable
+                    } else {
+                        FailurePhase::LaunchFailed
+                    };
+                    self.cleanup_capture_prelaunch_failure(Some(&e), &request, &sid_string, logger);
+                    return Err(ScriptResponse {
+                        exit_code: -1,
+                        error_message: msg.clone(),
+                        standard_err: msg,
+                        failure_phase,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        // The launch yields (api_return_code, last_win32_error_on_failure).
+        let (success, last_error, launch_api_name) = if let Some(session) = capture_session.as_ref()
+        {
+            // Single-attempt in-environment launch. The learning-mode security
+            // environment is attached as a process-thread attribute; the
+            // CreateProcessInSandbox environment fallback does not apply here.
             pi = unsafe { std::mem::zeroed() };
-
+            let inherited_handles = if pipe_mode {
+                vec![h_stdin, h_stdout, h_stderr]
+            } else {
+                Vec::new()
+            };
+            let extended_startup = match SecurityEnvironmentStartupInfo::new(
+                si,
+                session.environment(),
+                &inherited_handles,
+            ) {
+                Ok(startup) => startup,
+                Err(primary) => {
+                    let cleanup = capture_session
+                        .take()
+                        .map(|session| session.finish(None))
+                        .unwrap_or(Ok(()));
+                    let error = combine_capture_operation_and_cleanup_errors(primary, cleanup);
+                    let msg = format!(
+                            "captureDenials: failed to attach the process security environment: {error}"
+                        );
+                    let _ = writeln!(logger, "Error: {msg}");
+                    let failure_phase = if learning_mode_api_not_implemented(&error) {
+                        FailurePhase::BackendUnavailable
+                    } else {
+                        FailurePhase::LaunchFailed
+                    };
+                    self.cleanup_capture_prelaunch_failure(
+                        Some(&error),
+                        &request,
+                        &sid_string,
+                        logger,
+                    );
+                    return Err(ScriptResponse {
+                        exit_code: -1,
+                        error_message: msg.clone(),
+                        standard_err: msg,
+                        failure_phase,
+                        ..Default::default()
+                    });
+                }
+            };
+            let environment = (!current_env_ptr.is_null()).then_some(current_env_ptr);
             let result = unsafe {
-                create_process_in_sandbox(
-                    ptr::null(),           // applicationName (resolved from commandLine)
-                    cmd_wide.as_mut_ptr(), // commandLine
-                    ptr::null(),           // processAttributes (must be NULL)
-                    ptr::null(),           // threadAttributes  (must be NULL)
-                    // inheritHandles: must be FALSE per the OS sandbox API contract.
-                    // Unlike regular CreateProcess, CreateProcessInSandbox treats the
-                    // explicit STDIO handles in STARTUPINFO (hStdInput/hStdOutput/hStdError)
-                    // as inheritable when STARTF_USESTDHANDLES is set, but does not support
-                    // general handle inheritance.
-                    i32::from(false),        // inheritHandles
-                    current_creation_flags,  // creationFlags
-                    current_env_ptr,         // environment
-                    cwd_ptr,                 // currentDirectory
-                    &si,                     // startupInfo
-                    identity_wide.as_ptr(),  // identity
-                    spec_bytes.as_ptr(),     // sandboxSpecification
-                    spec_bytes.len() as u32, // sandboxSpecificationSize
-                    &mut pi,                 // processInformation
+                CreateProcessW(
+                    PCWSTR::null(),
+                    Some(PWSTR(cmd_wide.as_mut_ptr())),
+                    None,
+                    None,
+                    !inherited_handles.is_empty(),
+                    PROCESS_CREATION_FLAGS(current_creation_flags | EXTENDED_STARTUPINFO_PRESENT.0),
+                    environment,
+                    PCWSTR(cwd_ptr),
+                    &extended_startup.startup_info().StartupInfo,
+                    &mut pi,
                 )
             };
-
-            if result != 0 {
-                break (result, None);
+            if result.is_ok() {
+                (1, None, CREATE_PROCESS_IN_SECURITY_ENVIRONMENT_API)
+            } else {
+                (
+                    0,
+                    Some(unsafe { GetLastError() }),
+                    CREATE_PROCESS_IN_SECURITY_ENVIRONMENT_API,
+                )
             }
-
-            // Call failed -- capture the error before any handle cleanup.
-            let err = unsafe { GetLastError() };
-
-            if retries_remaining > 0
-                && is_environment_not_supported(err.0, !current_env_ptr.is_null())
-            {
-                retries_remaining -= 1;
-
-                // Clean up handles from the failed attempt.
-                unsafe {
-                    if !pi.hProcess.is_invalid() {
-                        let _ = CloseHandle(pi.hProcess);
-                    }
-                    if !pi.hThread.is_invalid() {
-                        let _ = CloseHandle(pi.hThread);
-                    }
-                }
-
-                let diag = diagnose_environment_not_supported();
-                let _ = writeln!(
-                    logger,
-                    "{EMOJI_WARNING} Launch diagnostic [{}]: {}",
-                    diag.kind, diag.message
-                );
-
-                // Retry without the environment block, but keep the child
-                // suspended (resumed after job assignment).
-                current_env_ptr = ptr::null();
-                current_creation_flags = CREATE_SUSPENDED.0 | no_window_flag;
-                continue;
+        } else {
+            let (success, error) = SandboxLaunchArgs {
+                api: create_process_in_sandbox,
+                command_line: &mut cmd_wide,
+                current_directory: cwd_ptr,
+                startup_info: &si,
+                identity: &identity_wide,
+                sandbox_specification: &spec_bytes,
+                no_window_flag,
             }
-
-            // Non-retryable failure.
-            break (result, Some(err));
+            .launch_with_environment_fallback(
+                current_creation_flags,
+                current_env_ptr,
+                &mut pi,
+                logger,
+            );
+            (success, error, CREATE_PROCESS_IN_SANDBOX_API)
         };
 
         if success == 0 {
+            let err = last_error.unwrap_or_else(|| unsafe { GetLastError() });
             // Clean up any partially-populated handles from the failed API call.
             unsafe {
                 if !pi.hProcess.is_invalid() {
@@ -1038,9 +1357,19 @@ impl BaseContainerRunner {
                     let _ = CloseHandle(pi.hThread);
                 }
             }
-            // The OS may have created the AppContainer profile before failing,
-            // so run the same cleanup logic used on normal exit.
-            if request.lifecycle.destroy_on_exit {
+            let capture_cleanup_error = capture_session
+                .take()
+                .and_then(|session| session.finish(None).err());
+            if capture_denials.is_some() {
+                self.cleanup_capture_prelaunch_failure(
+                    capture_cleanup_error.as_ref(),
+                    &request,
+                    &sid_string,
+                    logger,
+                );
+            } else if request.lifecycle.destroy_on_exit {
+                // The OS may have created the AppContainer profile before
+                // failing, so run the same cleanup logic used on normal exit.
                 run_sandbox_cleanup(
                     &identity,
                     &sid_string,
@@ -1052,14 +1381,19 @@ impl BaseContainerRunner {
             //
             // Diagnose the launch failure (FailurePhase::LaunchFailed).
             //
-            let err = last_error.unwrap_or_else(|| unsafe { GetLastError() });
             let diag = diagnose_create_process_failure(
                 err.0,
                 &request.script_code,
                 &request.policy.readonly_paths,
             );
 
-            let extended_error = format!("Experimental_CreateProcessInSandbox failed: {err:?}");
+            let mut extended_error = format!("{launch_api_name} failed: {err:?}");
+            if let Some(cleanup_error) = capture_cleanup_error {
+                let _ = write!(
+                    extended_error,
+                    "; capture teardown also failed: {cleanup_error}"
+                );
+            }
             let _ = writeln!(logger, "Error: {extended_error}");
 
             let _ = writeln!(
@@ -1142,7 +1476,17 @@ impl BaseContainerRunner {
                     let _ = CloseHandle(pi.hProcess);
                     let _ = CloseHandle(pi.hThread);
                 }
-                if request.lifecycle.destroy_on_exit {
+                let capture_cleanup_error = capture_session
+                    .take()
+                    .and_then(|session| session.finish(None).err());
+                if capture_denials.is_some() {
+                    self.cleanup_capture_prelaunch_failure(
+                        capture_cleanup_error.as_ref(),
+                        &request,
+                        &sid_string,
+                        logger,
+                    );
+                } else if request.lifecycle.destroy_on_exit {
                     run_sandbox_cleanup(
                         &identity,
                         &sid_string,
@@ -1151,17 +1495,26 @@ impl BaseContainerRunner {
                     );
                     sandbox_tracking::unregister_ctrl_c_cleanup();
                 }
-                self.proxy_coordinator.stop(logger);
+                if capture_denials.is_none() {
+                    self.proxy_coordinator.stop(logger);
+                }
 
                 const JOB_SETUP_FAILED_MSG: &str =
                     "BaseContainer sandbox could not be placed in a job object, so it \
                      could not be reliably terminated; the launch was rejected to \
                      avoid running an uncontainable sandbox.";
+                let mut extended_error = format!("BaseContainer job-object setup failed: {e}");
+                if let Some(cleanup_error) = capture_cleanup_error {
+                    let _ = write!(
+                        extended_error,
+                        "; capture teardown also failed: {cleanup_error}"
+                    );
+                }
                 return Err(ScriptResponse {
                     exit_code: -1,
                     error_message: JOB_SETUP_FAILED_MSG.to_string(),
                     standard_err: JOB_SETUP_FAILED_MSG.to_string(),
-                    extended_error: format!("BaseContainer job-object setup failed: {e}"),
+                    extended_error,
                     failure_phase: FailurePhase::LaunchFailed,
                     ..Default::default()
                 });
@@ -1196,6 +1549,8 @@ impl BaseContainerRunner {
             identity,
             sid_string,
             proxy_coordinator: std::mem::take(&mut self.proxy_coordinator),
+            capture_session,
+            capture_output_path,
         })
     }
 }
@@ -1222,6 +1577,13 @@ struct BaseChild {
     identity: String,
     sid_string: String,
     proxy_coordinator: ProxyCoordinator,
+    /// Live learning-mode capture session (`Some` only when `captureDenials`
+    /// is configured and the OS API is available). Sealed in `run_teardown`
+    /// after the child exits.
+    capture_session: Option<Box<dyn CaptureSessionOps>>,
+    /// Resolved ETL output path for the capture session (caller-specified or a
+    /// managed per-run temp file). `Some` iff `capture_session` is `Some`.
+    capture_output_path: Option<PathBuf>,
 }
 
 impl SandboxBackend for BaseContainerRunner {
@@ -1307,7 +1669,14 @@ struct BaseContainerSandboxProcess {
     identity: String,
     sid_string: String,
     proxy_coordinator: ProxyCoordinator,
-    teardown_done: bool,
+    /// Cached teardown outcome so repeated terminal waits cannot hide a
+    /// capture failure after the session has been consumed.
+    teardown_result: Option<Result<(), String>>,
+    /// Live learning-mode capture session, moved from the `BaseChild`. Sealed
+    /// in `run_teardown` once the child has exited and been reaped.
+    capture_session: Option<Box<dyn CaptureSessionOps>>,
+    /// Resolved ETL output path for the capture session.
+    capture_output_path: Option<PathBuf>,
 }
 
 // SAFETY: the fields are Windows HANDLEs / handle-owning managers and owned
@@ -1341,26 +1710,84 @@ impl BaseContainerSandboxProcess {
             identity: std::mem::take(&mut child.identity),
             sid_string: std::mem::take(&mut child.sid_string),
             proxy_coordinator: std::mem::take(&mut child.proxy_coordinator),
-            teardown_done: false,
+            teardown_result: None,
+            capture_session: child.capture_session.take(),
+            capture_output_path: child.capture_output_path.take(),
         }
     }
 
-    fn run_teardown(&mut self) {
-        if self.teardown_done {
-            return;
+    fn run_teardown(&mut self) -> std::io::Result<()> {
+        if let Some(result) = &self.teardown_result {
+            return result.clone().map_err(std::io::Error::other);
         }
-        self.teardown_done = true;
         let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+
+        // Seal the learning-mode ETL trace now that the child has exited and
+        // been reaped (both `wait` and `Drop` kill + reap before calling this).
+        // `finish` stops the trace to the resolved output path, then closes the
+        // security environment. The output-file path is surfaced on stderr so a
+        // caller can locate the denials (the full NDJSON contract is finalized
+        // in the output/consume stage).
+        let mut defer_capture_cleanup = false;
+        let capture_result = if let Some(session) = self.capture_session.take() {
+            let output_path = self.capture_output_path.take();
+            match session.finish(output_path.as_deref()) {
+                Ok(()) => {
+                    if let Some(path) = &output_path {
+                        eprintln!("captureDenials: denials ETL written to {}", path.display());
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    defer_capture_cleanup = learning_mode_cleanup_failed(&error);
+                    Err(std::io::Error::other(format!(
+                        "captureDenials failed to finalize the denial capture: {error}"
+                    )))
+                }
+            }
+        } else {
+            Ok(())
+        };
+
         if self.destroy_on_exit {
-            run_sandbox_cleanup(
-                &self.identity,
-                &self.sid_string,
-                self.proxy_enabled,
-                &mut logger,
-            );
+            if defer_capture_cleanup {
+                sandbox_tracking::mark_cleanup_deferred(
+                    &self.sid_string,
+                    CAPTURE_SECURITY_ENVIRONMENT_CLEANUP_DEFERRED_REASON,
+                    &mut logger,
+                );
+            } else {
+                run_sandbox_cleanup(
+                    &self.identity,
+                    &self.sid_string,
+                    self.proxy_enabled,
+                    &mut logger,
+                );
+            }
             sandbox_tracking::unregister_ctrl_c_cleanup();
         }
         self.proxy_coordinator.stop(&mut logger);
+        let result = capture_result.map_err(|error| error.to_string());
+        self.teardown_result = Some(result.clone());
+        result.map_err(std::io::Error::other)
+    }
+
+    fn kill_process_tree(&mut self) -> std::io::Result<()> {
+        if let Some(job) = &self.job {
+            job.terminate(u32::MAX);
+        } else {
+            unsafe {
+                let _ = TerminateProcess(self.process.get(), u32::MAX);
+            }
+        }
+        Ok(())
+    }
+
+    fn terminate_and_reap(&mut self) {
+        let _ = self.kill_process_tree();
+        unsafe {
+            let _ = WaitForSingleObject(self.process.get(), u32::MAX);
+        }
     }
 }
 
@@ -1392,6 +1819,9 @@ impl SandboxProcess for BaseContainerSandboxProcess {
                 if unsafe { GetExitCodeProcess(self.process.get(), &mut code) }.is_err() {
                     return Err(std::io::Error::other("GetExitCodeProcess failed"));
                 }
+                // Keep polling non-blocking and independent of captureDenials.
+                // `wait()` or `Drop` owns descendant termination and capture
+                // finalization after the root exit becomes observable.
                 Ok(Some(code as i32))
             }
             WAIT_TIMEOUT => Ok(None),
@@ -1406,14 +1836,7 @@ impl SandboxProcess for BaseContainerSandboxProcess {
     fn kill(&mut self) -> std::io::Result<()> {
         // Tree-kill via the job object when the child was successfully assigned
         // to one; otherwise fall back to terminating the root process.
-        if let Some(job) = &self.job {
-            job.terminate(u32::MAX);
-        } else {
-            unsafe {
-                let _ = TerminateProcess(self.process.get(), u32::MAX);
-            }
-        }
-        Ok(())
+        self.kill_process_tree()
     }
 
     fn wait(&mut self) -> std::io::Result<i32> {
@@ -1450,14 +1873,11 @@ impl SandboxProcess for BaseContainerSandboxProcess {
         // failure this also terminates it. Then reap the root before releasing
         // the pipe drains — and killing the tree closes the descendant's pipe
         // write-ends, so the drains can finish.
-        let _ = self.kill();
-        unsafe {
-            let _ = WaitForSingleObject(self.process.get(), u32::MAX);
-        }
+        self.terminate_and_reap();
         cancel_and_join_discard(stdout_thread, &self.stdout_canceller);
         cancel_and_join_discard(stderr_thread, &self.stderr_canceller);
-        self.run_teardown();
-        result
+        let teardown_result = self.run_teardown();
+        combine_process_and_teardown_results(result, teardown_result)
     }
 }
 
@@ -1466,11 +1886,44 @@ impl Drop for BaseContainerSandboxProcess {
         // Kill and reap before tearing down proxy / sandbox state, so an
         // abandoned-but-running sandbox cannot outlive its enforcement (or
         // leak as an orphan).
-        let _ = self.kill();
-        unsafe {
-            let _ = WaitForSingleObject(self.process.get(), u32::MAX);
+        self.terminate_and_reap();
+        if let Err(error) = self.run_teardown() {
+            eprintln!("captureDenials teardown failed during drop: {error}");
         }
-        self.run_teardown();
+    }
+}
+
+fn managed_capture_output_path() -> Result<PathBuf, ScriptResponse> {
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|error| {
+        ScriptResponse::error(&format!(
+            "captureDenials could not generate a unique temporary output path: {error}"
+        ))
+    })?;
+    let suffix = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(std::env::temp_dir().join(format!(
+        "mxc_capture_denials_{}_{suffix}.etl",
+        std::process::id()
+    )))
+}
+
+fn combine_process_and_teardown_results(
+    process_result: std::io::Result<i32>,
+    teardown_result: std::io::Result<()>,
+) -> std::io::Result<i32> {
+    match (process_result, teardown_result) {
+        (Ok(exit_code), Ok(())) => Ok(exit_code),
+        (Ok(_), Err(teardown_error)) => Err(teardown_error),
+        (Err(wait_error), Ok(())) => Err(wait_error),
+        (Err(wait_error), Err(teardown_error)) => {
+            eprintln!(
+                "captureDenials teardown also failed after process wait failure: {teardown_error}"
+            );
+            Err(wait_error)
+        }
     }
 }
 
@@ -1503,11 +1956,80 @@ mod tests {
     use super::*;
     use crate::job_object::to_job_object_uilimit_mask;
     use sandbox_spec::base_container_layout;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use wxc_common::models::{ClipboardPolicy, ProxyConfig, UiPolicy};
     use wxc_common::ui_policy::EffectiveUiRestrictions;
 
+    struct FakeCaptureSession {
+        finish_error: Option<(&'static str, u32)>,
+        finish_calls: Arc<AtomicUsize>,
+    }
+
+    impl CaptureSessionOps for FakeCaptureSession {
+        fn environment(&self) -> HANDLE {
+            HANDLE(std::ptr::dangling_mut())
+        }
+
+        fn finish(
+            self: Box<Self>,
+            _output_path: Option<&std::path::Path>,
+        ) -> Result<(), learning_mode_windows::LearningModeError> {
+            self.finish_calls.fetch_add(1, Ordering::SeqCst);
+            match self.finish_error {
+                Some((function, code)) => {
+                    Err(learning_mode_windows::LearningModeError::ApiCall { function, code })
+                }
+                None => Ok(()),
+            }
+        }
+    }
+
+    struct FakeCaptureFactory {
+        begin_error: Option<(&'static str, u32)>,
+        finish_error: Option<(&'static str, u32)>,
+        begin_calls: AtomicUsize,
+        finish_calls: Arc<AtomicUsize>,
+    }
+
+    impl CaptureSessionFactory for FakeCaptureFactory {
+        fn begin(
+            &self,
+            _sandbox_specification: &[u8],
+            _flags: u32,
+        ) -> Result<Box<dyn CaptureSessionOps>, learning_mode_windows::LearningModeError> {
+            self.begin_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((function, code)) = self.begin_error {
+                return Err(learning_mode_windows::LearningModeError::ApiCall { function, code });
+            }
+            Ok(Box::new(FakeCaptureSession {
+                finish_error: self.finish_error,
+                finish_calls: Arc::clone(&self.finish_calls),
+            }))
+        }
+    }
+
     fn expected_mask(r: EffectiveUiRestrictions) -> u64 {
         to_job_object_uilimit_mask(&r) as u64
+    }
+
+    #[test]
+    fn managed_capture_paths_are_unique_per_run() {
+        let first = managed_capture_output_path().expect("first path");
+        let second = managed_capture_output_path().expect("second path");
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(std::env::temp_dir().as_path()));
+        assert_eq!(second.parent(), Some(std::env::temp_dir().as_path()));
+        assert_eq!(first.extension().and_then(|ext| ext.to_str()), Some("etl"));
+    }
+
+    #[test]
+    fn successful_process_reports_capture_teardown_failure() {
+        let error =
+            combine_process_and_teardown_results(Ok(0), Err(std::io::Error::other("seal failed")))
+                .expect_err("capture failure must override successful process exit");
+
+        assert!(error.to_string().contains("seal failed"));
     }
 
     #[test]
@@ -1517,6 +2039,136 @@ mod tests {
         // ERROR_INVALID_PARAMETER (87) and success are ordinary, not "disabled".
         assert!(!is_api_not_implemented(87));
         assert!(!is_api_not_implemented(0));
+    }
+
+    #[test]
+    fn learning_mode_api_not_implemented_checks_primary_failure() {
+        use learning_mode_windows::LearningModeError;
+
+        let disabled = LearningModeError::CleanupFailed {
+            primary: Box::new(LearningModeError::ApiCall {
+                function: "CreateProcessSecurityEnvironment",
+                code: ERROR_CALL_NOT_IMPLEMENTED.0,
+            }),
+            cleanup: Box::new(LearningModeError::ApiCall {
+                function: "CloseProcessSecurityEnvironment",
+                code: 87,
+            }),
+        };
+        assert!(learning_mode_api_not_implemented(&disabled));
+
+        let ordinary = LearningModeError::ApiCall {
+            function: "StartLearningModeTrace",
+            code: 87,
+        };
+        assert!(!learning_mode_api_not_implemented(&ordinary));
+
+        assert!(learning_mode_api_not_implemented(
+            &LearningModeError::ExportMissing {
+                api: "Learning Mode trace",
+                export: "StartLearningModeTrace",
+                detail: "not found".to_string(),
+            }
+        ));
+        assert!(learning_mode_api_not_implemented(
+            &LearningModeError::DllLoad("missing processmodel.dll".to_string())
+        ));
+    }
+
+    #[test]
+    fn learning_mode_cleanup_failure_is_detected() {
+        use learning_mode_windows::LearningModeError;
+
+        let error = LearningModeError::CleanupFailed {
+            primary: Box::new(LearningModeError::ApiCall {
+                function: "StartLearningModeTrace",
+                code: 87,
+            }),
+            cleanup: Box::new(LearningModeError::ApiCall {
+                function: "CloseProcessSecurityEnvironment",
+                code: 5,
+            }),
+        };
+        assert!(learning_mode_cleanup_failed(&error));
+
+        let close_only = LearningModeError::ApiCall {
+            function: CLOSE_PROCESS_SECURITY_ENVIRONMENT_API,
+            code: 5,
+        };
+        assert!(learning_mode_cleanup_failed(&close_only));
+
+        let ordinary = LearningModeError::ApiCall {
+            function: "StartLearningModeTrace",
+            code: 87,
+        };
+        assert!(!learning_mode_cleanup_failed(&ordinary));
+    }
+
+    #[test]
+    fn prelaunch_failure_preserves_capture_cleanup_error() {
+        use learning_mode_windows::LearningModeError;
+
+        let error = combine_capture_operation_and_cleanup_errors(
+            LearningModeError::ApiCall {
+                function: "UpdateProcThreadAttribute(SecurityEnvironment)",
+                code: 87,
+            },
+            Err(LearningModeError::ApiCall {
+                function: CLOSE_PROCESS_SECURITY_ENVIRONMENT_API,
+                code: 5,
+            }),
+        );
+
+        assert!(matches!(error, LearningModeError::CleanupFailed { .. }));
+        assert!(learning_mode_cleanup_failed(&error));
+        assert!(error.to_string().contains("UpdateProcThreadAttribute"));
+        assert!(error
+            .to_string()
+            .contains(CLOSE_PROCESS_SECURITY_ENVIRONMENT_API));
+    }
+
+    #[test]
+    fn capture_factory_injects_begin_failure() {
+        let factory = Arc::new(FakeCaptureFactory {
+            begin_error: Some(("StartLearningModeTrace", 5)),
+            finish_error: None,
+            begin_calls: AtomicUsize::new(0),
+            finish_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let runner = BaseContainerRunner::with_capture_factory(factory.clone());
+
+        let error = match runner
+            .capture_factory
+            .begin(&[], PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE)
+        {
+            Ok(_) => panic!("fake begin must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("StartLearningModeTrace"));
+        assert_eq!(factory.begin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.finish_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn capture_factory_injects_finish_failure_once() {
+        let factory = Arc::new(FakeCaptureFactory {
+            begin_error: None,
+            finish_error: Some((CLOSE_PROCESS_SECURITY_ENVIRONMENT_API, 5)),
+            begin_calls: AtomicUsize::new(0),
+            finish_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let runner = BaseContainerRunner::with_capture_factory(factory.clone());
+        let session = runner
+            .capture_factory
+            .begin(&[], PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE)
+            .expect("fake begin");
+
+        let error = session.finish(None).expect_err("fake finish must fail");
+
+        assert!(learning_mode_cleanup_failed(&error));
+        assert_eq!(factory.begin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.finish_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
