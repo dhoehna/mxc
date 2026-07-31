@@ -134,7 +134,6 @@ fn malformed_cidr_syntax_and_garbage_resolve_to_nothing() {
 }
 
 #[test]
-#[ignore = "SUSPECTED BUG: CIDR prefix with plus sign is accepted instead of rejected"]
 fn cidr_prefix_with_plus_sign_resolves_to_nothing() {
     let input = "10.0.0.0/+24";
     let resolved = NetworkIptablesManager::resolve_host(input);
@@ -145,8 +144,8 @@ fn cidr_prefix_with_plus_sign_resolves_to_nothing() {
     assert_destination_family(input, None);
 }
 
-// Independent of whether a leading `+` should be accepted at all (the ignored
-// test above), the family range check must still reject an out-of-range prefix.
+// Independent of the leading-`+` rejection above, the family range check must
+// still reject an out-of-range prefix.
 #[test]
 fn leading_plus_does_not_smuggle_an_out_of_range_prefix_past_validation() {
     let input = "10.0.0.0/+33";

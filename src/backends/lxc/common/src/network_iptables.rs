@@ -132,6 +132,14 @@ impl NetworkIptablesManager {
     /// resolved to both A and AAAA records so IPv4 destinations route to
     /// `iptables` and IPv6 destinations route to `ip6tables`.
     fn resolve_host(host: &str) -> ResolvedDestinations {
+        // An empty entry is not a hostname. Without this guard the DNS branch
+        // below formats ":0", which Winsock resolves to every local interface
+        // address, so an empty policy entry would emit rules for the host's
+        // own addresses. glibc rejects ":0", so this only shows up on Windows.
+        if host.trim().is_empty() {
+            return ResolvedDestinations::default();
+        }
+
         if host.contains('/') {
             return match Self::destination_family(host) {
                 Some(IpFamily::V4) => ResolvedDestinations {
@@ -175,7 +183,16 @@ impl NetworkIptablesManager {
 
     fn destination_family(destination: &str) -> Option<IpFamily> {
         if let Some((network, prefix)) = destination.split_once('/') {
-            if network.is_empty() || prefix.is_empty() || prefix.contains('/') {
+            // The prefix must be digits only. `u8::from_str` would otherwise
+            // accept a leading `+`, so `10.0.0.0/+24` would be forwarded to
+            // iptables, which silently canonicalizes it to `10.0.0.0/24`. A
+            // typo in a policy file would then be applied instead of being
+            // reported by the unresolved-host warning. Also subsumes the
+            // embedded-slash case, e.g. `10.0.0.0/20/8`.
+            if network.is_empty()
+                || prefix.is_empty()
+                || !prefix.bytes().all(|b| b.is_ascii_digit())
+            {
                 return None;
             }
 
@@ -595,6 +612,10 @@ mod resolution_spec_tests;
 #[cfg(test)]
 #[path = "network_iptables_rulegen_spec_tests.rs"]
 mod rulegen_spec_tests;
+
+#[cfg(test)]
+#[path = "network_iptables_lifecycle_spec_tests.rs"]
+mod lifecycle_spec_tests;
 
 #[cfg(test)]
 mod tests {
