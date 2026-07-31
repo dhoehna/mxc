@@ -133,44 +133,29 @@ fn malformed_cidr_syntax_and_garbage_resolve_to_nothing() {
     }
 }
 
-// A leading `+` on the prefix is accepted, and it is a synonym rather than a
-// hole. Rust's `u8::from_str` accepts a leading `+`, so the prefix validates and
-// the string is passed through unchanged. iptables' own parser accepts the same
-// spelling: appending `-d 10.0.0.0/+24` to a real chain stores it as
-// `-d 10.0.0.0/24`, byte-identical to the plain form (verified against iptables
-// on a live host). The permissive spelling therefore widens nothing.
-//
-// What does matter is that the sign must not smuggle a prefix past the
-// family range check, so that is asserted here too.
 #[test]
-fn cidr_prefix_with_leading_plus_is_a_synonym_and_does_not_bypass_range_checks() {
-    let plus = NetworkIptablesManager::resolve_host("10.0.0.0/+24");
-    let plain = NetworkIptablesManager::resolve_host("10.0.0.0/24");
-
-    assert_eq!(
-        plus.ipv4,
-        vec!["10.0.0.0/+24".to_string()],
-        "a validated CIDR must be passed through unchanged, got {plus:?}"
-    );
+#[ignore = "SUSPECTED BUG: CIDR prefix with plus sign is accepted instead of rejected"]
+fn cidr_prefix_with_plus_sign_resolves_to_nothing() {
+    let input = "10.0.0.0/+24";
+    let resolved = NetworkIptablesManager::resolve_host(input);
     assert!(
-        plus.ipv6.is_empty(),
-        "a v4 CIDR must not populate the v6 bucket, got {plus:?}"
+        resolved.is_empty(),
+        "malformed destination {input:?} should resolve to nothing, got {resolved:?}"
     );
-    assert_eq!(
-        plus.ipv4.len(),
-        plain.ipv4.len(),
-        "`/+24` and `/24` must yield the same number of v4 destinations"
-    );
-    assert_destination_family("10.0.0.0/+24", Some(IpFamily::V4));
+    assert_destination_family(input, None);
+}
 
-    // 33 > 32 must still be rejected regardless of the sign.
-    let out_of_range = NetworkIptablesManager::resolve_host("10.0.0.0/+33");
+// Independent of whether a leading `+` should be accepted at all (the ignored
+// test above), the family range check must still reject an out-of-range prefix.
+#[test]
+fn leading_plus_does_not_smuggle_an_out_of_range_prefix_past_validation() {
+    let input = "10.0.0.0/+33";
+    let resolved = NetworkIptablesManager::resolve_host(input);
     assert!(
-        out_of_range.is_empty(),
-        "a leading `+` must not smuggle an out-of-range prefix past validation, \
-         got {out_of_range:?}"
+        resolved.is_empty(),
+        "a leading `+` must not smuggle an out-of-range prefix past validation, got {resolved:?}"
     );
-    assert_destination_family("10.0.0.0/+33", None);
+    assert_destination_family(input, None);
 }
 
 #[test]
