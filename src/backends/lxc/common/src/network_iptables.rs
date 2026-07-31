@@ -589,6 +589,14 @@ impl Drop for NetworkIptablesManager {
 }
 
 #[cfg(test)]
+#[path = "network_iptables_resolution_spec_tests.rs"]
+mod resolution_spec_tests;
+
+#[cfg(test)]
+#[path = "network_iptables_rulegen_spec_tests.rs"]
+mod rulegen_spec_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

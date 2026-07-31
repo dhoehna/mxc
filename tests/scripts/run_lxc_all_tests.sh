@@ -48,6 +48,8 @@ run_test "LXC Denied Masking" "$SCRIPT_DIR/run_lxc_denied_masking_test.sh"
 run_test "LXC Network" "$SCRIPT_DIR/run_lxc_network_test.sh"
 run_test "LXC Network IPv6+CIDR" "$SCRIPT_DIR/run_lxc_network_ipv6_cidr_test.sh"
 run_test "LXC Network Invalid CIDR" "$SCRIPT_DIR/run_lxc_network_invalid_cidr_test.sh"
+run_test "LXC Network Dual-Stack Hostname" "$SCRIPT_DIR/run_lxc_network_dualstack_test.sh"
+run_test "LXC Network CIDR Boundary" "$SCRIPT_DIR/run_lxc_network_cidr_boundary_test.sh"
 run_test "LXC Timeout" "$SCRIPT_DIR/run_lxc_timeout_test.sh"
 run_test "LXC Env+Cwd" "$SCRIPT_DIR/run_lxc_env_cwd_test.sh"
 
