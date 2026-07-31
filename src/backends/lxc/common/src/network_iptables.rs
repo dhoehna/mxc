@@ -12,7 +12,8 @@ use std::process::Command;
 
 use wxc_common::logger::Logger;
 use wxc_common::models::{
-    ContainerPolicy, EgressRule, NetworkEnforcementMode, NetworkPolicy, Protocol, RuleAction,
+    ContainerPolicy, EgressRule, NetworkEnforcementMode, NetworkPolicy, PortSpec, Protocol,
+    RuleAction,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,7 +286,7 @@ impl NetworkIptablesManager {
         destination: &str,
         action: &RuleAction,
         protocols: &[Protocol],
-        ports: &[u16],
+        ports: &[PortSpec],
     ) -> FirewallRuleArgs {
         let Some(family) = Self::destination_family(destination) else {
             return FirewallRuleArgs::default();
@@ -298,10 +299,17 @@ impl NetworkIptablesManager {
         } else {
             protocols.iter().cloned().map(Some).collect()
         };
-        let port_options: Vec<Option<u16>> = if ports.is_empty() {
+        let port_options: Vec<Option<&PortSpec>> = if ports.is_empty() {
             vec![None]
         } else {
-            ports.iter().copied().map(Some).collect()
+            ports
+                .iter()
+                .filter(|port| port.is_valid())
+                .map(Some)
+                .collect()
+        };
+        if port_options.is_empty() {
+            return FirewallRuleArgs::default();
         };
 
         // ICMP/ICMPv6 carry no ports, so collapse the port dimension for those
@@ -311,7 +319,7 @@ impl NetworkIptablesManager {
         let portless = [None];
         let mut args = FirewallRuleArgs::default();
         for protocol in &protocol_options {
-            let ports_for_protocol: &[Option<u16>] = match protocol.as_ref() {
+            let ports_for_protocol: &[Option<&PortSpec>] = match protocol.as_ref() {
                 Some(p) if !Self::protocol_supports_ports(p) => &portless,
                 _ => &port_options,
             };
@@ -338,7 +346,7 @@ impl NetworkIptablesManager {
         destination: &str,
         action: &RuleAction,
         protocol: Option<&Protocol>,
-        port: Option<u16>,
+        port: Option<&PortSpec>,
         family: IpFamily,
     ) -> Vec<String> {
         let mut args = vec![
@@ -356,8 +364,10 @@ impl NetworkIptablesManager {
         // make iptables/ip6tables reject the rule.
         let port_supported = protocol.is_some_and(Self::protocol_supports_ports);
         if let Some(port) = port.filter(|_| port_supported) {
-            args.push("--dport".to_string());
-            args.push(port.to_string());
+            if let Some(dport) = port.iptables_dport_arg() {
+                args.push("--dport".to_string());
+                args.push(dport);
+            }
         }
         args.push("-j".to_string());
         args.push(Self::rule_action_arg(action).to_string());
@@ -385,6 +395,21 @@ impl NetworkIptablesManager {
             ));
         }
         args
+    }
+
+    /// Invalid port ranges are skipped instead of being passed to iptables,
+    /// which would reject the command and roll back the whole firewall apply.
+    fn log_invalid_port_selectors(policy: &ContainerPolicy, logger: &mut Logger) {
+        for rule in &policy.egress_rules {
+            for port in rule.ports.iter().filter(|port| !port.is_valid()) {
+                if let PortSpec::Range { start, end } = port {
+                    logger.log_line(&format!(
+                        "Warning: skipping invalid egress port range '{}:{}' (start > end)",
+                        start, end
+                    ));
+                }
+            }
+        }
     }
 
     /// Build the allow/deny rule args for a container policy.
@@ -577,6 +602,8 @@ impl NetworkIptablesManager {
             }
         }
 
+        Self::log_invalid_port_selectors(policy, logger);
+
         let policy_rules = Self::build_policy_rule_args(&self.chain_name, policy);
         Self::run_iptables_rule_args(&policy_rules.ipv4, logger)?;
         if ipv6_enabled {
@@ -706,6 +733,14 @@ mod tests {
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    fn single(port: u16) -> PortSpec {
+        PortSpec::Single(port)
+    }
+
+    fn range(start: u16, end: u16) -> PortSpec {
+        PortSpec::Range { start, end }
     }
 
     #[test]
@@ -855,7 +890,7 @@ mod tests {
     fn build_egress_rule_args_adds_protocol_and_dport() {
         let rule = EgressRule {
             destinations: vec!["140.82.112.4".to_string()],
-            ports: vec![443],
+            ports: vec![single(443)],
             protocols: vec![Protocol::Tcp],
             action: RuleAction::Allow,
         };
@@ -883,7 +918,7 @@ mod tests {
     fn build_egress_rule_args_cross_products_multi_port_multi_proto() {
         let rule = EgressRule {
             destinations: vec!["140.82.112.4".to_string()],
-            ports: vec![80, 443],
+            ports: vec![single(80), single(443)],
             protocols: vec![Protocol::Tcp, Protocol::Udp],
             action: RuleAction::Allow,
         };
@@ -1042,7 +1077,7 @@ mod tests {
         // `--dport` and must not fan out into one rule per port.
         let rule = EgressRule {
             destinations: vec!["140.82.112.4".to_string()],
-            ports: vec![80, 443],
+            ports: vec![single(80), single(443)],
             protocols: vec![Protocol::Icmp],
             action: RuleAction::Allow,
         };
@@ -1062,6 +1097,267 @@ mod tests {
                 "ACCEPT",
             ])]
         );
+        assert!(args.ipv6.is_empty());
+    }
+
+    #[test]
+    fn build_egress_rule_args_emits_port_range_for_ipv4_tcp() {
+        let rule = EgressRule {
+            destinations: vec!["140.82.112.4".to_string()],
+            ports: vec![range(8000, 8999)],
+            protocols: vec![Protocol::Tcp],
+            action: RuleAction::Allow,
+        };
+
+        let args = NetworkIptablesManager::build_egress_rule_args("MXC-test", &rule);
+
+        assert_eq!(
+            args.ipv4,
+            vec![strings(&[
+                "-A",
+                "MXC-test",
+                "-d",
+                "140.82.112.4",
+                "-p",
+                "tcp",
+                "--dport",
+                "8000:8999",
+                "-j",
+                "ACCEPT",
+            ])]
+        );
+        assert!(args.ipv6.is_empty());
+    }
+
+    #[test]
+    fn build_egress_rule_args_emits_port_range_for_ipv6_tcp() {
+        let rule = EgressRule {
+            destinations: vec!["2606:50c0::1".to_string()],
+            ports: vec![range(8000, 8999)],
+            protocols: vec![Protocol::Tcp],
+            action: RuleAction::Allow,
+        };
+
+        let args = NetworkIptablesManager::build_egress_rule_args("MXC-test", &rule);
+
+        assert!(args.ipv4.is_empty());
+        assert_eq!(
+            args.ipv6,
+            vec![strings(&[
+                "-A",
+                "MXC-test",
+                "-d",
+                "2606:50c0::1",
+                "-p",
+                "tcp",
+                "--dport",
+                "8000:8999",
+                "-j",
+                "ACCEPT",
+            ])]
+        );
+    }
+
+    #[test]
+    fn build_egress_rule_args_normalizes_single_value_range() {
+        let rule = EgressRule {
+            destinations: vec!["140.82.112.4".to_string()],
+            ports: vec![range(443, 443)],
+            protocols: vec![Protocol::Tcp],
+            action: RuleAction::Allow,
+        };
+
+        let args = NetworkIptablesManager::build_egress_rule_args("MXC-test", &rule);
+
+        assert_eq!(
+            args.ipv4,
+            vec![strings(&[
+                "-A",
+                "MXC-test",
+                "-d",
+                "140.82.112.4",
+                "-p",
+                "tcp",
+                "--dport",
+                "443",
+                "-j",
+                "ACCEPT",
+            ])]
+        );
+    }
+
+    #[test]
+    fn build_egress_rule_args_skips_invalid_port_range() {
+        let rule = EgressRule {
+            destinations: vec!["140.82.112.4".to_string()],
+            ports: vec![range(900, 100)],
+            protocols: vec![Protocol::Tcp],
+            action: RuleAction::Allow,
+        };
+
+        let args = NetworkIptablesManager::build_egress_rule_args("MXC-test", &rule);
+
+        assert!(args.ipv4.is_empty());
+        assert!(args.ipv6.is_empty());
+    }
+
+    #[test]
+    fn build_egress_rule_args_mixes_single_port_and_range() {
+        let rule = EgressRule {
+            destinations: vec!["140.82.112.4".to_string()],
+            ports: vec![single(443), range(8000, 8999)],
+            protocols: vec![Protocol::Tcp],
+            action: RuleAction::Allow,
+        };
+
+        let args = NetworkIptablesManager::build_egress_rule_args("MXC-test", &rule);
+
+        assert_eq!(
+            args.ipv4,
+            vec![
+                strings(&[
+                    "-A",
+                    "MXC-test",
+                    "-d",
+                    "140.82.112.4",
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    "443",
+                    "-j",
+                    "ACCEPT",
+                ]),
+                strings(&[
+                    "-A",
+                    "MXC-test",
+                    "-d",
+                    "140.82.112.4",
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    "8000:8999",
+                    "-j",
+                    "ACCEPT",
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_egress_rule_args_cross_products_single_range_and_protocols() {
+        let rule = EgressRule {
+            destinations: vec!["140.82.112.4".to_string()],
+            ports: vec![single(443), range(8000, 8999)],
+            protocols: vec![Protocol::Tcp, Protocol::Udp],
+            action: RuleAction::Allow,
+        };
+
+        let args = NetworkIptablesManager::build_egress_rule_args("MXC-test", &rule);
+
+        assert_eq!(
+            args.ipv4,
+            vec![
+                strings(&[
+                    "-A",
+                    "MXC-test",
+                    "-d",
+                    "140.82.112.4",
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    "443",
+                    "-j",
+                    "ACCEPT",
+                ]),
+                strings(&[
+                    "-A",
+                    "MXC-test",
+                    "-d",
+                    "140.82.112.4",
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    "8000:8999",
+                    "-j",
+                    "ACCEPT",
+                ]),
+                strings(&[
+                    "-A",
+                    "MXC-test",
+                    "-d",
+                    "140.82.112.4",
+                    "-p",
+                    "udp",
+                    "--dport",
+                    "443",
+                    "-j",
+                    "ACCEPT",
+                ]),
+                strings(&[
+                    "-A",
+                    "MXC-test",
+                    "-d",
+                    "140.82.112.4",
+                    "-p",
+                    "udp",
+                    "--dport",
+                    "8000:8999",
+                    "-j",
+                    "ACCEPT",
+                ]),
+            ]
+        );
+        assert!(args.ipv6.is_empty());
+    }
+
+    #[test]
+    fn build_egress_rule_args_omits_dport_for_icmp_with_range() {
+        let rule = EgressRule {
+            destinations: vec!["140.82.112.4".to_string()],
+            ports: vec![range(8000, 8999)],
+            protocols: vec![Protocol::Icmp],
+            action: RuleAction::Allow,
+        };
+
+        let args = NetworkIptablesManager::build_egress_rule_args("MXC-test", &rule);
+
+        assert_eq!(
+            args.ipv4,
+            vec![strings(&[
+                "-A",
+                "MXC-test",
+                "-d",
+                "140.82.112.4",
+                "-p",
+                "icmp",
+                "-j",
+                "ACCEPT",
+            ])]
+        );
+        assert!(args.ipv6.is_empty());
+    }
+
+    #[test]
+    fn build_egress_rule_args_handles_port_boundaries() {
+        let rule = EgressRule {
+            destinations: vec!["140.82.112.4".to_string()],
+            ports: vec![single(0), single(65535), range(0, 65535), range(1, 65535)],
+            protocols: vec![Protocol::Tcp],
+            action: RuleAction::Allow,
+        };
+
+        let args = NetworkIptablesManager::build_egress_rule_args("MXC-test", &rule);
+        let dports: Vec<&str> = args
+            .ipv4
+            .iter()
+            .filter_map(|rule| {
+                rule.iter()
+                    .position(|arg| arg == "--dport")
+                    .map(|index| rule[index + 1].as_str())
+            })
+            .collect();
+
+        assert_eq!(dports, vec!["0", "65535", "0:65535", "1:65535"]);
         assert!(args.ipv6.is_empty());
     }
 }

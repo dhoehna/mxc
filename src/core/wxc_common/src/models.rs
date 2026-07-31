@@ -393,13 +393,39 @@ pub enum RuleAction {
     Deny,
 }
 
+/// A destination port selector: a single port or an inclusive range.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PortSpec {
+    Single(u16),
+    Range { start: u16, end: u16 },
+}
+
+impl PortSpec {
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Single(_) => true,
+            Self::Range { start, end } => start <= end,
+        }
+    }
+
+    pub fn iptables_dport_arg(&self) -> Option<String> {
+        match self {
+            Self::Single(port) => Some(port.to_string()),
+            Self::Range { start, end } if start < end => Some(format!("{start}:{end}")),
+            Self::Range { start, end } if start == end => Some(start.to_string()),
+            Self::Range { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct EgressRule {
     /// IP or CIDR destinations, split by backend into IPv4 and IPv6 rules.
     pub destinations: Vec<String>,
     /// Destination ports. Empty means all ports.
-    pub ports: Vec<u16>,
+    pub ports: Vec<PortSpec>,
     /// IP protocols. Empty means all protocols.
     pub protocols: Vec<Protocol>,
     /// Whether matching traffic is allowed or denied. A rule deserialized with
@@ -934,5 +960,101 @@ mod tests {
         let rule: EgressRule =
             serde_json::from_value(json!({ "destinations": ["10.0.0.1"] })).unwrap();
         assert_eq!(rule.action, RuleAction::Deny);
+    }
+
+    #[test]
+    fn port_spec_deserializes_bare_number_as_single_port() {
+        let port: PortSpec = serde_json::from_value(json!(443)).unwrap();
+        assert_eq!(port, PortSpec::Single(443));
+        assert_eq!(serde_json::to_value(&port).unwrap(), json!(443));
+    }
+
+    #[test]
+    fn port_spec_deserializes_range_object() {
+        let port: PortSpec = serde_json::from_value(json!({ "start": 8000, "end": 8999 })).unwrap();
+        assert_eq!(
+            port,
+            PortSpec::Range {
+                start: 8000,
+                end: 8999
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&port).unwrap(),
+            json!({ "start": 8000, "end": 8999 })
+        );
+    }
+
+    #[test]
+    fn egress_rule_deserializes_port_specs_and_defaults_missing_action_to_deny() {
+        let rule: EgressRule = serde_json::from_value(json!({
+            "destinations": ["10.0.0.1"],
+            "ports": [443, { "start": 8000, "end": 8999 }]
+        }))
+        .unwrap();
+
+        assert_eq!(rule.action, RuleAction::Deny);
+        assert_eq!(
+            rule.ports,
+            vec![
+                PortSpec::Single(443),
+                PortSpec::Range {
+                    start: 8000,
+                    end: 8999
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn port_spec_iptables_arg_normalizes_and_validates_ranges() {
+        assert_eq!(
+            PortSpec::Single(0).iptables_dport_arg().as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            PortSpec::Single(65535).iptables_dport_arg().as_deref(),
+            Some("65535")
+        );
+        assert_eq!(
+            PortSpec::Range {
+                start: 0,
+                end: 65535
+            }
+            .iptables_dport_arg()
+            .as_deref(),
+            Some("0:65535")
+        );
+        assert_eq!(
+            PortSpec::Range {
+                start: 1,
+                end: 65535
+            }
+            .iptables_dport_arg()
+            .as_deref(),
+            Some("1:65535")
+        );
+        assert_eq!(
+            PortSpec::Range {
+                start: 443,
+                end: 443
+            }
+            .iptables_dport_arg()
+            .as_deref(),
+            Some("443")
+        );
+        assert!(!PortSpec::Range {
+            start: 900,
+            end: 100
+        }
+        .is_valid());
+        assert_eq!(
+            PortSpec::Range {
+                start: 900,
+                end: 100
+            }
+            .iptables_dport_arg(),
+            None
+        );
     }
 }

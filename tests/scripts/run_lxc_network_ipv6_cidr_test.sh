@@ -26,6 +26,49 @@ if [ ! -f "$LXC_EXEC" ]; then
 fi
 
 CONFIG="$REPO_DIR/tests/configs/lxc_network_ipv6_cidr.json"
+EXPECTED_HOSTS=(
+    "140.82.112.0/20"
+    "2606:50c0::/32"
+    "2606:50c0:8000::153"
+    "10.0.0.0/8"
+    "2001:db8::/32"
+    "fe80::1"
+)
+
+fail() {
+    echo "FAIL: $1"
+    exit 1
+}
+
+load_config_hosts() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import json, sys; data=json.load(open(sys.argv[1], encoding="utf-8")); net=data["network"]; print("\n".join(net.get("allowedHosts", []) + net.get("blockedHosts", [])))' "$CONFIG"
+    else
+        awk '
+            /"allowedHosts"[[:space:]]*:/ { in_hosts=1; next }
+            /"blockedHosts"[[:space:]]*:/ { in_hosts=1; next }
+            in_hosts && /]/ { in_hosts=0; next }
+            in_hosts { print }
+        ' "$CONFIG" | sed -n 's/^[[:space:]]*"\([^"]*\)".*/\1/p'
+    fi
+}
+
+mapfile -t CONFIG_HOSTS < <(load_config_hosts)
+if [ "${#CONFIG_HOSTS[@]}" -ne "${#EXPECTED_HOSTS[@]}" ]; then
+    fail "config host count ${#CONFIG_HOSTS[@]} does not match expected count ${#EXPECTED_HOSTS[@]}."
+fi
+for expected in "${EXPECTED_HOSTS[@]}"; do
+    found=0
+    for actual in "${CONFIG_HOSTS[@]}"; do
+        if [ "$actual" = "$expected" ]; then
+            found=1
+            break
+        fi
+    done
+    if [ "$found" -ne 1 ]; then
+        fail "expected host '$expected' is missing from $CONFIG."
+    fi
+done
 
 echo "Running LXC IPv6/CIDR network filtering test..."
 
@@ -34,17 +77,13 @@ echo "Running LXC IPv6/CIDR network filtering test..."
 OUTPUT=$("$LXC_EXEC" "$CONFIG" 2>&1 || true)
 echo "$OUTPUT"
 
-fail() {
-    echo "FAIL: $1"
-    exit 1
-}
-
 # Every allow/block entry must survive resolution. An unparsed CIDR or IPv6
 # literal is reported here instead of silently dropping a rule.
-if echo "$OUTPUT" | grep -q "could not resolve host"; then
-    echo "$OUTPUT" | grep "could not resolve host"
-    fail "an IPv6 literal or CIDR entry was not resolved."
-fi
+for host in "${EXPECTED_HOSTS[@]}"; do
+    if echo "$OUTPUT" | grep -Fq "Warning: could not resolve host '$host'"; then
+        fail "host '$host' was not resolved."
+    fi
+done
 
 # A rejected rule aborts setup.
 if echo "$OUTPUT" | grep -qE "^(ip6?tables) .* failed:|Firewall setup failed:"; then

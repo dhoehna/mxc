@@ -109,18 +109,22 @@ Filesystem policies are enforced via bind mounts in the container configuration:
 
 ## Network Policy
 
-Network policies are enforced via iptables/nftables rules applied to the container's virtual ethernet (veth) interface:
+Network policies are enforced with parallel `iptables` and `ip6tables` chains scoped to the container's virtual ethernet (veth) interface:
 
 | Policy | Implementation |
 |--------|---------------|
-| `defaultPolicy: "block"` | Default DROP rule on container veth |
-| `defaultPolicy: "allow"` | Default ACCEPT rule on container veth |
-| `allowedHosts` | ACCEPT rules for specific IPs/CIDRs |
-| `blockedHosts` | DROP rules for specific IPs/CIDRs |
+| `defaultPolicy: "block"` | Final DROP rule in the container chain |
+| `defaultPolicy: "allow"` | Final ACCEPT rule in the container chain |
+| `allowedHosts` | ACCEPT rules for IP literals, CIDR blocks, or resolved hostnames |
+| `blockedHosts` | DROP rules for IP literals, CIDR blocks, or resolved hostnames |
 
-Rules are automatically cleaned up when the container exits (if `removeRulesOnExit` is `true`).
+`allowedHosts` and `blockedHosts` entries may be bare IPv4/IPv6 literals, IPv4/IPv6 CIDR blocks, or hostnames. Hostnames are resolved to both A and AAAA records; IPv4 destinations are applied to the `iptables` chain and IPv6 destinations are applied to the `ip6tables` chain. These host-list rules match all ports and protocols. The current config file schema does not expose port- or protocol-specific egress rules.
 
-**IPv4 only.** Firewall mode resolves `allowedHosts` / `blockedHosts` to IPv4 addresses only; AAAA (IPv6) records and IPv6 literals are silently dropped. A host that has only AAAA records is effectively unreachable from the sandbox under firewall mode.
+If `ip6tables` is unavailable or IPv6 is disabled in the host kernel, MXC applies the IPv4 chain, skips IPv6 rules, and logs a warning with the number of unapplied IPv6 rules. On such hosts, IPv6 egress is unfiltered.
+
+The chains are hooked into `FORWARD` for container egress by matching the host-side veth as the input interface. If MXC cannot discover the container veth, it skips the `FORWARD` hook with a warning rather than applying host-wide rules.
+
+Firewall state is torn down automatically with best-effort removal of the `FORWARD` hooks and both per-container chains; there is no network-policy opt-out field. Setup failures after partial creation are rolled back before returning an error, so retries do not trip over leftover chains.
 
 ## Usage
 
