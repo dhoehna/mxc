@@ -41,6 +41,7 @@ use crate::{path_norm, tdh_decode};
 /// `OpenTraceW` returns this sentinel (`(TRACEHANDLE)-1`) on failure.
 const INVALID_PROCESSTRACE_HANDLE: u64 = u64::MAX;
 const MAX_UNIQUE_DENIALS: usize = 10_000;
+const MAX_PROCESSED_EVENTS: usize = 1_000_000;
 
 /// One decoded ETW event, retaining the header context the extractors need.
 #[cfg(test)]
@@ -67,6 +68,9 @@ struct Accumulator<'visitor> {
     truncated: bool,
     raw_visitor: Option<&'visitor mut RawEventVisitor<'visitor>>,
     raw_event_count: usize,
+    processed_event_count: usize,
+    processing_limit_reached: bool,
+    stop_requested: bool,
     decode_error: Option<String>,
     panic_payload: Option<Box<dyn std::any::Any + Send>>,
     schema_cache: tdh_decode::EventSchemaCache,
@@ -81,6 +85,9 @@ impl<'visitor> Accumulator<'visitor> {
             truncated: false,
             raw_visitor: None,
             raw_event_count: 0,
+            processed_event_count: 0,
+            processing_limit_reached: false,
+            stop_requested: false,
             decode_error: None,
             panic_payload: None,
             schema_cache: tdh_decode::EventSchemaCache::default(),
@@ -95,6 +102,9 @@ impl<'visitor> Accumulator<'visitor> {
             truncated: false,
             raw_visitor: Some(visitor),
             raw_event_count: 0,
+            processed_event_count: 0,
+            processing_limit_reached: false,
+            stop_requested: false,
             decode_error: None,
             panic_payload: None,
             schema_cache: tdh_decode::EventSchemaCache::default(),
@@ -102,9 +112,9 @@ impl<'visitor> Accumulator<'visitor> {
     }
 
     fn add_raw_denial(&mut self, raw: RawDenial) {
-        let path = if raw.resource_type == learning_mode_core::ResourceType::File {
+        let resource = if raw.resource_type == learning_mode_core::ResourceType::File {
             match path_norm::to_user_visible(&raw.object_name) {
-                Some(path) if path_norm::is_user_visible_absolute(&path) => path,
+                Some(resource) if path_norm::is_user_visible_absolute(&resource) => resource,
                 Some(_) => return,
                 None if path_norm::is_user_visible_absolute(&raw.object_name) => {
                     raw.object_name.clone()
@@ -114,27 +124,42 @@ impl<'visitor> Accumulator<'visitor> {
         } else {
             path_norm::to_user_visible(&raw.object_name).unwrap_or_else(|| raw.object_name.clone())
         };
-        let dedup_path = match raw.resource_type {
+        let dedup_resource = match raw.resource_type {
             learning_mode_core::ResourceType::File | learning_mode_core::ResourceType::Other => {
-                path.to_ascii_lowercase()
+                resource.to_ascii_lowercase()
             }
-            _ => path.clone(),
+            _ => resource.clone(),
         };
-        if self.seen.contains(&(dedup_path.clone(), raw.access_type)) {
+        if self
+            .seen
+            .contains(&(dedup_resource.clone(), raw.access_type))
+        {
             return;
         }
         if self.denials.len() >= MAX_UNIQUE_DENIALS {
             self.truncated = true;
+            self.stop_requested = true;
             return;
         }
-        self.seen.insert((dedup_path, raw.access_type));
+        self.seen.insert((dedup_resource, raw.access_type));
         self.denials.push(DeniedResource {
-            path,
+            resource,
             resource_type: raw.resource_type,
             access_type: raw.access_type,
             pid: raw.pid,
             filetime: raw.filetime,
         });
+    }
+
+    fn begin_event(&mut self) -> bool {
+        if self.processed_event_count >= MAX_PROCESSED_EVENTS {
+            self.processing_limit_reached = true;
+            self.truncated = true;
+            self.stop_requested = true;
+            return false;
+        }
+        self.processed_event_count += 1;
+        true
     }
 
     fn visit_raw_event(&mut self, parts: &DecodedEventParts) {
@@ -214,20 +239,28 @@ pub fn visit_raw_events(
 ) -> Result<usize, AnalyzeError> {
     let mut accumulator = Accumulator::raw(visitor);
     process_trace_file(source_path, &mut accumulator)?;
+    if accumulator.processing_limit_reached {
+        return Err(AnalyzeError::Decode(format!(
+            "trace exceeded the {MAX_PROCESSED_EVENTS}-event processing limit"
+        )));
+    }
     if let Some(error) = accumulator.decode_error {
         return Err(AnalyzeError::Decode(error));
     }
     Ok(accumulator.raw_event_count)
 }
 
-/// De-duplicates raw denials by `(user-visible path, accessType)`,
-/// normalising kernel paths to drive-letter form and preserving first-seen
-/// order.
+/// De-duplicates raw denials by `(user-visible resource, accessType)`,
+/// normalising case-insensitive Windows file/registry identifiers while
+/// preserving first-seen display spelling and order.
 #[cfg(test)]
 fn dedup_to_resources<I: IntoIterator<Item = RawDenial>>(raws: I) -> AnalysisResult {
     let mut accumulator = Accumulator::analyze();
     for raw in raws {
         accumulator.add_raw_denial(raw);
+        if accumulator.stop_requested {
+            break;
+        }
     }
     accumulator
         .into_analysis()
@@ -256,6 +289,7 @@ fn process_trace_file(
     let mut logfile: EVENT_TRACE_LOGFILEW = unsafe { core::mem::zeroed() };
     logfile.LogFileName = PWSTR(name_wide.as_mut_ptr());
     logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD;
+    logfile.BufferCallback = Some(trace_buffer_callback);
     logfile.Anonymous2.EventRecordCallback = Some(event_record_callback);
     logfile.Context = std::ptr::from_mut(accumulator).cast();
 
@@ -286,8 +320,8 @@ fn process_trace_file(
         std::panic::resume_unwind(payload);
     }
 
-    // ERROR_SUCCESS (0) and ERROR_CANCELLED (1223) are both acceptable
-    // terminal states for a completed file trace.
+    // ERROR_SUCCESS (0) is end-of-file. ERROR_CANCELLED (1223) is expected
+    // when our buffer callback stops after a processing bound or fatal error.
     if status.0 != 0 && status.0 != 1223 {
         return Err(AnalyzeError::Decode(format!(
             "ProcessTrace failed for '{}': Win32 error {}",
@@ -319,7 +353,10 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
     // ProcessTrace invokes this callback synchronously on our thread, so no
     // aliasing/concurrency with the owner occurs.
     let acc = unsafe { &mut *context };
-    if acc.decode_error.is_some() || acc.panic_payload.is_some() {
+    if acc.stop_requested || acc.decode_error.is_some() || acc.panic_payload.is_some() {
+        return;
+    }
+    if !acc.begin_event() {
         return;
     }
 
@@ -328,6 +365,27 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
         // context for this synchronous ProcessTrace invocation.
         unsafe { process_event_record(event_record, acc) };
     });
+}
+
+/// Stops `ProcessTrace` after the buffer containing the event that crossed an
+/// analysis bound. Returning zero is the documented cancellation signal.
+unsafe extern "system" fn trace_buffer_callback(logfile: *mut EVENT_TRACE_LOGFILEW) -> u32 {
+    if logfile.is_null() {
+        return 0;
+    }
+    // SAFETY: ETW passes the same live logfile and Context configured in
+    // `process_trace_file`; the callback is synchronous with ProcessTrace.
+    let context = unsafe { (*logfile).Context } as *mut Accumulator<'_>;
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: `context` points to the live accumulator for this trace.
+    let accumulator = unsafe { &*context };
+    u32::from(
+        !accumulator.stop_requested
+            && accumulator.decode_error.is_none()
+            && accumulator.panic_payload.is_none(),
+    )
 }
 
 fn run_callback_guard(acc: &mut Accumulator<'_>, process: impl FnOnce(&mut Accumulator<'_>)) {
@@ -451,11 +509,11 @@ mod tests {
             raw(r"C:\b", AccessType::Read, ResourceType::File),
         ];
         let out = dedup_to_resources(denials).denials;
-        assert_eq!(out.len(), 3, "unique (path, access) pairs");
-        assert_eq!(out[0].path, r"C:\a");
+        assert_eq!(out.len(), 3, "unique (resource, access) pairs");
+        assert_eq!(out[0].resource, r"C:\a");
         assert_eq!(out[0].access_type, AccessType::Read);
         assert_eq!(out[1].access_type, AccessType::Write);
-        assert_eq!(out[2].path, r"C:\b");
+        assert_eq!(out[2].resource, r"C:\b");
     }
 
     #[test]
@@ -465,8 +523,8 @@ mod tests {
             raw(r"C:\a", AccessType::Read, ResourceType::File),
         ];
         let out = dedup_to_resources(denials).denials;
-        assert_eq!(out[0].path, r"C:\z");
-        assert_eq!(out[1].path, r"C:\a");
+        assert_eq!(out[0].resource, r"C:\z");
+        assert_eq!(out[1].resource, r"C:\a");
     }
 
     #[test]
@@ -494,7 +552,7 @@ mod tests {
         let out = dedup_to_resources(denials).denials;
 
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].path, r"\\server\share\file.txt");
+        assert_eq!(out[0].resource, r"\\server\share\file.txt");
     }
 
     #[test]
@@ -505,7 +563,7 @@ mod tests {
         ];
         let out = dedup_to_resources(denials).denials;
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].path, r"C:\Data\File.txt");
+        assert_eq!(out[0].resource, r"C:\Data\File.txt");
     }
 
     #[test]
@@ -520,6 +578,44 @@ mod tests {
         let out = dedup_to_resources(denials);
         assert_eq!(out.denials.len(), MAX_UNIQUE_DENIALS);
         assert!(out.denied_resources_truncated);
+    }
+
+    #[test]
+    fn unique_denial_bound_requests_trace_stop() {
+        let mut accumulator = Accumulator::analyze();
+        accumulator.denials = (0..MAX_UNIQUE_DENIALS)
+            .map(|index| DeniedResource {
+                resource: format!(r"C:\data\{index}.txt"),
+                resource_type: ResourceType::File,
+                access_type: AccessType::Read,
+                pid: 1,
+                filetime: 1,
+            })
+            .collect();
+
+        accumulator.add_raw_denial(raw(
+            r"C:\data\overflow.txt",
+            AccessType::Read,
+            ResourceType::File,
+        ));
+
+        assert!(accumulator.stop_requested);
+        assert!(accumulator.truncated);
+    }
+
+    #[test]
+    fn event_processing_is_bounded_and_reports_truncation() {
+        let mut accumulator = Accumulator {
+            processed_event_count: MAX_PROCESSED_EVENTS - 1,
+            ..Accumulator::analyze()
+        };
+
+        assert!(accumulator.begin_event());
+        assert!(!accumulator.begin_event());
+        assert_eq!(accumulator.processed_event_count, MAX_PROCESSED_EVENTS);
+        assert!(accumulator.processing_limit_reached);
+        assert!(accumulator.stop_requested);
+        assert!(accumulator.truncated);
     }
 
     #[test]
@@ -615,16 +711,16 @@ mod tests {
         let out = resources_from_events(&events).denials;
         assert_eq!(out.len(), 3);
 
-        assert_eq!(out[0].path, r"C:\data\test\bin\");
+        assert_eq!(out[0].resource, r"C:\data\test\bin\");
         assert_eq!(out[0].resource_type, ResourceType::File);
         assert_eq!(out[0].access_type, AccessType::Write);
         assert_eq!(out[0].pid, 5480);
 
-        assert_eq!(out[1].path, r"\REGISTRY\USER\.DEFAULT\Console");
+        assert_eq!(out[1].resource, r"\REGISTRY\USER\.DEFAULT\Console");
         assert_eq!(out[1].resource_type, ResourceType::Other);
         assert_eq!(out[1].access_type, AccessType::Read);
 
-        assert_eq!(out[2].path, "S-1-15-3-1");
+        assert_eq!(out[2].resource, "internetClient");
         assert_eq!(out[2].resource_type, ResourceType::Capability);
         assert_eq!(out[2].access_type, AccessType::Unknown);
         assert_eq!(out[2].pid, 0x1acc, "pid from payload ProcessId");
@@ -663,7 +759,7 @@ mod tests {
 
         let out = resources_from_events(&events).denials;
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].path, r"C:\data\test\bin\");
+        assert_eq!(out[0].resource, r"C:\data\test\bin\");
         assert_eq!(out[0].access_type, AccessType::Write);
     }
 

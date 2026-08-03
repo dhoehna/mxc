@@ -12,13 +12,16 @@
 use std::ffi::c_void;
 use std::fmt::Write;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
 
+use learning_mode_core::{
+    write_document, DenialAnalyzer, DenialSummary, DenialsDocument, DenialsOutputPointer,
+};
 use learning_mode_windows::{
-    CaptureSession, LearningModeApi, SecurityEnvironmentApi, SecurityEnvironmentStartupInfo,
-    PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
+    CaptureSession, EtlDenialAnalyzer, LearningModeApi, SecurityEnvironmentApi,
+    SecurityEnvironmentStartupInfo, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
 };
 
 use windows::Win32::Foundation::{
@@ -54,8 +57,8 @@ use wxc_common::log_symbols::{
 };
 use wxc_common::logger::Logger;
 use wxc_common::models::{
-    ExecutionRequest, FailurePhase, NetworkEnforcementMode, NetworkPolicy, ProxyAddress,
-    ScriptResponse,
+    CaptureDenialsOutput, ExecutionRequest, FailurePhase, NetworkEnforcementMode, NetworkPolicy,
+    ProxyAddress, SandboxOutputMetadata, ScriptResponse,
 };
 use wxc_common::process_util::{
     create_std_pipes, InterruptiblePipeReader, OwnedHandle, PipeReadCanceller, PipeWriter,
@@ -892,19 +895,24 @@ impl BaseContainerRunner {
             let _ = writeln!(logger, "{EMOJI_SECTION} SECTION: captureDenials");
         }
 
-        // Resolve the ETL output path: caller-specified when provided, else a
-        // managed per-run temp file the runner names (parsed / cleaned up by the
-        // consume + analyze stages).
-        let capture_output_path: Option<PathBuf> = capture_denials
-            .as_ref()
-            .map(|cd| {
-                cd.output_path
-                    .clone()
-                    .map(PathBuf::from)
-                    .map(Ok)
-                    .unwrap_or_else(managed_capture_output_path)
-            })
-            .transpose()?;
+        // Resolve two paths for the capture:
+        //   * `capture_etl_path` — an always-internal, runner-managed temp `.etl`
+        //     that the OS broker seals into. It is decoded then deleted in
+        //     `run_teardown`; callers never see it.
+        //   * `capture_output_path` — the JSON denials deliverable that consuming
+        //     apps read: caller-specified via `captureDenials.outputPath` when
+        //     provided, else a managed per-run temp `.json` file.
+        let (capture_etl_path, capture_output_path) =
+            if let Some(capture_config) = capture_denials.as_ref() {
+                (
+                    Some(managed_capture_output_path()?),
+                    Some(unique_denials_output_path(
+                        capture_config.output_path.as_deref(),
+                    )?),
+                )
+            } else {
+                (None, None)
+            };
 
         let _ = writeln!(logger, "{EMOJI_SECTION} SECTION: Load API");
 
@@ -1550,6 +1558,7 @@ impl BaseContainerRunner {
             sid_string,
             proxy_coordinator: std::mem::take(&mut self.proxy_coordinator),
             capture_session,
+            capture_etl_path,
             capture_output_path,
         })
     }
@@ -1581,8 +1590,11 @@ struct BaseChild {
     /// is configured and the OS API is available). Sealed in `run_teardown`
     /// after the child exits.
     capture_session: Option<Box<dyn CaptureSessionOps>>,
-    /// Resolved ETL output path for the capture session (caller-specified or a
-    /// managed per-run temp file). `Some` iff `capture_session` is `Some`.
+    /// Internal runner-managed temp `.etl` the broker seals into. Decoded
+    /// then deleted in `run_teardown`. `Some` iff `capture_session` is `Some`.
+    capture_etl_path: Option<PathBuf>,
+    /// Resolved JSON denials deliverable path (caller-specified or a managed
+    /// per-run temp file). `Some` iff `capture_session` is `Some`.
     capture_output_path: Option<PathBuf>,
 }
 
@@ -1675,8 +1687,15 @@ struct BaseContainerSandboxProcess {
     /// Live learning-mode capture session, moved from the `BaseChild`. Sealed
     /// in `run_teardown` once the child has exited and been reaped.
     capture_session: Option<Box<dyn CaptureSessionOps>>,
-    /// Resolved ETL output path for the capture session.
+    /// Internal runner-managed temp `.etl` the broker seals into.
+    capture_etl_path: Option<PathBuf>,
+    /// Resolved JSON denials deliverable path.
     capture_output_path: Option<PathBuf>,
+    /// Exit code of the child, recorded by `wait` before teardown so the
+    /// denials summary can carry it. `None` on the `Drop`/early-exit path.
+    last_exit_code: Option<i32>,
+    /// Structured output published after capture teardown succeeds.
+    output_metadata: Option<SandboxOutputMetadata>,
 }
 
 // SAFETY: the fields are Windows HANDLEs / handle-owning managers and owned
@@ -1712,7 +1731,10 @@ impl BaseContainerSandboxProcess {
             proxy_coordinator: std::mem::take(&mut child.proxy_coordinator),
             teardown_result: None,
             capture_session: child.capture_session.take(),
+            capture_etl_path: child.capture_etl_path.take(),
             capture_output_path: child.capture_output_path.take(),
+            last_exit_code: None,
+            output_metadata: None,
         }
     }
 
@@ -1724,29 +1746,52 @@ impl BaseContainerSandboxProcess {
 
         // Seal the learning-mode ETL trace now that the child has exited and
         // been reaped (both `wait` and `Drop` kill + reap before calling this).
-        // `finish` stops the trace to the resolved output path, then closes the
-        // security environment. The output-file path is surfaced on stderr so a
-        // caller can locate the denials (the full NDJSON contract is finalized
-        // in the output/consume stage).
+        // The ETL is an internal temp: seal it, decode it into the JSON denials
+        // deliverable that consuming apps read, delete the temp, and retain
+        // structured metadata for the caller. Any seal/decode/write failure is
+        // returned through `wait()`.
         let mut defer_capture_cleanup = false;
         let capture_result = if let Some(session) = self.capture_session.take() {
+            let etl_path = self.capture_etl_path.take();
             let output_path = self.capture_output_path.take();
-            match session.finish(output_path.as_deref()) {
-                Ok(()) => {
-                    if let Some(path) = &output_path {
-                        eprintln!("captureDenials: denials ETL written to {}", path.display());
+            let exit_code = self.last_exit_code.unwrap_or(-1);
+            let result = match session.finish(etl_path.as_deref()) {
+                Ok(()) => match (&etl_path, &output_path) {
+                    (Some(etl), Some(output)) => {
+                        Self::decode_write_and_cleanup(&EtlDenialAnalyzer, etl, output, exit_code)
+                            .map(Some)
                     }
-                    Ok(())
-                }
+                    _ => combine_capture_and_cleanup_results(
+                        Err(std::io::Error::other(
+                            "captureDenials internal output paths were not initialized",
+                        )),
+                        etl_path
+                            .as_deref()
+                            .map(remove_internal_capture_file)
+                            .unwrap_or(Ok(())),
+                    ),
+                },
                 Err(error) => {
                     defer_capture_cleanup = learning_mode_cleanup_failed(&error);
-                    Err(std::io::Error::other(format!(
-                        "captureDenials failed to finalize the denial capture: {error}"
-                    )))
+                    combine_capture_and_cleanup_results(
+                        Err(std::io::Error::other(format!(
+                            "captureDenials failed to finalize the denial capture: {error}"
+                        ))),
+                        etl_path
+                            .as_deref()
+                            .map(remove_internal_capture_file)
+                            .unwrap_or(Ok(())),
+                    )
                 }
+            };
+            if let Ok(Some(metadata)) = &result {
+                self.output_metadata = Some(SandboxOutputMetadata {
+                    capture_denials: Some(metadata.clone()),
+                });
             }
+            result
         } else {
-            Ok(())
+            Ok(None)
         };
 
         if self.destroy_on_exit {
@@ -1767,7 +1812,9 @@ impl BaseContainerSandboxProcess {
             sandbox_tracking::unregister_ctrl_c_cleanup();
         }
         self.proxy_coordinator.stop(&mut logger);
-        let result = capture_result.map_err(|error| error.to_string());
+        let result = capture_result
+            .map(|_| ())
+            .map_err(|error| error.to_string());
         self.teardown_result = Some(result.clone());
         result.map_err(std::io::Error::other)
     }
@@ -1789,9 +1836,155 @@ impl BaseContainerSandboxProcess {
             let _ = WaitForSingleObject(self.process.get(), u32::MAX);
         }
     }
+
+    /// Decodes a sealed capture into the JSON denials document at `output_path`.
+    fn decode_and_write_denials(
+        analyzer: &dyn DenialAnalyzer,
+        etl_path: &std::path::Path,
+        output_path: &std::path::Path,
+        exit_code: i32,
+    ) -> std::io::Result<CaptureDenialsOutput> {
+        let analysis = analyzer.analyze(etl_path).map_err(|error| {
+            std::io::Error::other(format!(
+                "captureDenials failed to decode denials ETL: {error}"
+            ))
+        })?;
+
+        let summary = DenialSummary::new(
+            exit_code,
+            analysis.denials.len(),
+            analysis.denied_resources_truncated,
+        );
+        let document = DenialsDocument::new(analysis.denials, summary);
+
+        write_denials_output_file(output_path, |writer| write_document(writer, &document))?;
+
+        let pointer = DenialsOutputPointer::new(output_path.to_string_lossy(), &document.summary);
+        Ok(CaptureDenialsOutput {
+            kind: pointer.kind,
+            output_path: pointer.output_path,
+            exit_code: pointer.exit_code,
+            total_denials: pointer.total_denials,
+            denied_resources_truncated: pointer.denied_resources_truncated,
+        })
+    }
+
+    fn decode_write_and_cleanup(
+        analyzer: &dyn DenialAnalyzer,
+        etl_path: &Path,
+        output_path: &Path,
+        exit_code: i32,
+    ) -> std::io::Result<CaptureDenialsOutput> {
+        combine_capture_and_cleanup_results(
+            Self::decode_and_write_denials(analyzer, etl_path, output_path, exit_code),
+            remove_internal_capture_file(etl_path),
+        )
+    }
+}
+
+fn remove_internal_capture_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(std::io::Error::other(format!(
+            "captureDenials failed to remove internal ETL file {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn combine_capture_and_cleanup_results<T>(
+    capture_result: std::io::Result<T>,
+    cleanup_result: std::io::Result<()>,
+) -> std::io::Result<T> {
+    match (capture_result, cleanup_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(capture_error), Ok(())) => Err(capture_error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(capture_error), Err(cleanup_error)) => Err(std::io::Error::other(format!(
+            "{capture_error}; additionally failed to clean up the internal ETL: {cleanup_error}"
+        ))),
+    }
+}
+
+fn write_stderr_line_best_effort(message: std::fmt::Arguments<'_>) {
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    let _ = std::io::Write::write_fmt(&mut stderr, format_args!("{message}\n"));
+    let _ = std::io::Write::flush(&mut stderr);
+}
+
+fn write_denials_output_file(
+    output_path: &Path,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_path)
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "captureDenials failed to create denials output file {}: {error}",
+                output_path.display()
+            ))
+        })?;
+
+    let write_result = {
+        let mut writer = std::io::BufWriter::new(file);
+        write(&mut writer)
+    };
+    if let Err(error) = write_result {
+        let write_error = std::io::Error::other(format!(
+            "captureDenials failed to write denials output file {}: {error}",
+            output_path.display()
+        ));
+        return match std::fs::remove_file(output_path) {
+            Ok(()) => Err(write_error),
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
+                Err(write_error)
+            }
+            Err(cleanup_error) => Err(std::io::Error::other(format!(
+                "{write_error}; additionally failed to remove incomplete output file {}: {cleanup_error}",
+                output_path.display()
+            ))),
+        };
+    }
+
+    Ok(())
+}
+
+/// Inserts a per-run identifier into a denials output path's file stem so
+/// concurrent and sequential captures using the same configured `outputPath`
+/// produce distinct files instead of clobbering one another.
+///
+/// `C:\app\denials.json` → `C:\app\denials.<run_id>.json`. A path with no
+/// extension gets `<name>.<run_id>`; a bare filename (no parent) keeps its
+/// directory-less form.
+fn insert_run_id_into_stem(path: &Path, run_id: &str) -> PathBuf {
+    let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+        return path.to_path_buf();
+    };
+    let new_name = match path.extension().and_then(|s| s.to_str()) {
+        Some(ext) => {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(file_name);
+            format!("{stem}.{run_id}.{ext}")
+        }
+        None => format!("{file_name}.{run_id}"),
+    };
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(new_name),
+        _ => PathBuf::from(new_name),
+    }
 }
 
 impl SandboxProcess for BaseContainerSandboxProcess {
+    fn output_metadata(&self) -> Option<&SandboxOutputMetadata> {
+        self.output_metadata.as_ref()
+    }
+
     fn take_stdin(&mut self) -> Option<Box<dyn std::io::Write + Send>> {
         take_boxed_write(&mut self.stdin)
     }
@@ -1876,6 +2069,9 @@ impl SandboxProcess for BaseContainerSandboxProcess {
         self.terminate_and_reap();
         cancel_and_join_discard(stdout_thread, &self.stdout_canceller);
         cancel_and_join_discard(stderr_thread, &self.stderr_canceller);
+        // Record the child's exit code so `run_teardown` can stamp it into the
+        // denials summary. On a timeout / wait failure there is no exit code.
+        self.last_exit_code = result.as_ref().ok().copied();
         let teardown_result = self.run_teardown();
         combine_process_and_teardown_results(result, teardown_result)
     }
@@ -1888,26 +2084,41 @@ impl Drop for BaseContainerSandboxProcess {
         // leak as an orphan).
         self.terminate_and_reap();
         if let Err(error) = self.run_teardown() {
-            eprintln!("captureDenials teardown failed during drop: {error}");
+            write_stderr_line_best_effort(format_args!(
+                "captureDenials teardown failed during drop: {error}"
+            ));
         }
     }
 }
 
 fn managed_capture_output_path() -> Result<PathBuf, ScriptResponse> {
-    let mut nonce = [0u8; 16];
-    getrandom::getrandom(&mut nonce).map_err(|error| {
-        ScriptResponse::error(&format!(
-            "captureDenials could not generate a unique temporary output path: {error}"
-        ))
-    })?;
-    let suffix = nonce
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let suffix = random_capture_suffix()?;
     Ok(std::env::temp_dir().join(format!(
         "mxc_capture_denials_{}_{suffix}.etl",
         std::process::id()
     )))
+}
+
+fn unique_denials_output_path(configured_path: Option<&str>) -> Result<PathBuf, ScriptResponse> {
+    let suffix = random_capture_suffix()?;
+    let run_id = format!("{}_{suffix}", std::process::id());
+    Ok(match configured_path {
+        Some(path) => insert_run_id_into_stem(Path::new(path), &run_id),
+        None => std::env::temp_dir().join(format!("mxc_denials_{run_id}.json")),
+    })
+}
+
+fn random_capture_suffix() -> Result<String, ScriptResponse> {
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|error| {
+        ScriptResponse::error(&format!(
+            "captureDenials could not generate a unique output path: {error}"
+        ))
+    })?;
+    Ok(nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>())
 }
 
 fn combine_process_and_teardown_results(
@@ -1919,9 +2130,9 @@ fn combine_process_and_teardown_results(
         (Ok(_), Err(teardown_error)) => Err(teardown_error),
         (Err(wait_error), Ok(())) => Err(wait_error),
         (Err(wait_error), Err(teardown_error)) => {
-            eprintln!(
+            write_stderr_line_best_effort(format_args!(
                 "captureDenials teardown also failed after process wait failure: {teardown_error}"
-            );
+            ));
             Err(wait_error)
         }
     }
@@ -1955,6 +2166,9 @@ fn derive_sid_string_from_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::job_object::to_job_object_uilimit_mask;
+    use learning_mode_core::{
+        AccessType, AnalysisResult, AnalyzeError, DeniedResource, ResourceType,
+    };
     use sandbox_spec::base_container_layout;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wxc_common::models::{ClipboardPolicy, ProxyConfig, UiPolicy};
@@ -2008,6 +2222,19 @@ mod tests {
         }
     }
 
+    struct FakeAnalyzer {
+        result: Result<AnalysisResult, &'static str>,
+    }
+
+    impl DenialAnalyzer for FakeAnalyzer {
+        fn analyze(&self, _source_path: &Path) -> Result<AnalysisResult, AnalyzeError> {
+            match &self.result {
+                Ok(result) => Ok(result.clone()),
+                Err(message) => Err(AnalyzeError::Decode((*message).to_string())),
+            }
+        }
+    }
+
     fn expected_mask(r: EffectiveUiRestrictions) -> u64 {
         to_job_object_uilimit_mask(&r) as u64
     }
@@ -2024,12 +2251,169 @@ mod tests {
     }
 
     #[test]
+    fn managed_denials_paths_are_unique_per_run() {
+        let first = unique_denials_output_path(None).expect("first path");
+        let second = unique_denials_output_path(None).expect("second path");
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(std::env::temp_dir().as_path()));
+        assert_eq!(second.parent(), Some(std::env::temp_dir().as_path()));
+        assert_eq!(first.extension().and_then(|ext| ext.to_str()), Some("json"));
+    }
+
+    #[test]
+    fn failed_denials_write_removes_incomplete_output() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let output_path = directory.path().join("denials.json");
+
+        let error = write_denials_output_file(&output_path, |writer| {
+            std::io::Write::write_all(writer, b"{\"partial\":")?;
+            Err(std::io::Error::other("simulated write failure"))
+        })
+        .expect_err("write should fail");
+
+        assert!(error.to_string().contains("simulated write failure"));
+        assert!(!output_path.exists());
+    }
+
+    #[test]
+    fn denials_output_does_not_overwrite_an_existing_file() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let output_path = directory.path().join("denials.json");
+        std::fs::write(&output_path, b"existing").expect("seed output");
+
+        write_denials_output_file(&output_path, |_| Ok(())).expect_err("collision should fail");
+
+        assert_eq!(
+            std::fs::read(&output_path).expect("read existing output"),
+            b"existing"
+        );
+    }
+
+    #[test]
+    fn missing_internal_etl_is_already_clean() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let missing = directory.path().join("missing.etl");
+        remove_internal_capture_file(&missing).expect("missing file should be clean");
+    }
+
+    #[test]
+    fn capture_and_etl_cleanup_failures_are_both_preserved() {
+        let error = combine_capture_and_cleanup_results::<()>(
+            Err(std::io::Error::other("decode failed")),
+            Err(std::io::Error::other("delete failed")),
+        )
+        .expect_err("combined operation should fail");
+
+        let message = error.to_string();
+        assert!(message.contains("decode failed"));
+        assert!(message.contains("delete failed"));
+    }
+
+    #[test]
+    fn injected_analyzer_writes_document_and_returns_metadata() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let output_path = directory.path().join("denials.json");
+        let analyzer = FakeAnalyzer {
+            result: Ok(AnalysisResult::complete(vec![DeniedResource {
+                resource: r"C:\blocked.txt".to_string(),
+                resource_type: ResourceType::File,
+                access_type: AccessType::Read,
+                pid: 42,
+                filetime: 99,
+            }])),
+        };
+
+        let metadata = BaseContainerSandboxProcess::decode_and_write_denials(
+            &analyzer,
+            Path::new("ignored.etl"),
+            &output_path,
+            7,
+        )
+        .expect("decode succeeds");
+
+        assert_eq!(metadata.kind, CaptureDenialsOutput::KIND);
+        assert_eq!(metadata.exit_code, 7);
+        assert_eq!(metadata.total_denials, 1);
+        let document: DenialsDocument =
+            serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
+        assert_eq!(document.denials.len(), 1);
+    }
+
+    #[test]
+    fn injected_analyzer_writes_empty_document() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let output_path = directory.path().join("denials.json");
+        let analyzer = FakeAnalyzer {
+            result: Ok(AnalysisResult::complete(Vec::new())),
+        };
+
+        let metadata = BaseContainerSandboxProcess::decode_and_write_denials(
+            &analyzer,
+            Path::new("ignored.etl"),
+            &output_path,
+            0,
+        )
+        .expect("decode succeeds");
+
+        assert_eq!(metadata.total_denials, 0);
+        assert!(output_path.exists());
+    }
+
+    #[test]
+    fn injected_analyzer_failure_leaves_no_output_file() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let etl_path = directory.path().join("capture.etl");
+        let output_path = directory.path().join("denials.json");
+        std::fs::write(&etl_path, b"fake etl").expect("seed ETL");
+        let analyzer = FakeAnalyzer {
+            result: Err("simulated decode failure"),
+        };
+
+        let error = BaseContainerSandboxProcess::decode_write_and_cleanup(
+            &analyzer,
+            &etl_path,
+            &output_path,
+            0,
+        )
+        .expect_err("decode should fail");
+
+        assert!(error.to_string().contains("simulated decode failure"));
+        assert!(!etl_path.exists());
+        assert!(!output_path.exists());
+    }
+
+    #[test]
     fn successful_process_reports_capture_teardown_failure() {
         let error =
             combine_process_and_teardown_results(Ok(0), Err(std::io::Error::other("seal failed")))
                 .expect_err("capture failure must override successful process exit");
 
         assert!(error.to_string().contains("seal failed"));
+    }
+
+    #[test]
+    fn insert_run_id_into_stem_injects_id_before_extension() {
+        let got = insert_run_id_into_stem(Path::new(r"C:\app\denials.json"), "1234_abcd");
+        assert_eq!(got, PathBuf::from(r"C:\app\denials.1234_abcd.json"));
+    }
+
+    #[test]
+    fn insert_run_id_into_stem_handles_no_extension() {
+        let got = insert_run_id_into_stem(Path::new(r"C:\app\denials"), "77_abcd");
+        assert_eq!(got, PathBuf::from(r"C:\app\denials.77_abcd"));
+    }
+
+    #[test]
+    fn insert_run_id_into_stem_handles_bare_filename() {
+        let got = insert_run_id_into_stem(Path::new("denials.json"), "9_abcd");
+        assert_eq!(got, PathBuf::from("denials.9_abcd.json"));
+    }
+
+    #[test]
+    fn insert_run_id_into_stem_preserves_multi_dot_stem() {
+        let got = insert_run_id_into_stem(Path::new(r"C:\app\out.denials.json"), "5_abcd");
+        assert_eq!(got, PathBuf::from(r"C:\app\out.denials.5_abcd.json"));
     }
 
     #[test]
