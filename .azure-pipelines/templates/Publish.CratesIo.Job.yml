@@ -10,7 +10,12 @@
 # ESRP publishes via the crates.io API, which does NOT enforce dependency order
 # and offers no bulk sorting (see the ESRP crates.io docs). We therefore emit
 # one EsrpRelease task per crate, leaf-first. A run-time guard asserts the
-# compile-time `crateOrder` matches what was packaged.
+# compile-time `crateOrder` is an ordered subset of what was packaged.
+#
+# This is a standard `job` with `templateContext.type: releaseJob`, matching the
+# NPM release job in 1ES.Release.yml. It is deliberately NOT a `deployment` job:
+# 1ES requires `environment:` on those, which would mean provisioning an ADO
+# Environment (and its approval gates) for no benefit here.
 #
 # This pool enforces 1ES network isolation (CFSClean), so crates.io is NOT
 # reachable from here and this job performs no crates.io reads. Correct ordering
@@ -44,7 +49,7 @@ parameters:
     default: false
 
 jobs:
-  - deployment: publish_crates
+  - job: publish_crates
     displayName: Publish crates to crates.io (ESRP)
     pool:
       name: Azure-Pipelines-1ESPT-ExDShared
@@ -63,48 +68,45 @@ jobs:
       esrpDir: $(Pipeline.Workspace)/esrp-one
       orderFile: $(Pipeline.Workspace)/crates/release-order.json
       script: $(Pipeline.Workspace)/crates/crates_release.py
-    strategy:
-      runOnce:
-        deploy:
-          steps:
-            # Guard: the crates this run will publish must be a correctly
-            # ordered subset of what was packaged, or we could publish in the
-            # wrong order. A strict subset is allowed (resume); it is reported
-            # as a warning naming every dependency assumed already published.
+    steps:
+      # Guard: the crates this run will publish must be a correctly
+      # ordered subset of what was packaged, or we could publish in the
+      # wrong order. A strict subset is allowed (resume); it is reported
+      # as a warning naming every dependency assumed already published.
+      - script: |
+          set -euo pipefail
+          python3 "$(script)" verify-order --order-file "$(orderFile)" --expected "$EXPECTED_ORDER"
+        displayName: Verify crate order matches package
+        env:
+          EXPECTED_ORDER: ${{ convertToJson(parameters.crateOrder) }}
+
+      - ${{ each crate in parameters.crateOrder }}:
+          - script: |
+              set -euo pipefail
+              python3 "$(script)" stage --order-file "$(orderFile)" --crate "${{ crate }}" --out-dir "$(esrpDir)"
+            displayName: "Stage ${{ crate }} for ESRP"
+
+          - ${{ if parameters.cratesDryRun }}:
             - script: |
-                set -euo pipefail
-                python3 "$(script)" verify-order --order-file "$(orderFile)" --expected "$EXPECTED_ORDER"
-              displayName: Verify crate order matches package
-              env:
-                EXPECTED_ORDER: ${{ convertToJson(parameters.crateOrder) }}
-
-            - ${{ each crate in parameters.crateOrder }}:
-                - script: |
-                    set -euo pipefail
-                    python3 "$(script)" stage --order-file "$(orderFile)" --crate "${{ crate }}" --out-dir "$(esrpDir)"
-                  displayName: "Stage ${{ crate }} for ESRP"
-
-                - ${{ if parameters.cratesDryRun }}:
-                  - script: |
-                      echo "##vso[task.logissue type=warning]DRY RUN: skipping ESRP publish for ${{ crate }} (staged .crate only)."
-                    displayName: "DRY RUN: skip publish ${{ crate }}"
-                - ${{ else }}:
-                  - task: EsrpRelease@12
-                    displayName: "Publish ${{ crate }} to crates.io"
-                    inputs:
-                      connectedservicename: ${{ parameters.ESRPInfo.serviceName }}
-                      usemanagedidentity: false
-                      keyvaultname: ${{ parameters.ESRPInfo.azureKeyVaultName }}
-                      authcertname: ${{ parameters.ESRPInfo.authCertName }}
-                      signcertname: ${{ parameters.ESRPInfo.signCertName }}
-                      clientid: ${{ parameters.ESRPInfo.clientId }}
-                      intent: 'PackageDistribution'
-                      contenttype: 'Rust'
-                      contentsource: 'Folder'
-                      folderlocation: $(esrpDir)
-                      owners: ${{ parameters.ESRPInfo.OwnersEmail }}
-                      approvers: ${{ parameters.ESRPInfo.ApproversEmail }}
-                      waitforreleasecompletion: true
-                      serviceendpointurl: 'https://api.esrp.microsoft.com'
-                      mainpublisher: 'ESRPRELPACMAN'
-                      domaintenantid: ${{ parameters.ESRPInfo.tenantId }}
+                echo "##vso[task.logissue type=warning]DRY RUN: skipping ESRP publish for ${{ crate }} (staged .crate only)."
+              displayName: "DRY RUN: skip publish ${{ crate }}"
+          - ${{ else }}:
+            - task: EsrpRelease@12
+              displayName: "Publish ${{ crate }} to crates.io"
+              inputs:
+                connectedservicename: ${{ parameters.ESRPInfo.serviceName }}
+                usemanagedidentity: false
+                keyvaultname: ${{ parameters.ESRPInfo.azureKeyVaultName }}
+                authcertname: ${{ parameters.ESRPInfo.authCertName }}
+                signcertname: ${{ parameters.ESRPInfo.signCertName }}
+                clientid: ${{ parameters.ESRPInfo.clientId }}
+                intent: 'PackageDistribution'
+                contenttype: 'Rust'
+                contentsource: 'Folder'
+                folderlocation: $(esrpDir)
+                owners: ${{ parameters.ESRPInfo.OwnersEmail }}
+                approvers: ${{ parameters.ESRPInfo.ApproversEmail }}
+                waitforreleasecompletion: true
+                serviceendpointurl: 'https://api.esrp.microsoft.com'
+                mainpublisher: 'ESRPRELPACMAN'
+                domaintenantid: ${{ parameters.ESRPInfo.tenantId }}
