@@ -14,9 +14,9 @@ parameters:
     type: boolean
     default: false
 
-  # Opt-in while multi-package `cargo package` is blocked by
-  # https://github.com/rust-lang/cargo/issues/17196 when crates.io is replaced
-  # by the private ingestion feed.
+  # Opt-in until the `--registry Mxc-Azure-Feed` workaround for
+  # https://github.com/rust-lang/cargo/issues/17196 has been validated against
+  # the full crate closure on the official build.
   - name: packageCrates
     type: boolean
     default: false
@@ -89,8 +89,8 @@ stages:
 
   - template: Mxc.Binary.Packaging.Job.yml
 
-# Crate packaging is official-build-only and explicitly opt-in until Cargo
-# #17196 is fixed or the packaging implementation no longer depends on it.
+# Crate packaging is official-build-only and explicitly opt-in until the
+# cargo #17196 workaround has been validated against the full crate closure.
 - ${{ if and(parameters.isOfficialBuild, parameters.packageCrates) }}:
   - stage: Package_Crates
     displayName: 'Package Crates'

@@ -7,31 +7,41 @@ repository never handles a `CARGO_REGISTRY_TOKEN`. See:
 https://eng.ms/docs/microsoft-security/identity/trust-and-security-services/tss-release-distribute/tss-release-esrp-parent/oss-publishing/releasing-open-source/cratesio
 
 ESRP does not sort a multi-crate dependency graph. The pipeline publishes one
-crate at a time in leaf-first order. Before a dependent crate is submitted, this
-helper confirms that every first-party dependency exists on the real crates.io
-sparse index with the checksum produced by the same official build.
+crate at a time in leaf-first order, an order this helper validates offline
+against the workspace's real dependency edges.
+
+The release pool enforces 1ES network isolation (CFSClean), which blocks
+crates.io. This helper therefore performs NO crates.io reads. The guarantees
+that used to depend on them are covered earlier or elsewhere:
+
+  * a dependency's version requirement matching its real version is enforced by
+    `cargo package` itself at packaging time (it fails the build);
+  * leaf-first ordering is enforced offline by `_validate_release_graph`;
+  * a dependency crate existing at all is enforced server-side by crates.io,
+    which rejects a publish naming an unknown crate;
+  * yank detection and the published-checksum audit are out-of-band concerns
+    and do not belong in the isolated release job.
 
 Subcommands
 -----------
 package       Validate and package the complete first-party closure, then write
               `.crate` files and release-order.json.
 
-verify-order  Assert that the pipeline's compile-time crate order exactly
-              matches the packaged order and its dependency graph.
-
-probe         Confirm the release pool can read the crates.io sparse index.
+verify-order  Assert that the crates the pipeline is about to publish are a
+              correctly-ordered subset of what was packaged. A partial subset is
+              allowed so an operator can resume a release that failed partway.
 
 stage         Copy one `.crate` file into a clean directory for an ESRP task.
 
-verify-dependencies
-              Confirm every first-party dependency of one packaged crate exists
-              on crates.io with the exact packaged checksum.
-
-status        Set the pipeline's `crateAlreadyPublished` variable after checking
-              whether the exact packaged crate is already on crates.io.
-
-wait          Poll crates.io until the exact packaged crate is visible before
-              the release continues to any dependent crate.
+Resuming a failed release
+-------------------------
+There is no automated resume. crates.io rejects a duplicate version outright, so
+re-running a partially-completed release unchanged fails on the first crate that
+already landed. The isolated pool cannot ask crates.io what landed, so the
+operator asserts it: re-queue the release with the finished crates removed from
+the `crateOrder` parameter. `verify-order` still enforces that whatever remains
+is published in correct leaf-first order, and logs every dependency it is
+therefore assuming is already live.
 """
 from __future__ import annotations
 
@@ -42,9 +52,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
-import urllib.error
-import urllib.request
 
 # Current Cargo package names in leaf-first order. These names remain
 # provisional until the public naming scheme is approved; publishCrates defaults
@@ -69,49 +76,6 @@ CRATES: list[str] = [
     "mxc_engine",
     "mxc-sdk",
 ]
-
-CRATES_IO_SPARSE_INDEX = "https://index.crates.io"
-PROPAGATION_TIMEOUT = 300
-PROPAGATION_POLL = 5
-
-
-def _sparse_index_path(name: str) -> str:
-    """Return the crates.io sparse-index path for a package name."""
-    name = name.lower()
-    if len(name) == 1:
-        return f"1/{name}"
-    if len(name) == 2:
-        return f"2/{name}"
-    if len(name) == 3:
-        return f"3/{name[0]}/{name}"
-    return f"{name[:2]}/{name[2:4]}/{name}"
-
-
-def _index_request(url: str) -> urllib.request.Request:
-    return urllib.request.Request(
-        url,
-        headers={"User-Agent": "mxc-crates-release/1.0"},
-    )
-
-
-def _published_releases(crate: str) -> dict[str, dict]:
-    """Return crates.io sparse-index records for `crate`, keyed by version."""
-    url = f"{CRATES_IO_SPARSE_INDEX}/{_sparse_index_path(crate)}"
-    try:
-        with urllib.request.urlopen(_index_request(url), timeout=30) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return {}
-        raise
-
-    releases: dict[str, dict] = {}
-    for line in body.splitlines():
-        line = line.strip()
-        if line:
-            record = json.loads(line)
-            releases[record["vers"]] = record
-    return releases
 
 
 def _cargo_metadata(manifest_path: str) -> dict:
@@ -166,27 +130,6 @@ def _sha256(path: str) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _published_matches(order_file: str, entry: dict) -> bool:
-    """Return whether crates.io has this exact crate; reject conflicts."""
-    record = _published_releases(entry["name"]).get(entry["version"])
-    if record is None:
-        return False
-    if record.get("yanked", False):
-        raise RuntimeError(
-            f"{entry['name']} {entry['version']} exists on crates.io but is yanked"
-        )
-
-    expected_checksum = _sha256(_crate_file(order_file, entry))
-    actual_checksum = record.get("cksum")
-    if actual_checksum != expected_checksum:
-        raise RuntimeError(
-            f"{entry['name']} {entry['version']} already exists on crates.io "
-            f"with checksum {actual_checksum}, but this build packaged "
-            f"{expected_checksum}"
-        )
-    return True
 
 
 def _validate_release_graph(metadata: dict) -> dict[str, list[str]]:
@@ -280,7 +223,7 @@ def cmd_package(args: argparse.Namespace) -> int:
         "--no-verify",
         "--allow-dirty",
         "--registry",
-        "crates-io",
+        args.registry,
         "--manifest-path",
         manifest,
     ]
@@ -299,12 +242,18 @@ def cmd_package(args: argparse.Namespace) -> int:
         if not os.path.isfile(source):
             print(f"FAIL  expected {source} was not produced by cargo package")
             return 1
-        shutil.copy2(source, os.path.join(out_dir, crate_file))
+        destination = os.path.join(out_dir, crate_file)
+        shutil.copy2(source, destination)
         ordered.append(
             {
                 "name": crate,
                 "version": version,
                 "file": crate_file,
+                # Recorded so an out-of-band auditor can confirm what crates.io
+                # actually serves matches what this build produced. The release
+                # job itself cannot check that -- crates.io is unreachable from
+                # the isolated pool.
+                "sha256": _sha256(destination),
                 "dependencies": dependencies[crate],
             }
         )
@@ -321,60 +270,76 @@ def cmd_package(args: argparse.Namespace) -> int:
 def cmd_verify_order(args: argparse.Namespace) -> int:
     entries = _load_order(args.order_file)
     packaged = [entry["name"] for entry in entries]
-    expected = json.loads(args.expected)
-    if packaged != expected:
+    by_name = {entry["name"]: entry for entry in entries}
+    requested = json.loads(args.expected)
+
+    if len(set(requested)) != len(requested):
+        print("The crateOrder parameter lists the same crate more than once.")
+        return 1
+
+    unknown = [name for name in requested if name not in by_name]
+    if unknown:
         print(
-            "Crate order mismatch between the pipeline `crateOrder` parameter "
-            "and the packaged release-order.json."
+            "The crateOrder parameter names crates that were not packaged: "
+            f"{unknown}"
         )
-        print(f"  pipeline crateOrder : {expected}")
+        print(f"  release-order.json : {packaged}")
+        return 1
+
+    # A release may deliberately publish a SUBSET of the packaged closure: that
+    # is how an operator resumes a run that failed partway through. The release
+    # pool cannot ask crates.io what already landed (network isolation), so the
+    # operator asserts it by removing the finished crates from crateOrder.
+    # The subset must remain a SUBSEQUENCE of the packaged leaf-first order, so
+    # that whatever is published is still published in dependency order.
+    remaining = iter(packaged)
+    if not all(name in remaining for name in requested):
+        print(
+            "The crateOrder parameter is not in packaged leaf-first order. It "
+            "must list a subset of the packaged crates in the same relative "
+            "order."
+        )
+        print(f"  pipeline crateOrder : {requested}")
         print(f"  release-order.json  : {packaged}")
         return 1
 
-    positions = {crate: index for index, crate in enumerate(packaged)}
-    for entry in entries:
+    positions = {name: index for index, name in enumerate(requested)}
+    assumed_published: list[str] = []
+    for name in requested:
+        entry = by_name[name]
         if "dependencies" not in entry:
-            print(f"Crate {entry['name']} is missing dependency metadata.")
+            print(f"Crate {name} is missing dependency metadata.")
             return 1
         for dependency in entry["dependencies"]:
+            if dependency not in by_name:
+                print(f"Crate {name} depends on unpackaged crate {dependency}.")
+                return 1
             if dependency not in positions:
-                print(
-                    f"Crate {entry['name']} depends on unpackaged crate "
-                    f"{dependency}."
-                )
-                return 1
-            if positions[dependency] >= positions[entry["name"]]:
-                print(
-                    f"Crate {entry['name']} appears before dependency "
-                    f"{dependency}."
-                )
+                assumed_published.append(f"{name} -> {dependency}")
+                continue
+            if positions[dependency] >= positions[name]:
+                print(f"Crate {name} appears before dependency {dependency}.")
                 return 1
 
-    print(f"Crate order verified ({len(packaged)} crates, leaf-first).")
-    return 0
+    if len(requested) == len(packaged):
+        print(f"Crate order verified ({len(packaged)} crates, leaf-first).")
+        return 0
 
-
-def cmd_probe(_args: argparse.Namespace) -> int:
-    url = f"{CRATES_IO_SPARSE_INDEX}/config.json"
-    try:
-        with urllib.request.urlopen(_index_request(url), timeout=30) as response:
-            config = json.load(response)
-        if "dl" not in config:
-            print(f"FAIL  crates.io index config at {url} has no download URL")
-            return 1
-    except (
-        urllib.error.HTTPError,
-        urllib.error.URLError,
-        TimeoutError,
-        json.JSONDecodeError,
-    ) as error:
+    skipped = [name for name in packaged if name not in positions]
+    print(
+        f"Crate order verified ({len(requested)} of {len(packaged)} crates, "
+        "leaf-first)."
+    )
+    print(
+        "##vso[task.logissue type=warning]PARTIAL RELEASE: publishing "
+        f"{len(requested)} of {len(packaged)} packaged crates. Skipping: "
+        f"{skipped}"
+    )
+    for edge in assumed_published:
         print(
-            "FAIL  cannot read the crates.io sparse index. Allow read-only "
-            f"HTTPS egress to index.crates.io on the release pool: {error}"
+            f"##vso[task.logissue type=warning]Assuming already published on "
+            f"crates.io: {edge}"
         )
-        return 1
-
-    print(f"OK    crates.io sparse index is reachable at {url}")
     return 0
 
 
@@ -401,129 +366,6 @@ def cmd_stage(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_verify_dependencies(args: argparse.Namespace) -> int:
-    entries = _load_order(args.order_file)
-    entry = next(
-        (item for item in entries if item["name"] == args.crate),
-        None,
-    )
-    if entry is None:
-        print(f"Crate {args.crate!r} not found in {args.order_file}")
-        return 1
-    by_name = {item["name"]: item for item in entries}
-
-    dependencies = entry.get("dependencies")
-    if dependencies is None:
-        print(f"Crate {args.crate!r} has no dependency metadata")
-        return 1
-    if not dependencies:
-        print(f"OK    {args.crate} has no first-party crate dependencies.")
-        return 0
-
-    for dependency in dependencies:
-        dependency_entry = by_name.get(dependency)
-        if dependency_entry is None:
-            print(
-                f"FAIL  {args.crate} depends on unpackaged crate {dependency}"
-            )
-            return 1
-        try:
-            published = _published_matches(args.order_file, dependency_entry)
-        except (
-            RuntimeError,
-            urllib.error.HTTPError,
-            urllib.error.URLError,
-            TimeoutError,
-            json.JSONDecodeError,
-            OSError,
-        ) as error:
-            print(f"FAIL  cannot validate dependency {dependency}: {error}")
-            return 1
-        if not published:
-            print(
-                f"FAIL  {args.crate} requires {dependency} "
-                f"{dependency_entry['version']}, but that exact package is "
-                "not on crates.io"
-            )
-            return 1
-        print(
-            f"OK    {dependency} {dependency_entry['version']} is on crates.io "
-            "with the packaged checksum."
-        )
-
-    print(
-        f"=== verified {len(dependencies)} first-party dependencies for "
-        f"{args.crate} ==="
-    )
-    return 0
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    entry = _entry_for_crate(args.order_file, args.crate)
-    if entry is None:
-        print(f"Crate {args.crate!r} not found in {args.order_file}")
-        return 1
-    try:
-        published = _published_matches(args.order_file, entry)
-    except (
-        RuntimeError,
-        urllib.error.HTTPError,
-        urllib.error.URLError,
-        TimeoutError,
-        json.JSONDecodeError,
-        OSError,
-    ) as error:
-        print(f"FAIL  cannot check {args.crate} on crates.io: {error}")
-        return 1
-
-    value = "true" if published else "false"
-    print(f"##vso[task.setvariable variable=crateAlreadyPublished]{value}")
-    if published:
-        print(
-            f"OK    {entry['name']} {entry['version']} is already on crates.io "
-            "with the packaged checksum."
-        )
-    else:
-        print(
-            f"INFO  {entry['name']} {entry['version']} is not yet on crates.io."
-        )
-    return 0
-
-
-def cmd_wait(args: argparse.Namespace) -> int:
-    entry = _entry_for_crate(args.order_file, args.crate)
-    if entry is None:
-        print(f"Crate {args.crate!r} not found in {args.order_file}")
-        return 1
-    crate, version = entry["name"], entry["version"]
-
-    deadline = time.monotonic() + args.timeout
-    while time.monotonic() < deadline:
-        try:
-            if _published_matches(args.order_file, entry):
-                print(
-                    f"OK    {crate} {version} is live on crates.io with the "
-                    "packaged checksum."
-                )
-                return 0
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
-            print(
-                f"WARN  crates.io index unreachable for {crate}: "
-                f"{error}; retrying"
-            )
-        except (RuntimeError, json.JSONDecodeError, OSError) as error:
-            print(f"FAIL  cannot validate {crate}: {error}")
-            return 1
-        time.sleep(args.poll)
-
-    print(
-        f"##vso[task.logissue type=error]{crate} {version} was not confirmed "
-        f"on crates.io within {args.timeout}s. Stopping before publishing a "
-        "dependent crate."
-    )
-    return 1
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -534,6 +376,11 @@ def main() -> int:
     )
     package.add_argument("--manifest-path", default="src/Cargo.toml")
     package.add_argument("--out-dir", required=True)
+    # Which registry cargo resolves unpublished workspace siblings against.
+    # Defaults to crates-io so a developer running this by hand behaves
+    # normally; the pipeline passes the private feed to work around
+    # rust-lang/cargo#17196. See cmd_package for why this matters.
+    package.add_argument("--registry", default="crates-io")
     package.set_defaults(func=cmd_package)
 
     verify_order = sub.add_parser(
@@ -544,12 +391,6 @@ def main() -> int:
     verify_order.add_argument("--expected", required=True)
     verify_order.set_defaults(func=cmd_verify_order)
 
-    probe = sub.add_parser(
-        "probe",
-        help="confirm the release pool can read the crates.io sparse index",
-    )
-    probe.set_defaults(func=cmd_probe)
-
     stage = sub.add_parser(
         "stage",
         help="copy one crate into a clean ESRP input directory",
@@ -558,32 +399,6 @@ def main() -> int:
     stage.add_argument("--crate", required=True)
     stage.add_argument("--out-dir", required=True)
     stage.set_defaults(func=cmd_stage)
-
-    dependencies = sub.add_parser(
-        "verify-dependencies",
-        help="verify one crate's first-party dependencies on crates.io",
-    )
-    dependencies.add_argument("--order-file", required=True)
-    dependencies.add_argument("--crate", required=True)
-    dependencies.set_defaults(func=cmd_verify_dependencies)
-
-    status = sub.add_parser(
-        "status",
-        help="set whether the exact packaged crate is already on crates.io",
-    )
-    status.add_argument("--order-file", required=True)
-    status.add_argument("--crate", required=True)
-    status.set_defaults(func=cmd_status)
-
-    wait = sub.add_parser(
-        "wait",
-        help="poll crates.io for the exact packaged crate",
-    )
-    wait.add_argument("--order-file", required=True)
-    wait.add_argument("--crate", required=True)
-    wait.add_argument("--timeout", type=int, default=PROPAGATION_TIMEOUT)
-    wait.add_argument("--poll", type=int, default=PROPAGATION_POLL)
-    wait.set_defaults(func=cmd_wait)
 
     args = parser.parse_args()
     return args.func(args)

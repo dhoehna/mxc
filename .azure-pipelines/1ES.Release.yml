@@ -9,13 +9,22 @@
 #   * crates.io -> `mxc-crates-package`   (Package.Crates.Job.yml)
 # Leaf-first crate ordering/verification lives in templates/Publish.CratesIo.Job.yml.
 #
-# One-time enablement (out of band): OSPO OSS-release registration, crate-name
-# reservation under `microsoft-oss-releases`, and ESRP `Rust` content-type
-# onboarding for the ESRP client id (see the ESRP crates.io docs). The release
-# pool's network-isolation policy must also allow read-only HTTPS access to
-# `index.crates.io`; build-time dependency consumption remains on the private
-# Mxc-Azure-Feed. No CARGO_REGISTRY_TOKEN or variable group is needed -- ESRP
-# owns the credentials.
+# One-time enablement (out of band), ALL required before publishCrates is set:
+#   * OSPO OSS-release registration and ESRP `Rust` content-type onboarding for
+#     the ESRP client id (see the ESRP crates.io docs).
+#   * Public crate-name reservation. NOTE: `hyperlight_common` normalizes to
+#     `hyperlight-common`, which is already TAKEN on crates.io by
+#     github.com/hyperlight-dev/hyperlight. That crate must be renamed or
+#     co-ownership obtained before the closure can publish. crates.io treats
+#     `-` and `_` as equivalent when checking name collisions.
+#   * A crates.io publish rate-limit override, requested via help@crates.io.
+#     The default `PublishNew` allowance is a burst of 5 plus 1 per 10 minutes,
+#     so an 18-crate first release is throttled partway through without one.
+#
+# This release does NOT require crates.io network access. The pool's isolation
+# policy (CFSClean) blocks it, and the job is built to need no crates.io reads;
+# build-time dependency consumption remains on the private Mxc-Azure-Feed. No
+# CARGO_REGISTRY_TOKEN or variable group is needed -- ESRP owns the credentials.
 
 trigger: none
 name: $(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)

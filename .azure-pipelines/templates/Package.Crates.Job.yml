@@ -9,12 +9,20 @@
 # toolchain plus the internal Mxc-Azure-Feed for dependency resolution.
 # `cargo package --no-verify` tars each crate's source without compiling, while
 # the helper validates that the complete first-party dependency graph is
-# publishable and leaf-first. This job is currently opt-in because Cargo
-# https://github.com/rust-lang/cargo/issues/17196 prevents multi-package
-# packaging when crates.io is replaced by the private feed.
+# publishable and leaf-first.
+#
+# `--registry Mxc-Azure-Feed` works around rust-lang/cargo#17196: when
+# `[source.crates-io] replace-with` is active, cargo registers the temporary
+# overlay holding the just-packaged workspace siblings under the PRE-replacement
+# source id (crates-io) but looks it up under the POST-replacement one (the
+# feed). The keys never match, the overlay is silently bypassed, and each
+# sibling is searched for in the feed where it does not exist. Passing the feed
+# as the registry makes both sides agree. The emitted `.crate` files are
+# byte-identical either way -- they record the canonical crates.io registry and
+# contain no internal URLs.
 #
 # The helper script is copied into the artifact so the release job can run its
-# `stage`/`wait`/`verify-order` subcommands without checking out the source.
+# `stage`/`verify-order` subcommands without checking out the source.
 
 parameters:
   - name: cratesArtifactName
@@ -46,6 +54,7 @@ jobs:
           set -euo pipefail
           python3 .azure-pipelines/scripts/crates_release.py package \
             --manifest-path src/Cargo.toml \
+            --registry Mxc-Azure-Feed \
             --out-dir "$(outDir)"
           cp .azure-pipelines/scripts/crates_release.py "$(outDir)/"
         displayName: Package crate closure (leaf-first)

@@ -9,24 +9,36 @@
 #
 # ESRP publishes via the crates.io API, which does NOT enforce dependency order
 # and offers no bulk sorting (see the ESRP crates.io docs). We therefore emit
-# one EsrpRelease task per crate, leaf-first. Before each publish, the job checks
-# every first-party dependency directly on the crates.io sparse index; after the
-# publish it confirms the exact `.crate` checksum is live before continuing. A
-# run-time guard asserts the compile-time `crateOrder` matches what was packaged.
+# one EsrpRelease task per crate, leaf-first. A run-time guard asserts the
+# compile-time `crateOrder` matches what was packaged.
+#
+# This pool enforces 1ES network isolation (CFSClean), so crates.io is NOT
+# reachable from here and this job performs no crates.io reads. Correct ordering
+# is established offline at packaging time; a publish that crates.io rejects
+# fails its EsrpRelease task, which fails the job and skips every later crate,
+# so the leaf-first chain halts instead of shipping a broken closure.
+#
+# RESUMING A FAILED RELEASE: crates.io rejects a duplicate version, so simply
+# re-running this job unchanged fails on the first crate that already landed.
+# The pool cannot ask crates.io what landed, and 1ES forbids `checkout` in a
+# release job, so there is no automated ledger. Instead the operator re-queues
+# the release with the already-published crates removed from `crateOrder`.
+# `verify-order` accepts that subset only if it is still in packaged leaf-first
+# order, and logs every dependency it is consequently assuming is already live.
 
 parameters:
   - name: ESRPInfo
     type: object
-  # Leaf-first crate order. MUST match the CRATES list in
-  # scripts/crates_release.py; `verify-order` enforces this at run time.
+  # Leaf-first crate order. MUST be a correctly-ordered subset of the CRATES
+  # list in scripts/crates_release.py; `verify-order` enforces this at run time.
+  # Drop already-published crates from this list to resume a failed release.
   - name: crateOrder
     type: object
   - name: cratesArtifactName
     type: string
     default: mxc-crates-package
-  # When true, run index access + stage + verify-order but SKIP ESRP publication
-  # and live dependency checks -- exercises the pipeline plumbing without
-  # publishing anything.
+  # When true, run stage + verify-order but SKIP ESRP publication -- exercises
+  # the pipeline plumbing without publishing anything.
   - name: cratesDryRun
     type: boolean
     default: false
@@ -55,21 +67,16 @@ jobs:
       runOnce:
         deploy:
           steps:
-            # Guard: the compile-time crate loop below and the packaged closure
-            # must agree, or we could publish in the wrong order / skip a crate.
+            # Guard: the crates this run will publish must be a correctly
+            # ordered subset of what was packaged, or we could publish in the
+            # wrong order. A strict subset is allowed (resume); it is reported
+            # as a warning naming every dependency assumed already published.
             - script: |
                 set -euo pipefail
                 python3 "$(script)" verify-order --order-file "$(orderFile)" --expected "$EXPECTED_ORDER"
               displayName: Verify crate order matches package
               env:
                 EXPECTED_ORDER: ${{ convertToJson(parameters.crateOrder) }}
-
-            # Fail before publishing anything if the release pool's network
-            # isolation policy does not allow the crates.io sparse index.
-            - script: |
-                set -euo pipefail
-                python3 "$(script)" probe
-              displayName: Verify crates.io index access
 
             - ${{ each crate in parameters.crateOrder }}:
                 - script: |
@@ -79,23 +86,11 @@ jobs:
 
                 - ${{ if parameters.cratesDryRun }}:
                   - script: |
-                      echo "##vso[task.logissue type=warning]DRY RUN: skipping ESRP publish and feed wait for ${{ crate }} (staged .crate only)."
+                      echo "##vso[task.logissue type=warning]DRY RUN: skipping ESRP publish for ${{ crate }} (staged .crate only)."
                     displayName: "DRY RUN: skip publish ${{ crate }}"
                 - ${{ else }}:
-                  - script: |
-                      set -euo pipefail
-                      python3 "$(script)" status --order-file "$(orderFile)" --crate "${{ crate }}"
-                    displayName: "Check whether ${{ crate }} is already on crates.io"
-
-                  - script: |
-                      set -euo pipefail
-                      python3 "$(script)" verify-dependencies --order-file "$(orderFile)" --crate "${{ crate }}"
-                    displayName: "Verify ${{ crate }} dependencies on crates.io"
-                    condition: and(succeeded(), ne(variables['crateAlreadyPublished'], 'true'))
-
                   - task: EsrpRelease@12
                     displayName: "Publish ${{ crate }} to crates.io"
-                    condition: and(succeeded(), ne(variables['crateAlreadyPublished'], 'true'))
                     inputs:
                       connectedservicename: ${{ parameters.ESRPInfo.serviceName }}
                       usemanagedidentity: false
@@ -113,14 +108,3 @@ jobs:
                       serviceendpointurl: 'https://api.esrp.microsoft.com'
                       mainpublisher: 'ESRPRELPACMAN'
                       domaintenantid: ${{ parameters.ESRPInfo.tenantId }}
-
-                  - script: |
-                      echo "${{ crate }} is already on crates.io with the packaged checksum; skipping ESRP."
-                    displayName: "Skip existing ${{ crate }} version"
-                    condition: and(succeeded(), eq(variables['crateAlreadyPublished'], 'true'))
-
-                  - script: |
-                      set -euo pipefail
-                      python3 "$(script)" wait --order-file "$(orderFile)" --crate "${{ crate }}"
-                    displayName: "Wait for ${{ crate }} on crates.io"
-                    condition: and(succeeded(), ne(variables['crateAlreadyPublished'], 'true'))
