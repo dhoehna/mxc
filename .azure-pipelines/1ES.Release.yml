@@ -1,37 +1,5 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
-#
-# Single entry point for MXC package releases: one run can publish the npm SDK,
-# the Rust crate closure to crates.io, or both, via the `publishNpm` /
-# `publishCrates` parameters. Both publish through ESRP Release (no registry
-# tokens in this repo).
-#   * npm SDK   -> `mxc-npm-sdk-package`, consumed from `MXC-Official-Build`
-#   * crates.io -> `mxc-crates-package`, PACKAGED IN THIS RUN (see below)
-#
-# Releasing crates is a single click: queue this pipeline with `publishCrates`
-# and it packages the closure and then publishes it. 1ES forbids `checkout` in a
-# release JOB, but a regular job in the same PIPELINE may check out and build, so
-# the Package_Crates_For_Release stage produces the artifact that the release job
-# then consumes. Set `cratesDryRun` to package and verify while skipping ESRP --
-# that is the safe way to exercise the full 18-crate closure without publishing.
-# Leaf-first crate ordering/verification lives in templates/Publish.CratesIo.Job.yml.
-#
-# One-time enablement (out of band), ALL required before publishCrates is set:
-#   * OSPO OSS-release registration and ESRP `Rust` content-type onboarding for
-#     the ESRP client id (see the ESRP crates.io docs).
-#   * Public crate-name reservation. NOTE: `hyperlight_common` normalizes to
-#     `hyperlight-common`, which is already TAKEN on crates.io by
-#     github.com/hyperlight-dev/hyperlight. That crate must be renamed or
-#     co-ownership obtained before the closure can publish. crates.io treats
-#     `-` and `_` as equivalent when checking name collisions.
-#   * A crates.io publish rate-limit override, requested via help@crates.io.
-#     The default `PublishNew` allowance is a burst of 5 plus 1 per 10 minutes,
-#     so an 18-crate first release is throttled partway through without one.
-#
-# This release does NOT require crates.io network access. The pool's isolation
-# policy (CFSClean) blocks it, and the job is built to need no crates.io reads;
-# build-time dependency consumption remains on the private Mxc-Azure-Feed. No
-# CARGO_REGISTRY_TOKEN or variable group is needed -- ESRP owns the credentials.
 
 trigger: none
 name: $(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
@@ -42,7 +10,7 @@ resources:
     name: 1ESPipelineTemplates/1ESPipelineTemplates
     ref: refs/tags/release
   pipelines:
-  # Reference pipeline that created the signed release artifacts so we can consume them later
+  # Reference pipeline that created the signed npm artifacts so we can consume them later
   - pipeline: MXC 
     source: 'MXC-Official-Build'
     trigger: none
@@ -50,43 +18,6 @@ resources:
 
 # Parameters for ESRP release info will be passed from the ADO UI.
 parameters:
-  - name: publishNpm
-    displayName: "Publish the npm SDK to npmjs.com"
-    type: boolean
-    default: false
-  - name: publishCrates
-    displayName: "Publish the Rust crate closure to crates.io"
-    type: boolean
-    default: false
-  - name: cratesDryRun
-    displayName: "Crates dry run: stage + verify only, skip the ESRP publish"
-    type: boolean
-    default: false
-  # Leaf-first crate order for crates.io. MUST match the CRATES list in
-  # .azure-pipelines/scripts/crates_release.py; verified at run time by
-  # `verify-order`, which fails the release if the two disagree.
-  #
-  - name: crateOrder
-    type: object
-    default:
-      - nanvix_common
-      - mxc_telemetry
-      - wxc_common
-      - nanvix_runner
-      - hyperlight_common
-      - mxc_pty
-      - lxc_common
-      - bwrap_common
-      - seatbelt_common
-      - sandbox_spec
-      - appcontainer_common
-      - isolation_session_bindings
-      - isolation_session_common
-      - windows_sandbox_common
-      - windows_sandbox_lifecycle
-      - wslc_common
-      - mxc_engine
-      - mxc-sdk
   - name: ESRPInfo
     type: object
     default:
@@ -116,65 +47,42 @@ extends:
         os: windows
 
     stages:
-    - ${{ if parameters.publishNpm }}:
-      - stage: Publish_to_NPM
-        displayName: 'Publish NPM Package'
-        variables:
-        - name: release_environment
-          value: Production
-        jobs:
-        - job: ReleaseJob
-          templateContext:
-            type: releaseJob
-            isProduction: true
-            inputs:
-            - input: pipelineArtifact
-              pipeline: MXC
-              targetPath: '$(Pipeline.Workspace)/packages'
-              artifactName: mxc-npm-sdk-package
+    - stage: Publish_to_NPM
+      displayName: 'Publish NPM Package'
+      variables:
+      - name: release_environment
+        value: Production
+      jobs:
+      - job: ReleaseJob
+        templateContext:
+          type: releaseJob
+          isProduction: true
+          inputs:
+          - input: pipelineArtifact
+            pipeline: MXC
+            targetPath: '$(Pipeline.Workspace)/packages'
+            artifactName: mxc-npm-sdk-package
 
-          displayName: Publish to NPM
-          steps:
-          - task: EsrpRelease@10
-            displayName: 'Publish to NPM'
-            inputs:
-              connectedservicename: ${{ parameters.ESRPInfo.serviceName }}
-              usemanagedidentity: false
-              keyvaultname: ${{ parameters.ESRPInfo.azureKeyVaultName }}
-              authcertname: ${{ parameters.ESRPInfo.authCertName }}
-              signcertname: ${{ parameters.ESRPInfo.signCertName }}
-              clientid: ${{ parameters.ESRPInfo.clientId }}
-              intent: 'PackageDistribution'
-              contenttype: npm
-              contentsource: 'Folder'
-              folderlocation: '$(Pipeline.Workspace)/packages'
-              owners: ${{ parameters.ESRPInfo.OwnersEmail }}
-              approvers: ${{ parameters.ESRPInfo.ApproversEmail }}
-              waitforreleasecompletion: true
-              serviceendpointurl: 'https://api.esrp.microsoft.com'
-              mainpublisher: ESRPRELPACMAN
-              domaintenantid: ${{ parameters.ESRPInfo.tenantId }}
-
-    - ${{ if parameters.publishCrates }}:
-      # Package first, in this same run, so releasing crates is a single click:
-      # queue this pipeline with publishCrates and it packages then publishes.
-      # A release job cannot check out or build, but a REGULAR job in the same
-      # pipeline can -- so packaging happens here and the release job consumes
-      # the artifact this run produced.
-      - stage: Package_Crates_For_Release
-        displayName: 'Package Crates'
-        dependsOn: []
-        jobs:
-        - template: templates/Package.Crates.Job.yml@self
-
-      - stage: Publish_to_CratesIo
-        displayName: 'Publish Crates.io Packages'
-        dependsOn: Package_Crates_For_Release
-        jobs:
-        - template: templates/Publish.CratesIo.Job.yml@self
-          parameters:
-            ESRPInfo: ${{ parameters.ESRPInfo }}
-            crateOrder: ${{ parameters.crateOrder }}
-            cratesDryRun: ${{ parameters.cratesDryRun }}
+        displayName: Publish to NPM
+        steps:
+        - task: EsrpRelease@10
+          displayName: 'Publish to NPM'
+          inputs:
+            connectedservicename: ${{ parameters.ESRPInfo.serviceName }}
+            usemanagedidentity: false
+            keyvaultname: ${{ parameters.ESRPInfo.azureKeyVaultName }}
+            authcertname: ${{ parameters.ESRPInfo.authCertName }}
+            signcertname: ${{ parameters.ESRPInfo.signCertName }}
+            clientid: ${{ parameters.ESRPInfo.clientId }}
+            intent: 'PackageDistribution'
+            contenttype: npm
+            contentsource: 'Folder'
+            folderlocation: '$(Pipeline.Workspace)/packages'
+            owners: ${{ parameters.ESRPInfo.OwnersEmail }}
+            approvers: ${{ parameters.ESRPInfo.ApproversEmail }}
+            waitforreleasecompletion: true
+            serviceendpointurl: 'https://api.esrp.microsoft.com'
+            mainpublisher: ESRPRELPACMAN
+            domaintenantid: ${{ parameters.ESRPInfo.tenantId }} 
 
   

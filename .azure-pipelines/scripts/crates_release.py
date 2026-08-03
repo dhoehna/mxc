@@ -54,8 +54,9 @@ import subprocess
 import sys
 
 # Current Cargo package names in leaf-first order. These names remain
-# provisional until the public naming scheme is approved; publishCrates defaults
-# to false in 1ES.Release.yml.
+# provisional until the public naming scheme is approved; the crates.io release
+# pipeline (.azure-pipelines/1ES.Release.Crates.yml) is manual-trigger only and
+# offers a dry-run mode, so nothing reaches crates.io until that is settled.
 CRATES: list[str] = [
     "nanvix_common",
     "mxc_telemetry",
@@ -217,11 +218,16 @@ def cmd_package(args: argparse.Namespace) -> int:
     print(flush=True)
 
     manifest = os.path.abspath(args.manifest_path)
+    # Verification stays on. Passing --registry (rather than the default
+    # crates-io) is what makes cargo resolve sibling crates against the
+    # temporary package registry, so the overlay bug in cargo#17196 does not
+    # apply here and --no-verify is unnecessary. --allow-dirty is likewise
+    # omitted: the only file the pipeline modifies is the workspace
+    # .cargo/config.toml, which lies outside every package directory, so a
+    # dirty-tree failure here means a crate source really was modified.
     package_args = [
         "cargo",
         "package",
-        "--no-verify",
-        "--allow-dirty",
         "--registry",
         args.registry,
         "--manifest-path",
@@ -358,10 +364,26 @@ def cmd_stage(args: argparse.Namespace) -> int:
     if not os.path.isfile(source):
         print(f"Crate file not found: {source}")
         return 1
+
+    # Staging is the last point at which a truncated or substituted archive can
+    # be caught: past here ESRP uploads it and the crates.io version is
+    # immutable. Fail closed when the digest is missing as well as when it
+    # disagrees, so an order file written without one cannot silently skip this.
+    expected = entry.get("sha256")
+    if not expected:
+        print(f"FAIL  no sha256 recorded for {entry['file']} in {args.order_file}")
+        return 1
+    actual = _sha256(source)
+    if actual != expected:
+        print(f"FAIL  checksum mismatch for {entry['file']}")
+        print(f"      expected {expected}")
+        print(f"      actual   {actual}")
+        return 1
+
     shutil.copy2(source, os.path.join(out_dir, entry["file"]))
     print(
         f"Staged {entry['file']} ({args.crate} {entry['version']}) "
-        f"into {out_dir} for ESRP."
+        f"into {out_dir} for ESRP, sha256 verified."
     )
     return 0
 
@@ -377,10 +399,11 @@ def main() -> int:
     package.add_argument("--manifest-path", default="src/Cargo.toml")
     package.add_argument("--out-dir", required=True)
     # Which registry cargo resolves unpublished workspace siblings against.
-    # Defaults to crates-io so a developer running this by hand behaves
-    # normally; the pipeline passes the private feed to work around
-    # rust-lang/cargo#17196. See cmd_package for why this matters.
-    package.add_argument("--registry", default="crates-io")
+    # Defaults to the private feed because that is the only value known to
+    # work: verification is enabled (see cmd_package), and with the default
+    # crates-io the overlay bug in rust-lang/cargo#17196 fails the run. Keeping
+    # this aligned with the pipeline also means a local repro matches CI.
+    package.add_argument("--registry", default="Mxc-Azure-Feed")
     package.set_defaults(func=cmd_package)
 
     verify_order = sub.add_parser(

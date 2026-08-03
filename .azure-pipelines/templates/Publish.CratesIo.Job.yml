@@ -3,19 +3,19 @@
 #
 # Publishes the `mxc-sdk` crate closure to crates.io through ESRP Release, under
 # the official `microsoft-oss-releases` account. Consumes the
-# `mxc-crates-package` artifact produced earlier in the SAME run by
-# Package.Crates.Job.yml -- ESRP publishes pre-built `.crate` files, so no
-# CARGO_REGISTRY_TOKEN ever lives in this repo.
+# `mxc-crates-package` artifact produced by Package.Crates.Job.yml in the SAME
+# pipeline run (1ES.Release.Crates.yml) -- ESRP publishes pre-built `.crate`
+# files, so no CARGO_REGISTRY_TOKEN ever lives in this repo.
 #
 # ESRP publishes via the crates.io API, which does NOT enforce dependency order
 # and offers no bulk sorting (see the ESRP crates.io docs). We therefore emit
 # one EsrpRelease task per crate, leaf-first. A run-time guard asserts the
 # compile-time `crateOrder` is an ordered subset of what was packaged.
 #
-# This is a standard `job` with `templateContext.type: releaseJob`, matching the
-# NPM release job in 1ES.Release.yml. It is deliberately NOT a `deployment` job:
-# 1ES requires `environment:` on those, which would mean provisioning an ADO
-# Environment (and its approval gates) for no benefit here.
+# This is a standard `job` with `templateContext.type: releaseJob`, modelled on
+# the pattern used by the NPM release job in 1ES.Release.yml. It is deliberately
+# NOT a `deployment` job: 1ES requires `environment:` on those, which would mean
+# provisioning an ADO Environment (and its approval gates) for no benefit here.
 #
 # This pool enforces 1ES network isolation (CFSClean), so crates.io is NOT
 # reachable from here and this job performs no crates.io reads. Correct ordering

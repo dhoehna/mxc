@@ -2,12 +2,23 @@
 # Licensed under the MIT License.
 #
 # Packages the `mxc-sdk` crate closure into `.crate` files for ESRP-based
-# crates.io publishing (consumed by 1ES.Release.yml's Publish_to_CratesIo
-# stage). Publishes them as the `mxc-crates-package` pipeline artifact.
+# crates.io publishing. Publishes them as the `mxc-crates-package` pipeline
+# artifact, consumed by `1ES.Release.Crates.yml`'s Publish_to_CratesIo stage.
+#
+# This template has TWO callers, and both package the ref the run was queued
+# against:
+#   1. `templates/1ES.Build.Stages.yml` (official build) -- packages the commit
+#      the build is already building, producing the artifact purely as build
+#      output / validation.
+#   2. `.azure-pipelines/1ES.Release.Crates.yml` (dedicated crates release
+#      pipeline) -- queued against a release tag picked in the Run dialog's
+#      branch/tag selector, so it packages that tag. That pipeline gates the
+#      ref in its Validate_Release_Ref stage, which is why no tag handling is
+#      needed here.
 #
 # Source-only: unlike the npm SDK this needs no built binaries, only a cargo
 # toolchain plus the internal Mxc-Azure-Feed for dependency resolution.
-# `cargo package --no-verify` tars each crate's source without compiling, while
+# `cargo package` tars each crate's source and verification-builds it, while
 # the helper validates that the complete first-party dependency graph is
 # publishable and leaf-first.
 #
@@ -39,6 +50,11 @@ jobs:
     variables:
       outDir: $(Build.SourcesDirectory)/out/crates
     steps:
+      # Packages the ref the run was queued against. For a release that is the
+      # release tag itself, selected in the Run dialog's branch/tag selector and
+      # already validated by the Validate_Release_Ref stage, so there is no tag
+      # to resolve or check out here. Crate versions come from src/Cargo.toml at
+      # that ref, since every crate inherits `version.workspace = true`.
       - checkout: self
 
       - template: Rust.Toolchain.Public.yml@self

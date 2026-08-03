@@ -1,0 +1,222 @@
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License.
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# MXC Crates.io Release Pipeline (ESRP)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# What this does:
+#   Packages the MXC Rust crate closure from a release tag and publishes every
+#   crate to crates.io through ESRP Release, leaf-first. It is ONE CLICK:
+#   pick the release tag in the Run dialog's branch/tag selector, and it
+#   packages then publishes.
+#
+# Choosing the release (REQUIRED):
+#   The source packaged is the ref the run is QUEUED AGAINST -- selected from
+#   the branch/tag selector at the top of the Run pipeline dialog. There is no
+#   tag parameter to type. The ref must be a release tag matching
+#   `refs/tags/release/*` (for example `release/v0.8.0`); the
+#   Validate_Release_Ref stage fails the run otherwise, and every other stage
+#   depends on it.
+#
+#   This means the pipeline DEFINITION also comes from that tag, so a release
+#   is fully immutable: changing anything about how a release is built --
+#   including this pipeline -- requires cutting a new tag. Crate versions come
+#   from `src/Cargo.toml` at the tag because every crate in the workspace uses
+#   `version.workspace = true`.
+#
+# Dry-run:
+#   Set `cratesDryRun` to true to package and verify ordering without
+#   actually publishing to crates.io. Useful for validating a release tag
+#   before committing.
+#
+# Network / credentials:
+#   This pipeline needs NO crates.io network access. The 1ES pool's CFSClean
+#   isolation policy blocks crates.io; dependency resolution stays on the
+#   private `Mxc-Azure-Feed`; and ESRP owns the publishing credentials so no
+#   CARGO_REGISTRY_TOKEN or token variable group is needed.
+#
+# ─── One-time enablement prerequisites ───────────────────────────────────────
+#
+# 1. OSPO OSS-release registration: the crate closure must be registered in
+#    OSPO's open-source release tracker before ESRP will accept a Rust
+#    content-type release.
+#
+# 2. ESRP `Rust` content-type onboarding: the ESRP service connection must
+#    have the `Rust` content type enabled. File a request through the ESRP
+#    onboarding portal.
+#
+# 3. Public crate-name reservation. NOTE: `hyperlight_common` normalizes to
+#    `hyperlight-common`, which is already TAKEN on crates.io by
+#    github.com/hyperlight-dev/hyperlight. crates.io treats `-` and `_` as
+#    equivalent when checking name collisions, so that crate must be renamed
+#    or co-ownership obtained before the closure can publish.
+#
+# 4. crates.io `PublishNew` rate-limit override, requested via help@crates.io.
+#    The default allowance is a burst of 5 plus 1 per 10 minutes, so an
+#    18-crate first release is throttled partway through without one.
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+trigger: none
+pr: none
+
+name: $(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+# No `resources.pipelines` entry: unlike the npm release pipeline, this
+# pipeline packages its own source in-run (via Package.Crates.Job.yml) so it
+# does not consume artifacts from another pipeline.
+resources:
+  repositories:
+  - repository: 1ESPipelineTemplates
+    type: git
+    name: 1ESPipelineTemplates/1ESPipelineTemplates
+    ref: refs/tags/release
+
+parameters:
+  - name: cratesDryRun
+    displayName: 'Dry run — package and verify order but skip ESRP publish'
+    type: boolean
+    default: false
+
+  # These email parameters exist because the MXC-ESRP-Signing variable group
+  # does not contain OwnersEmail / ApproversEmail keys — confirmed against the
+  # ADO variable-groups API, which reports exactly six code-signing fields:
+  # serviceName, tenantId, azureKeyVaultName, authCertName, signCertName, and
+  # clientId. A string parameter renders in the ADO "Run pipeline" dialog, so
+  # operators supply these values at queue time.
+  - name: esrpOwnersEmail
+    displayName: 'ESRP release owners email'
+    type: string
+    default: ''
+
+  - name: esrpApproversEmail
+    displayName: 'ESRP release approvers email'
+    type: string
+    default: ''
+
+  # Leaf-first crate publish order. Must match `scripts/crates_release.py`
+  # CRATES list; `verify-order` fails the run at run time if this is not an
+  # ordered SUBSET of what was packaged. A subset passes on purpose, so that a
+  # partial release can be resumed -- which also means an accidental omission
+  # here will not be caught. Edit deliberately.
+  - name: crateOrder
+    type: object
+    default:
+    - nanvix_common
+    - mxc_telemetry
+    - wxc_common
+    - nanvix_runner
+    - hyperlight_common
+    - mxc_pty
+    - lxc_common
+    - bwrap_common
+    - seatbelt_common
+    - sandbox_spec
+    - appcontainer_common
+    - isolation_session_bindings
+    - isolation_session_common
+    - windows_sandbox_common
+    - windows_sandbox_lifecycle
+    - wslc_common
+    - mxc_engine
+    - mxc-sdk
+
+variables:
+  - group: MXC-ESRP-Signing
+
+extends:
+  template: v1/1ES.Official.PipelineTemplate.yml@1ESPipelineTemplates
+  parameters:
+    pool:
+      name: Azure-Pipelines-1ESPT-ExDShared
+      image: windows-2022
+      os: windows
+    customBuildTags:
+    - ES365AIMigrationTooling
+
+    sdl:
+      sourceAnalysisPool:
+        name: Azure-Pipelines-1ESPT-ExDShared
+        image: windows-latest
+        os: windows
+
+    stages:
+    # ─── Stage 0: Gate on the release ref ────────────────────────────────────
+    # The source packaged by this pipeline is whatever ref the run was queued
+    # against, chosen from the Run dialog's branch/tag selector. That selector
+    # cannot be filtered -- Azure DevOps offers no way to restrict which refs
+    # it lists, so it shows every branch and tag. This stage is what makes the
+    # choice safe: it fails unless the run was queued against a release tag,
+    # and both stages below depend on it, so nothing is checked out, packaged,
+    # or published from a branch or a non-release tag.
+    #
+    # This must be a RUNTIME check. `Build.SourceBranch` is not available to
+    # compile-time `${{ }}` template expressions, so the stages cannot be
+    # conditionally omitted based on it.
+    - stage: Validate_Release_Ref
+      displayName: 'Validate Release Ref'
+      dependsOn: []
+      # Operators can deselect stages in the Run dialog's "Stages to run" panel.
+      # `isSkippable: false` greys out this stage's checkbox so the gate cannot
+      # be switched off, which is the documented purpose of the property (the
+      # Learn example is an injected malware-detection stage). Without it, the
+      # guard below would be advisory rather than enforced.
+      isSkippable: false
+      jobs:
+      - job: validate_release_ref
+        displayName: 'Require a release tag'
+        pool:
+          name: Azure-Pipelines-1ESPT-ExDShared
+          image: ubuntu-latest
+          os: linux
+        steps:
+        - checkout: none
+        - script: |
+            set -euo pipefail
+            echo "Run was queued against: $SOURCE_REF"
+            case "$SOURCE_REF" in
+              refs/tags/release/?*)
+                echo "OK: releasing from tag ${SOURCE_REF#refs/tags/}"
+                ;;
+              *)
+                echo "##vso[task.logissue type=error]This pipeline may only run from a release tag (refs/tags/release/*). It was queued against '$SOURCE_REF'."
+                echo "Cut a tag such as 'release/v0.8.0' from main, then pick it in the branch/tag selector of the Run pipeline dialog."
+                exit 1
+                ;;
+            esac
+          displayName: 'Require refs/tags/release/*'
+          env:
+            SOURCE_REF: $(Build.SourceBranch)
+
+    # ─── Stage 1: Package ────────────────────────────────────────────────────
+    # Packaging happens in this pipeline (not the build pipeline) because:
+    # 1ES forbids `checkout` in a release JOB ("To adhere to compliance
+    # requirements, 1ES PT no longer supports checkout in release jobs"), but
+    # a regular job in the same PIPELINE may check out and build. So a normal
+    # job packages, and the release job consumes the artifact produced within
+    # this same run. This is what makes the release one click.
+    - stage: Package_Crates_For_Release
+      displayName: 'Package Crates'
+      dependsOn: Validate_Release_Ref
+      jobs:
+      - template: templates/Package.Crates.Job.yml@self
+
+    # ─── Stage 2: Publish ────────────────────────────────────────────────────
+    - stage: Publish_to_CratesIo
+      displayName: 'Publish Crates.io Packages'
+      dependsOn: Package_Crates_For_Release
+      jobs:
+      - template: templates/Publish.CratesIo.Job.yml@self
+        parameters:
+          ESRPInfo:
+            serviceName: $(serviceName)
+            tenantId: $(tenantId)
+            azureKeyVaultName: $(azureKeyVaultName)
+            authCertName: $(authCertName)
+            signCertName: $(signCertName)
+            clientId: $(clientId)
+            OwnersEmail: ${{ parameters.esrpOwnersEmail }}
+            ApproversEmail: ${{ parameters.esrpApproversEmail }}
+          crateOrder: ${{ parameters.crateOrder }}
+          cratesDryRun: ${{ parameters.cratesDryRun }}
