@@ -4,9 +4,16 @@
 # Single entry point for MXC package releases: one run can publish the npm SDK,
 # the Rust crate closure to crates.io, or both, via the `publishNpm` /
 # `publishCrates` parameters. Both publish through ESRP Release (no registry
-# tokens in this repo), consuming artifacts from `MXC-Official-Build`:
-#   * npm SDK   -> `mxc-npm-sdk-package`  (Package.NpmSdk.Job.yml)
-#   * crates.io -> `mxc-crates-package`   (Package.Crates.Job.yml)
+# tokens in this repo).
+#   * npm SDK   -> `mxc-npm-sdk-package`, consumed from `MXC-Official-Build`
+#   * crates.io -> `mxc-crates-package`, PACKAGED IN THIS RUN (see below)
+#
+# Releasing crates is a single click: queue this pipeline with `publishCrates`
+# and it packages the closure and then publishes it. 1ES forbids `checkout` in a
+# release JOB, but a regular job in the same PIPELINE may check out and build, so
+# the Package_Crates_For_Release stage produces the artifact that the release job
+# then consumes. Set `cratesDryRun` to package and verify while skipping ESRP --
+# that is the safe way to exercise the full 18-crate closure without publishing.
 # Leaf-first crate ordering/verification lives in templates/Publish.CratesIo.Job.yml.
 #
 # One-time enablement (out of band), ALL required before publishCrates is set:
@@ -149,9 +156,20 @@ extends:
               domaintenantid: ${{ parameters.ESRPInfo.tenantId }}
 
     - ${{ if parameters.publishCrates }}:
+      # Package first, in this same run, so releasing crates is a single click:
+      # queue this pipeline with publishCrates and it packages then publishes.
+      # A release job cannot check out or build, but a REGULAR job in the same
+      # pipeline can -- so packaging happens here and the release job consumes
+      # the artifact this run produced.
+      - stage: Package_Crates_For_Release
+        displayName: 'Package Crates'
+        dependsOn: []
+        jobs:
+        - template: templates/Package.Crates.Job.yml@self
+
       - stage: Publish_to_CratesIo
         displayName: 'Publish Crates.io Packages'
-        dependsOn: []
+        dependsOn: Package_Crates_For_Release
         jobs:
         - template: templates/Publish.CratesIo.Job.yml@self
           parameters:
