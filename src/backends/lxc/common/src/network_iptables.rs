@@ -12,8 +12,13 @@
 //!
 //! **Dual-stack.** A dual-stack container is reachable over IPv4 or IPv6, so an
 //! IPv4-only chain would let IPv6 inbound bypass the deny entirely. Every rule
-//! is installed through both `iptables` and `ip6tables` (see
-//! [`IPTABLES_BINARIES`]), and teardown removes both.
+//! is installed through `iptables` and, when the family is usable, `ip6tables`;
+//! teardown removes both. `ip6tables` being unusable is only safe when IPv6 is
+//! positively known to be disabled on the host (no `/proc/net/if_inet6`
+//! addresses): there the IPv4 chain is enforced alone. When IPv6 is live but
+//! `ip6tables` cannot run, the inbound deny is unenforceable for that family,
+//! so the run fails closed rather than silently leaving IPv6 open. This matches
+//! PR #632's probe (`ip6tables_available` / `host_has_ipv6`).
 //!
 //! **Permissive path is not yet implemented.** `allowLocalNetwork: true` is
 //! meant to open *host-loopback* inbound only, but scoping to host loopback
@@ -54,12 +59,13 @@ pub struct NetworkIptablesManager {
     netns_pid: Option<u32>,
 }
 
-/// The IP families the inbound chain is installed for. A dual-stack container
-/// is reachable over either family, so a chain that lives only in IPv4 lets
-/// IPv6 inbound bypass the default-deny entirely. Every rule this manager
-/// emits is family-agnostic (interface, connection-state, and chain matches —
-/// no IP literals), so the same argv is replayed through both binaries and the
-/// teardown removes both.
+/// The IP families the inbound chain may exist in. A dual-stack container is
+/// reachable over either family, so a chain that lives only in IPv4 lets IPv6
+/// inbound bypass the default-deny entirely. Every rule this manager emits is
+/// family-agnostic (interface, connection-state, and chain matches — no IP
+/// literals), so the same argv is valid for both binaries. Install replays each
+/// rule through IPv4 and, when `ip6tables` is usable, IPv6; teardown is
+/// best-effort over both families (a stale `-D`/`-F`/`-X` simply no-ops).
 const IPTABLES_BINARIES: [&str; 2] = ["iptables", "ip6tables"];
 
 impl NetworkIptablesManager {
@@ -158,15 +164,44 @@ impl NetworkIptablesManager {
 
         let rules = Self::build_firewall_rules(&self.chain_name, policy, self.netns_pid.is_some());
 
-        // Replay every rule through both IP families so IPv6 inbound cannot
-        // bypass an IPv4-only deny on a dual-stack container. An `ip6tables`
-        // failure is treated exactly like an `iptables` failure (fail-closed):
-        // a default-deny inbound control that cannot be installed for a family
-        // must abort the run, not silently leave that family open.
+        // IPv6 handling. The inbound chain is *always* default-deny (terminal
+        // DROP) on the path that reaches here — the permissive `allowLocalNetwork`
+        // case returned above — so IPv6 always needs the same chain or v6 inbound
+        // bypasses the deny. Unlike PR #632's egress model there is no allow
+        // stance that would make skipping v6 harmless.
+        //
+        // Being unable to run `ip6tables` is only safe when the host has no IPv6
+        // stack at all. On a host with live IPv6 it means we cannot filter a
+        // whole address family, which is exactly the fail-open this fix closes,
+        // so we abort. When IPv6 is positively known to be disabled we enforce
+        // the IPv4 chain alone. This mirrors PR #632's probe so the two branches
+        // agree on the distinction (`network_iptables.rs` `ip6tables_available`
+        // / `host_has_ipv6` there).
+        let ipv6_enabled = Self::ip6tables_available(logger);
+        if !ipv6_enabled {
+            if Self::host_has_ipv6() {
+                return Err(format!(
+                    "ip6tables is unusable on this host but IPv6 is live \
+                     (/proc/net/if_inet6 lists addresses), so inbound IPv6 for container \
+                     '{}' cannot be denied. Refusing to start with an unenforceable inbound \
+                     policy: disable IPv6 on the host, or install/enable ip6tables.",
+                    self.chain_name
+                ));
+            }
+            logger.log_line(
+                "ip6tables unusable and no live IPv6 stack on this host; enforcing the \
+                 IPv4 inbound policy only.",
+            );
+        }
+
+        // Install each rule in IPv4, and in IPv6 too when the family is usable,
+        // so IPv6 inbound cannot bypass an IPv4-only deny on a dual-stack
+        // container.
         for rule in &rules {
             let argv: Vec<&str> = rule.iter().map(String::as_str).collect();
-            for binary in IPTABLES_BINARIES {
-                Self::run_iptables(binary, self.netns_pid, &argv, logger)?;
+            Self::run_iptables("iptables", self.netns_pid, &argv, logger)?;
+            if ipv6_enabled {
+                Self::run_iptables("ip6tables", self.netns_pid, &argv, logger)?;
             }
         }
 
@@ -302,6 +337,63 @@ impl NetworkIptablesManager {
         // iptables `-D`/`-F`/`-X` calls just no-op.
         mgr.rules_applied = true;
         let _ = mgr.remove_firewall_rules(logger);
+    }
+
+    /// Probe whether `ip6tables` can be used on this host.
+    ///
+    /// Runs a harmless, read-only `ip6tables -S` (list the filter table). This
+    /// fails both when the binary is missing (IPv4-only images) and when the
+    /// kernel has IPv6 disabled (`ip6tables` reports the table cannot be
+    /// initialized). The two cases are **not** equivalent, so callers must pair
+    /// this with [`Self::host_has_ipv6`]: skipping the v6 chain is safe only on
+    /// a host that has no IPv6 stack to leak through.
+    ///
+    /// Probed on the host (not via `nsenter`), mirroring PR #632. The
+    /// `ip6_tables` kernel module is global rather than per-netns, so a
+    /// successful host probe predicts that the in-netns `ip6tables` invocation
+    /// this manager actually runs will work too.
+    fn ip6tables_available(logger: &mut Logger) -> bool {
+        match Command::new("ip6tables").arg("-S").output() {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                logger.log_line(&format!(
+                    "ip6tables unavailable ({}); skipping IPv6 firewall rules.",
+                    stderr.trim()
+                ));
+                false
+            }
+            Err(e) => {
+                logger.log_line(&format!(
+                    "ip6tables not found ({}); skipping IPv6 firewall rules.",
+                    e
+                ));
+                false
+            }
+        }
+    }
+
+    /// Whether this host has a live IPv6 stack.
+    ///
+    /// `/proc/net/if_inet6` exists only when the kernel's IPv6 support is
+    /// present, and lists one line per configured address — so it is empty when
+    /// IPv6 is administratively disabled everywhere
+    /// (`net.ipv6.conf.all.disable_ipv6=1`). Absent or empty therefore means
+    /// "no IPv6 to filter"; anything else means IPv6 is live. A host with no
+    /// IPv6 stack cannot hand one to a container netns, so this host-level probe
+    /// is a conservative predictor for the in-netns inbound path.
+    ///
+    /// If the file exists but cannot be read we report `true` so the caller
+    /// fails closed rather than assuming away a family it cannot filter.
+    fn host_has_ipv6() -> bool {
+        let path = std::path::Path::new("/proc/net/if_inet6");
+        if !path.exists() {
+            return false;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(contents) => contents.lines().any(|line| !line.trim().is_empty()),
+            Err(_) => true,
+        }
     }
 
     /// Run an `iptables`/`ip6tables` command, entering the container's network
