@@ -79,21 +79,28 @@ parameters:
     type: boolean
     default: false
 
-  # These email parameters exist because the MXC-ESRP-Signing variable group
-  # does not contain OwnersEmail / ApproversEmail keys — confirmed against the
-  # ADO variable-groups API, which reports exactly six code-signing fields:
+  # ESRP Release needs an owner email and an approver email, but the
+  # MXC-ESRP-Signing variable group does not carry them: inspected through the
+  # ADO variable-groups API, it holds exactly six code-signing fields —
   # serviceName, tenantId, azureKeyVaultName, authCertName, signCertName, and
-  # clientId. A string parameter renders in the ADO "Run pipeline" dialog, so
-  # operators supply these values at queue time.
+  # clientId.  They are therefore exposed as string parameters.  Both default
+  # to $(Build.RequestedForEmail), the predefined variable holding the email
+  # of whoever queued the run, so a manual release is one click: no address is
+  # typed and no individual is hardcoded in the repo.  The default is a macro
+  # token, not a literal address -- the ${{ }} template substitutions here and
+  # in the ESRPInfo object preserve the literal string "$(Build.RequestedForEmail)",
+  # which Azure DevOps expands at runtime in the EsrpRelease task inputs, since
+  # macro syntax is expanded in task inputs after template expansion.  An
+  # operator can still override either value in the Run dialog.
   - name: esrpOwnersEmail
     displayName: 'ESRP release owners email'
     type: string
-    default: 'Darren.Hoehna@microsoft.com'
+    default: '$(Build.RequestedForEmail)'
 
   - name: esrpApproversEmail
     displayName: 'ESRP release approvers email'
     type: string
-    default: 'Darren.Hoehna@microsoft.com'
+    default: '$(Build.RequestedForEmail)'
 
   # Leaf-first crate publish order. Must match `scripts/crates_release.py`
   # CRATES list; `verify-order` fails the run at run time if this is not an
@@ -174,24 +181,27 @@ extends:
           os: linux
         steps:
         - checkout: none
-        # Fail fast on empty ESRP owner or approver emails. These flow
+        # Fail fast on an empty ESRP owner or approver email.  These flow
         # unvalidated into EsrpRelease's `owners` and `approvers` (via
         # Publish.CratesIo.Job.yml), and an empty value submits a release with
         # no owner or no approver -- something the pipeline would otherwise not
-        # catch until packaging has already run. Because these are parameters,
-        # their values are known at compile time, so these ${{ }} guards emit a
-        # failing step ONLY when a value is missing; a correctly-parameterized
-        # run compiles without them and consumes no extra work. The check lives
-        # in this stage because every other stage depends on it, so a missing
-        # value stops the run before any crate is checked out or packaged.
-        - ${{ if eq(parameters.esrpOwnersEmail, '') }}:
+        # catch until packaging has already run.  Both parameters default to
+        # the $(Build.RequestedForEmail) macro, which is a non-empty token at
+        # compile time, so these compile-time ${{ }} guards fire only when an
+        # operator explicitly clears or space-fills a value in the Run dialog;
+        # a normal run compiles without them and consumes no extra work.  The
+        # `replace(..., ' ', '')` strips spaces first so a space-only value is
+        # rejected too.  The check lives in this stage because every other
+        # stage depends on it, so a missing value stops the run before any
+        # crate is checked out or packaged.
+        - ${{ if eq(replace(parameters.esrpOwnersEmail, ' ', ''), '') }}:
           - script: |
-              echo "##vso[task.logissue type=error]The 'ESRP release owners email' (esrpOwnersEmail) parameter is empty. Supply a valid owner email in the Run pipeline dialog before releasing."
+              echo "##vso[task.logissue type=error]The 'ESRP release owners email' (esrpOwnersEmail) parameter is empty.  Supply a valid owner email in the Run pipeline dialog before releasing."
               exit 1
             displayName: 'Require esrpOwnersEmail'
-        - ${{ if eq(parameters.esrpApproversEmail, '') }}:
+        - ${{ if eq(replace(parameters.esrpApproversEmail, ' ', ''), '') }}:
           - script: |
-              echo "##vso[task.logissue type=error]The 'ESRP release approvers email' (esrpApproversEmail) parameter is empty. Supply a valid approver email in the Run pipeline dialog before releasing."
+              echo "##vso[task.logissue type=error]The 'ESRP release approvers email' (esrpApproversEmail) parameter is empty.  Supply a valid approver email in the Run pipeline dialog before releasing."
               exit 1
             displayName: 'Require esrpApproversEmail'
         - script: |

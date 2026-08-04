@@ -131,14 +131,23 @@ for code signing. The pipeline must be granted access to that group in ADO.
 ESRP Release additionally needs owner and approver emails. The
 `MXC-ESRP-Signing` group was inspected through the ADO REST API and contains
 exactly the six signing keys above — it does **not** contain `OwnersEmail` or
-`ApproversEmail`. They are therefore exposed as the string parameters
-`esrpOwnersEmail` and `esrpApproversEmail`, both defaulting to
-`Darren.Hoehna@microsoft.com` (the current release owner), so a normal release
-is one click. An operator may override either in the Run dialog. If either is
-cleared to an empty string, the `Validate_Release_Ref` stage fails the run
-immediately, naming the empty parameter, before anything is checked out or
-packaged — an empty value would otherwise submit an ESRP release with no owner
-or no approver.
+`ApproversEmail`.  They are therefore exposed as the string parameters
+`esrpOwnersEmail` and `esrpApproversEmail`, both defaulting to the predefined
+variable `$(Build.RequestedForEmail)` — the email of whoever queued the run —
+so a normal release is one click, with no address typed and no individual
+hardcoded in the repository.  The default is a macro token, not a literal
+address: the `${{ }}` template substitutions preserve the literal string
+`$(Build.RequestedForEmail)`, which Azure DevOps expands at runtime in the
+`EsrpRelease` task's `owners` and `approvers` inputs, since macro syntax is
+expanded in task inputs after template expansion.  An operator may override
+either value in the Run dialog.  For a manually queued run,
+`Build.RequestedForEmail` is the queuer's email; it can be empty for a run
+started by a service identity or a schedule, so if this pipeline is ever
+automated rather than queued by a person, pass an explicit owner and approver
+instead.  If either value is cleared to an empty or space-only string, the
+`Validate_Release_Ref` stage fails the run immediately, naming the empty
+parameter, before anything is checked out or packaged — an empty value would
+otherwise submit an ESRP release with no owner or no approver.
 
 ### 2. Real release
 
@@ -210,13 +219,13 @@ These must be resolved before the first real (non-dry-run) publish:
 3. **`hyperlight_common` name collision** — crates.io treats `-` and `_` as
    equivalent when checking name collisions, so `hyperlight_common` collides
    with the existing `hyperlight-common` crate, published from
-   github.com/hyperlight-dev/hyperlight. It is the only one of the 20 names
-   that is taken today; the other 19 are unregistered. The crate must be
+   github.com/hyperlight-dev/hyperlight.  It is the only one of the 20 names
+   that is taken today; the other 19 are unregistered.  The crate must be
    renamed or co-ownership obtained before it can be published. Note that
    `hyperlight-common` is marked `trustpub_only` on crates.io, so co-ownership
    alone may not permit an ESRP token publish.
 4. **crates.io rate limit** — the default `PublishNew` rate limit is burst-5
-   plus 1 per 10 minutes. A 20-crate first release will be throttled. An
+   plus 1 per 10 minutes.  A 20-crate first release will be throttled.  An
    override must be requested from help@crates.io before the first publish.
 5. **Pipeline registration** — `.azure-pipelines/1ES.Release.Crates.yml` is new
    and must be registered as a pipeline in Azure DevOps, and that pipeline must
