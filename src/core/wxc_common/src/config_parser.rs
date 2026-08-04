@@ -2785,6 +2785,56 @@ mod tests {
     }
 
     #[test]
+    fn network_default_policy_absent_leaves_presence_false() {
+        // Absent `defaultPolicy` must not set the presence bit.  The struct
+        // default is Block, so without this bit an explicit "block" would be
+        // indistinguishable from a policy-free start.
+        let json = r#"{"process": {"commandLine": "print('test')"}}"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert!(
+            !req.policy.default_network_policy_present,
+            "absent defaultPolicy must not set the presence bit"
+        );
+    }
+
+    #[test]
+    fn network_default_policy_block_sets_presence_true() {
+        // An explicit "block" must set both the policy value and the presence bit.
+        // The presence bit is what lets `requires_firewall_enforcement` distinguish
+        // a caller-requested default-deny from the struct default a policy-free
+        // start produces.
+        let json = r#"{"process": {"commandLine": "print('test')"}, "network": {"defaultPolicy": "block"}}"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert_eq!(req.policy.default_network_policy, NetworkPolicy::Block);
+        assert!(
+            req.policy.default_network_policy_present,
+            "explicit defaultPolicy: \"block\" must set the presence bit"
+        );
+    }
+
+    #[test]
+    fn network_default_policy_allow_sets_presence_true() {
+        // An explicit "allow" must set the presence bit even though Allow is not
+        // a firewall restriction.
+        let json = r#"{"process": {"commandLine": "print('test')"}, "network": {"defaultPolicy": "allow"}}"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert_eq!(req.policy.default_network_policy, NetworkPolicy::Allow);
+        assert!(
+            req.policy.default_network_policy_present,
+            "explicit defaultPolicy: \"allow\" must set the presence bit"
+        );
+    }
+
+    #[test]
     fn network_default_policy_absent_defaults_to_block_on_any_version() {
         // wxc-exec is the trust boundary -- absent `defaultPolicy`
         // resolves to `Block` regardless of declared schema version.

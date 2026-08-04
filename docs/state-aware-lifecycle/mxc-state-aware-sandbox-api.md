@@ -1614,12 +1614,16 @@ raw-JSON caller that sends it is not rejected.
 > then be scoped to the container. `allowLocalNetwork` and `removeRulesOnExit` are not
 > part of the LXC surface (see `LxcNetworkConfig`).
 >
-> `defaultPolicy: "block"` on its own is **not** enough to trigger that rejection, and
-> is **not** enforced under `"capabilities"`. `block` is the default value of the
-> field, so once the request is parsed an explicitly requested `"block"` is
-> indistinguishable from a start that supplied no `network` block at all; rejecting on
-> it would fail every plain start. To get a default-deny container, set
-> `enforcementMode` to `"firewall"` or `"both"` explicitly.
+> An explicit `defaultPolicy: "block"` now triggers the same rejection as
+> `allowedHosts`/`blockedHosts`: the parser records whether the field was present in
+> the wire request (`default_network_policy_present`), so a requested default-deny is
+> distinguishable from the struct default a policy-free start produces.  Under
+> `"capabilities"` (the default `enforcementMode`), start therefore fails rather than
+> let the container run believing it is default-deny when no iptables rule enforces it
+> (`state_aware.rs: requires_firewall_enforcement`, `validate_start`).  A start that
+> supplies no `network.defaultPolicy`, or supplies `defaultPolicy: "allow"`, does not
+> set the presence bit and is unaffected.  To start a default-deny container, set
+> `enforcementMode` to `"firewall"` or `"both"`.
 
 - **Compile-time enforcement at the SDK.** Each per-(backend, phase) Config (§6.1)
   declares only the cross-cutting fields the matrix marks as `applied` for that phase

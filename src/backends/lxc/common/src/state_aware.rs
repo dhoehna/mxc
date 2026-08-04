@@ -228,7 +228,8 @@ fn apply_network_policy(
         return Err(MxcError::policy_validation(format!(
             "LXC state-aware start cannot enforce this network policy under \
              enforcementMode {:?}: LXC has no capability-based network enforcement, \
-             so allowedHosts/blockedHosts would be ignored. \
+             so allowedHosts/blockedHosts would be silently unenforced and an explicit \
+             defaultPolicy 'block' would not be applied. \
              Use enforcementMode 'firewall' or 'both'.",
             policy.network_enforcement_mode
         )));
