@@ -1568,6 +1568,10 @@ fn mask_state_aware_experimental<'a>(
 }
 
 #[cfg(test)]
+#[path = "config_parser_loopback_spec_tests.rs"]
+mod loopback_spec_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::encoding::base64_encode;

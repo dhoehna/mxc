@@ -903,6 +903,10 @@ impl ScriptResponse {
 }
 
 #[cfg(test)]
+#[path = "models_proxy_url_spec_tests.rs"]
+mod proxy_url_spec_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
