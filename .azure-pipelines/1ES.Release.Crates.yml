@@ -53,8 +53,8 @@
 #    or co-ownership obtained before the closure can publish.
 #
 # 4. crates.io `PublishNew` rate-limit override, requested via help@crates.io.
-#    The default allowance is a burst of 5 plus 1 per 10 minutes, so an
-#    18-crate first release is throttled partway through without one.
+#    The default allowance is a burst of 5 plus 1 per 10 minutes, so a
+#    20-crate first release is throttled partway through without one.
 #
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -88,12 +88,12 @@ parameters:
   - name: esrpOwnersEmail
     displayName: 'ESRP release owners email'
     type: string
-    default: ''
+    default: 'Darren.Hoehna@microsoft.com'
 
   - name: esrpApproversEmail
     displayName: 'ESRP release approvers email'
     type: string
-    default: ''
+    default: 'Darren.Hoehna@microsoft.com'
 
   # Leaf-first crate publish order. Must match `scripts/crates_release.py`
   # CRATES list; `verify-order` fails the run at run time if this is not an
@@ -174,6 +174,26 @@ extends:
           os: linux
         steps:
         - checkout: none
+        # Fail fast on empty ESRP owner or approver emails. These flow
+        # unvalidated into EsrpRelease's `owners` and `approvers` (via
+        # Publish.CratesIo.Job.yml), and an empty value submits a release with
+        # no owner or no approver -- something the pipeline would otherwise not
+        # catch until packaging has already run. Because these are parameters,
+        # their values are known at compile time, so these ${{ }} guards emit a
+        # failing step ONLY when a value is missing; a correctly-parameterized
+        # run compiles without them and consumes no extra work. The check lives
+        # in this stage because every other stage depends on it, so a missing
+        # value stops the run before any crate is checked out or packaged.
+        - ${{ if eq(parameters.esrpOwnersEmail, '') }}:
+          - script: |
+              echo "##vso[task.logissue type=error]The 'ESRP release owners email' (esrpOwnersEmail) parameter is empty. Supply a valid owner email in the Run pipeline dialog before releasing."
+              exit 1
+            displayName: 'Require esrpOwnersEmail'
+        - ${{ if eq(parameters.esrpApproversEmail, '') }}:
+          - script: |
+              echo "##vso[task.logissue type=error]The 'ESRP release approvers email' (esrpApproversEmail) parameter is empty. Supply a valid approver email in the Run pipeline dialog before releasing."
+              exit 1
+            displayName: 'Require esrpApproversEmail'
         - script: |
             set -euo pipefail
             echo "Run was queued against: $SOURCE_REF"

@@ -6,7 +6,7 @@ crate workspace to [crates.io](https://crates.io) via ESRP Release.
 ## Overview
 
 The **1ES.Release.Crates** pipeline (`.azure-pipelines/1ES.Release.Crates.yml`)
-packages and publishes the 18-crate release closure from the MXC Rust workspace
+packages and publishes the 20-crate release closure from the MXC Rust workspace
 in a single pipeline run:
 
 1. **Package stage** — checks out the release tag the run was queued against,
@@ -35,14 +35,16 @@ Defined in `.azure-pipelines/scripts/crates_release.py`:
 | 8 | `bwrap_common` |
 | 9 | `seatbelt_common` |
 | 10 | `sandbox_spec` |
-| 11 | `appcontainer_common` |
-| 12 | `isolation_session_bindings` |
-| 13 | `isolation_session_common` |
-| 14 | `windows_sandbox_common` |
-| 15 | `windows_sandbox_lifecycle` |
-| 16 | `wslc_common` |
-| 17 | `mxc_engine` |
-| 18 | `mxc-sdk` |
+| 11 | `learning_mode_core` |
+| 12 | `learning_mode_windows` |
+| 13 | `appcontainer_common` |
+| 14 | `isolation_session_bindings` |
+| 15 | `isolation_session_common` |
+| 16 | `windows_sandbox_common` |
+| 17 | `windows_sandbox_lifecycle` |
+| 18 | `wslc_common` |
+| 19 | `mxc_engine` |
+| 20 | `mxc-sdk` |
 
 These names are provisional until the public naming scheme is approved. The
 same sequence is duplicated as the `crateOrder` default in
@@ -106,10 +108,10 @@ including this pipeline, requires cutting a new tag.
    | Parameter | Value |
    |---|---|
    | **Dry run** (`cratesDryRun`) | Set to `true` for this first run. |
-   | **ESRP release owners email** (`esrpOwnersEmail`) | See [ESRP identity](#esrp-identity) below. |
-   | **ESRP release approvers email** (`esrpApproversEmail`) | See [ESRP identity](#esrp-identity) below. |
+   | **ESRP release owners email** (`esrpOwnersEmail`) | Defaults to `Darren.Hoehna@microsoft.com`; see [ESRP identity](#esrp-identity) below. |
+   | **ESRP release approvers email** (`esrpApproversEmail`) | Defaults to `Darren.Hoehna@microsoft.com`; see [ESRP identity](#esrp-identity) below. |
 
-   `crateOrder` is an `object` parameter whose default is the full 18-crate
+   `crateOrder` is an `object` parameter whose default is the full 20-crate
    list baked into the YAML, so a full release needs no input here. Whether
    Azure DevOps renders an `object` parameter as an editable field in the Run
    dialog is unverified; to change the list (to resume a partial release), edit
@@ -130,8 +132,13 @@ ESRP Release additionally needs owner and approver emails. The
 `MXC-ESRP-Signing` group was inspected through the ADO REST API and contains
 exactly the six signing keys above — it does **not** contain `OwnersEmail` or
 `ApproversEmail`. They are therefore exposed as the string parameters
-`esrpOwnersEmail` and `esrpApproversEmail` so an operator can supply them at
-queue time.
+`esrpOwnersEmail` and `esrpApproversEmail`, both defaulting to
+`Darren.Hoehna@microsoft.com` (the current release owner), so a normal release
+is one click. An operator may override either in the Run dialog. If either is
+cleared to an empty string, the `Validate_Release_Ref` stage fails the run
+immediately, naming the empty parameter, before anything is checked out or
+packaged — an empty value would otherwise submit an ESRP release with no owner
+or no approver.
 
 ### 2. Real release
 
@@ -142,7 +149,7 @@ skipped (the job fails).
 ## Resuming a failed release
 
 crates.io rejects duplicate versions. If the pipeline fails partway through
-(e.g. crate 7 of 18 fails for a transient reason), crates 1–6 are already
+(e.g. crate 7 of 20 fails for a transient reason), crates 1–6 are already
 published and cannot be republished.
 
 To resume:
@@ -203,13 +210,13 @@ These must be resolved before the first real (non-dry-run) publish:
 3. **`hyperlight_common` name collision** — crates.io treats `-` and `_` as
    equivalent when checking name collisions, so `hyperlight_common` collides
    with the existing `hyperlight-common` crate, published from
-   github.com/hyperlight-dev/hyperlight. It is the only one of the 18 names
-   that is taken today; the other 17 are unregistered. The crate must be
+   github.com/hyperlight-dev/hyperlight. It is the only one of the 20 names
+   that is taken today; the other 19 are unregistered. The crate must be
    renamed or co-ownership obtained before it can be published. Note that
    `hyperlight-common` is marked `trustpub_only` on crates.io, so co-ownership
    alone may not permit an ESRP token publish.
 4. **crates.io rate limit** — the default `PublishNew` rate limit is burst-5
-   plus 1 per 10 minutes. An 18-crate first release will be throttled. An
+   plus 1 per 10 minutes. A 20-crate first release will be throttled. An
    override must be requested from help@crates.io before the first publish.
 5. **Pipeline registration** — `.azure-pipelines/1ES.Release.Crates.yml` is new
    and must be registered as a pipeline in Azure DevOps, and that pipeline must
