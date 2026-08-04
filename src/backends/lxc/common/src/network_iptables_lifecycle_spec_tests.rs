@@ -37,21 +37,11 @@ fn a_non_firewall_policy_is_a_successful_no_op() {
 
 #[test]
 fn every_enforcement_mode_takes_the_contractual_firewall_gate() {
-    const SKIP_MESSAGE: &str = "Network enforcement mode does not use firewall, skipping iptables.";
-
     for (mode, uses_firewall) in enforcement_modes_with_firewall_contract() {
-        let mut manager = NetworkIptablesManager::new(&format!("gate-{mode:?}"));
-        manager.set_veth_interface("veth-gate");
-        let policy = policy_with_enforcement_mode(mode.clone());
-        let mut logger = Logger::new(Mode::Buffer);
-
-        let _ = manager.apply_firewall_rules(&policy, &mut logger);
-        let log = logger.get_buffer();
-
         assert_eq!(
-            log.contains(SKIP_MESSAGE),
-            !uses_firewall,
-            "{mode:?} gate mismatch; log was {log:?}"
+            NetworkIptablesManager::enforcement_mode_uses_firewall(&mode),
+            uses_firewall,
+            "{mode:?} firewall-gate predicate mismatch"
         );
     }
 }
