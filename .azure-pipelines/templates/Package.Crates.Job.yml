@@ -11,10 +11,10 @@
 #      the build is already building, producing the artifact purely as build
 #      output / validation.
 #   2. `.azure-pipelines/1ES.Release.Crates.yml` (dedicated crates release
-#      pipeline) -- queued against a release tag picked in the Run dialog's
-#      branch/tag selector, so it packages that tag. That pipeline gates the
-#      ref in its Validate_Release_Ref stage, which is why no tag handling is
-#      needed here.
+#      pipeline) -- queued against a release ref picked in the Run dialog's
+#      ref selector, so it packages that ref. That pipeline gates the ref in
+#      its Validate_Release_Ref stage, accepting only `refs/heads/release/*`
+#      or `refs/tags/v*`, which is why no ref handling is needed here.
 #
 # Source-only: unlike the npm SDK this needs no built binaries, only a cargo
 # toolchain plus the internal Mxc-Azure-Feed for dependency resolution.
@@ -51,10 +51,11 @@ jobs:
       outDir: $(Build.SourcesDirectory)/out/crates
     steps:
       # Packages the ref the run was queued against. For a release that is the
-      # release tag itself, selected in the Run dialog's branch/tag selector and
-      # already validated by the Validate_Release_Ref stage, so there is no tag
-      # to resolve or check out here. Crate versions come from src/Cargo.toml at
-      # that ref, since every crate inherits `version.workspace = true`.
+      # release branch or tag itself, selected in the Run dialog's ref selector
+      # and already validated by the Validate_Release_Ref stage, so there is no
+      # ref to resolve or check out here. Crate versions come from
+      # src/Cargo.toml at that ref, since every crate inherits
+      # `version.workspace = true`.
       - checkout: self
 
       - template: Rust.Toolchain.Public.yml@self

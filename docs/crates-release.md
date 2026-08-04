@@ -9,7 +9,7 @@ The **1ES.Release.Crates** pipeline (`.azure-pipelines/1ES.Release.Crates.yml`)
 packages and publishes the 20-crate release closure from the MXC Rust workspace
 in a single pipeline run:
 
-1. **Package stage** — checks out the release tag the run was queued against,
+1. **Package stage** — checks out the release ref the run was queued against,
    runs one `cargo package` invocation carrying a `-p` flag per crate, and
    uploads the `.crate` files plus a `release-order.json` manifest as the
    `mxc-crates-package` artifact.
@@ -63,36 +63,65 @@ version:
 
 1. Bump the version in `src/Cargo.toml`.
 2. Commit and push.
-3. Create a new git tag named `release/v<major>.<minor>.<patch>[-rc<n>]` (for
-   example `release/v0.8.0`). The `release/` prefix is required — see
+3. Cut a release branch named `release/v<major>.<minor>.<patch>[-rc<n>]` (for
+   example `release/v0.8.0`) from the commit you are releasing, and confirm
+   the `release/*` ruleset has frozen it — see
    [Choosing the release ref](#choosing-the-release-ref).
-4. Run the pipeline against that tag.
+4. Run the pipeline against that branch.
 
-Re-running against the same tag re-packages the same version, which crates.io
+Re-running against the same ref re-packages the same version, which crates.io
 rejects (duplicate version). See [Resuming a failed release](#resuming-a-failed-release)
 for what to do when only some crates landed.
 
 ## Choosing the release ref
 
-There is no tag parameter to type. The pipeline packages **the ref the run is
-queued against**, chosen from the branch/tag selector at the top of the **Run
+There is no ref parameter to type. The pipeline packages **the ref the run is
+queued against**, chosen from the ref selector at the top of the **Run
 pipeline** dialog.
 
-That ref must be a tag under `refs/tags/release/*` — for example
-`release/v0.8.0`. The `Validate_Release_Ref` stage fails the run for anything
-else (a branch, or a bare `v0.8.0` tag), and both the package and publish
-stages depend on it, so nothing is checked out or published from a
-non-release ref. That stage is marked `isSkippable: false`, so it also cannot
-be switched off in the Run dialog's **Stages to run** panel.
+`Validate_Release_Ref` accepts exactly two shapes:
 
-Azure DevOps offers no way to filter that selector — it lists every branch and
-tag in the repository — which is why the guard exists. For enforcement outside
-the pipeline's own YAML, add a **branch control check** to the ESRP service
-connection in the Azure DevOps UI.
+| Ref | Example | How it is queued |
+|---|---|---|
+| `refs/heads/release/*` | `release/v0.8.0` | Picked in the Run dialog — **use this** |
+| `refs/tags/v*` | `v0.8.0` | REST API |
 
-Because the ref supplies the pipeline definition as well as the source, a
-release is fully immutable: changing anything about how a release is built,
-including this pipeline, requires cutting a new tag.
+Use the **branch**. For a GitHub-backed pipeline the Run dialog reliably
+enumerates branches, so a release branch is what an operator can actually
+select. Tags are accepted so a run can also be queued against the repo's
+existing `v<semver>` tags through the REST API.
+
+Selecting a **commit** does not work. A commit-queued run is still
+branch-contextual: `Build.SourceBranch` reports the containing branch
+(`refs/heads/main`), not the SHA, so the gate rejects it.
+
+The gate fails the run for anything else — `main`, a feature branch, or an
+unrelated tag — and both the package and publish stages depend on it, so
+nothing is checked out or published from a non-release ref. That stage is
+marked `isSkippable: false`, so it also cannot be switched off in the Run
+dialog's **Stages to run** panel.
+
+Azure DevOps offers no way to filter that selector, which is why the guard
+exists. For enforcement outside the pipeline's own YAML, add a **branch
+control check** to the ESRP service connection in the Azure DevOps UI.
+
+### Freezing the release branch
+
+**The gate proves a run came from a release ref. It cannot prove that ref is
+immutable.** A branch moves unless something stops it, and the pipeline would
+package wherever it points at run time.
+
+Freeze `release/*` with a **GitHub ruleset** on the repository — Settings →
+Rules → Rulesets — targeting `release/*` and blocking pushes, force-pushes,
+and deletion, with no bypass list. Rulesets are the current mechanism and can
+target branches and tags; classic branch protection can also freeze a branch
+by restricting who may push, but is less expressive. This is a **repository
+setting**, not something this pipeline can enforce, and it requires repo admin
+rights.
+
+Because the ref supplies the pipeline definition as well as the source,
+changing anything about how a release is built — including this pipeline —
+means cutting a new release ref.
 
 ## Running the pipeline (step-by-step)
 
@@ -101,7 +130,7 @@ including this pipeline, requires cutting a new tag.
 1. In Azure DevOps, navigate to Pipelines → find the pipeline registered
    against `.azure-pipelines/1ES.Release.Crates.yml`.
 2. Click **Run pipeline**.
-3. In the branch/tag selector at the top of the dialog, pick the release tag
+3. In the ref selector at the top of the dialog, pick the release branch
    (for example `release/v0.8.0`).
 4. Fill in the parameters:
 
@@ -169,11 +198,12 @@ To resume:
    removing the already-published crates, and merge that change to `main`.
    `crateOrder` is an `object` parameter; changing it means editing the
    pipeline file.
-3. Cut a **new** release tag containing that edit (for example
-   `release/v0.8.0-resume1`) and run the pipeline against it. The tag supplies
+3. Cut a **new** release branch containing that edit (for example
+   `release/v0.8.0-resume1`) and run the pipeline against it. The ref supplies
    the pipeline definition as well as the source, so the edited `crateOrder`
-   only takes effect once it is inside a tag. Do not bump the crate version —
-   the remaining crates still need to publish at the version that failed.
+   only takes effect once it is on the release branch. Do not bump the crate
+   version — the remaining crates still need to publish at the version that
+   failed.
 4. The `verify-order` guard accepts a subset of the original order as long as
    it is still in correct leaf-first sequence. It logs a warning naming every
    dependency it assumes is already live.
@@ -246,6 +276,6 @@ These must be resolved before the first real (non-dry-run) publish:
 The npm SDK release (`.azure-pipelines/1ES.Release.yml`) consumes artifacts from
 a **separate** official build pipeline (`MXC-Official-Build`) and publishes a
 single `@microsoft/mxc-sdk` package. The crates release is self-contained: it
-checks out the release tag, packages, and publishes in one run. This design
+checks out the release ref, packages, and publishes in one run. This design
 exists because 1ES forbids `checkout` in a release *job*, but a normal job in
 the same *pipeline* may check out and build.

@@ -6,24 +6,40 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # What this does:
-#   Packages the MXC Rust crate closure from a release tag and publishes every
-#   crate to crates.io through ESRP Release, leaf-first. It is ONE CLICK:
-#   pick the release tag in the Run dialog's branch/tag selector, and it
+#   Packages the MXC Rust crate closure from a frozen release ref and publishes
+#   every crate to crates.io through ESRP Release, leaf-first.  It is ONE
+#   CLICK: pick the release branch in the Run dialog's ref selector, and it
 #   packages then publishes.
 #
 # Choosing the release (REQUIRED):
 #   The source packaged is the ref the run is QUEUED AGAINST -- selected from
-#   the branch/tag selector at the top of the Run pipeline dialog. There is no
-#   tag parameter to type. The ref must be a release tag matching
-#   `refs/tags/release/*` (for example `release/v0.8.0`); the
-#   Validate_Release_Ref stage fails the run otherwise, and every other stage
-#   depends on it.
+#   the ref selector at the top of the Run pipeline dialog.  There is no ref
+#   parameter to type.  Validate_Release_Ref accepts exactly two shapes and
+#   fails the run on anything else; every other stage depends on it.
 #
-#   This means the pipeline DEFINITION also comes from that tag, so a release
-#   is fully immutable: changing anything about how a release is built --
-#   including this pipeline -- requires cutting a new tag. Crate versions come
-#   from `src/Cargo.toml` at the tag because every crate in the workspace uses
-#   `version.workspace = true`.
+#     refs/heads/release/*   a release BRANCH, e.g. release/v0.8.0
+#     refs/tags/v*           a release TAG, e.g. v0.8.0
+#
+#   Use the branch for a normal release.  For a GitHub-backed pipeline the Run
+#   dialog reliably enumerates branches, and a release branch is what an
+#   operator can actually select; tags are accepted so a run can also be queued
+#   against the repo's existing v<semver> tags through the REST API.
+#
+#   A release branch is NOT immutable by default -- it is made immutable by a
+#   GitHub ruleset on `release/*` that blocks pushes, force-pushes, and
+#   deletion.  That ruleset is a REPO SETTING, not something this file can
+#   enforce, and it is what makes the packaged source static.  Without it a
+#   release branch can still move, and the run would package whatever it points
+#   at.  See docs/crates-release.md.
+#
+#   Because the ref also supplies the pipeline DEFINITION, changing anything
+#   about how a release is built means cutting a new release ref.  Crate
+#   versions come from `src/Cargo.toml` at that ref because every crate in the
+#   workspace uses `version.workspace = true`.
+#
+#   Selecting a COMMIT in the Run dialog does not work: a commit-queued run is
+#   still branch-contextual and reports `Build.SourceBranch` as the containing
+#   branch (`refs/heads/main`), not the SHA, so the gate below rejects it.
 #
 # Dry-run:
 #   Set `cratesDryRun` to true to package and verify ordering without
@@ -153,12 +169,22 @@ extends:
     stages:
     # ─── Stage 0: Gate on the release ref ────────────────────────────────────
     # The source packaged by this pipeline is whatever ref the run was queued
-    # against, chosen from the Run dialog's branch/tag selector. That selector
-    # cannot be filtered -- Azure DevOps offers no way to restrict which refs
-    # it lists, so it shows every branch and tag. This stage is what makes the
-    # choice safe: it fails unless the run was queued against a release tag,
-    # and both stages below depend on it, so nothing is checked out, packaged,
-    # or published from a branch or a non-release tag.
+    # against, chosen from the Run dialog's ref selector.  That selector cannot
+    # be filtered -- Azure DevOps offers no way to restrict which refs it
+    # lists.  This stage is what makes the choice safe: it fails unless the run
+    # was queued against a release branch or a release tag, and both stages
+    # below depend on it, so nothing is checked out, packaged, or published
+    # from `main`, a feature branch, or an unrelated tag.
+    #
+    # Two shapes are accepted, and the branch is the one an operator uses:
+    # for a GitHub-backed pipeline the Run dialog reliably enumerates branches,
+    # so a release BRANCH is what can actually be selected.  Tags are accepted
+    # as well so a run can be queued against the repo's existing v<semver>
+    # tags (v0.6.1, v0.7.0) through the REST API.
+    #
+    # A release branch is frozen by a GitHub ruleset on `release/*`, not by
+    # this file -- see the header.  This gate proves the run came from a
+    # release ref; it CANNOT prove that ref is immutable.
     #
     # This must be a RUNTIME check. `Build.SourceBranch` is not available to
     # compile-time `${{ }}` template expressions, so the stages cannot be
@@ -174,7 +200,7 @@ extends:
       isSkippable: false
       jobs:
       - job: validate_release_ref
-        displayName: 'Require a release tag'
+        displayName: 'Require a release ref'
         pool:
           name: Azure-Pipelines-1ESPT-ExDShared
           image: ubuntu-latest
@@ -208,16 +234,20 @@ extends:
             set -euo pipefail
             echo "Run was queued against: $SOURCE_REF"
             case "$SOURCE_REF" in
-              refs/tags/release/?*)
+              refs/heads/release/?*)
+                echo "OK: releasing from branch ${SOURCE_REF#refs/heads/}"
+                ;;
+              refs/tags/v?*)
                 echo "OK: releasing from tag ${SOURCE_REF#refs/tags/}"
                 ;;
               *)
-                echo "##vso[task.logissue type=error]This pipeline may only run from a release tag (refs/tags/release/*). It was queued against '$SOURCE_REF'."
-                echo "Cut a tag such as 'release/v0.8.0' from main, then pick it in the branch/tag selector of the Run pipeline dialog."
+                echo "##vso[task.logissue type=error]This pipeline may only run from a release branch (refs/heads/release/*) or a release tag (refs/tags/v*). It was queued against '$SOURCE_REF'."
+                echo "Cut a branch such as 'release/v0.8.0' from the commit you are releasing, confirm the release/* ruleset has frozen it, then pick it in the ref selector of the Run pipeline dialog."
+                echo "Note: selecting a COMMIT does not work -- a commit-queued run still reports its containing branch here, not the SHA."
                 exit 1
                 ;;
             esac
-          displayName: 'Require refs/tags/release/*'
+          displayName: 'Require refs/heads/release/* or refs/tags/v*'
           env:
             SOURCE_REF: $(Build.SourceBranch)
 
