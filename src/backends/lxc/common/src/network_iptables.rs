@@ -161,14 +161,32 @@ impl NetworkIptablesManager {
         // MUST precede the NEW-inbound decision below so container-initiated
         // flows survive an inbound DROP.
         rules.push(argv(&[
-            "-A", chain, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", accept,
+            "-A",
+            chain,
+            "-m",
+            "state",
+            "--state",
+            "ESTABLISHED,RELATED",
+            "-j",
+            accept,
         ]));
 
         // hostLoopback toggle: accept or drop NEW inbound connections to the
         // container's listening sockets.
-        let inbound_verb = if policy.allow_local_network { accept } else { drop };
+        let inbound_verb = if policy.allow_local_network {
+            accept
+        } else {
+            drop
+        };
         rules.push(argv(&[
-            "-A", chain, "-m", "state", "--state", "NEW", "-j", inbound_verb,
+            "-A",
+            chain,
+            "-m",
+            "state",
+            "--state",
+            "NEW",
+            "-j",
+            inbound_verb,
         ]));
 
         // Ingress default-deny: host/external inbound is blocked by default
@@ -380,7 +398,14 @@ mod tests {
         let est = pos(
             &rules,
             &[
-                "-A", "MXC-t", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT",
+                "-A",
+                "MXC-t",
+                "-m",
+                "state",
+                "--state",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
             ],
         )
         .expect("ESTABLISHED,RELATED rule must be emitted");
@@ -400,7 +425,9 @@ mod tests {
         let rules = build(true, true);
         let new = pos(
             &rules,
-            &["-A", "MXC-t", "-m", "state", "--state", "NEW", "-j", "ACCEPT"],
+            &[
+                "-A", "MXC-t", "-m", "state", "--state", "NEW", "-j", "ACCEPT",
+            ],
         )
         .expect("NEW rule must be emitted");
         let def =
@@ -467,6 +494,9 @@ mod tests {
     #[test]
     fn chain_is_created_first() {
         let rules = build(false, true);
-        assert!(is(&rules[0], &["-N", "MXC-t"]), "chain must be created first");
+        assert!(
+            is(&rules[0], &["-N", "MXC-t"]),
+            "chain must be created first"
+        );
     }
 }
