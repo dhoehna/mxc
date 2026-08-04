@@ -209,6 +209,13 @@ impl LxcContainer {
         Self::run_status(cmd, "lxc-create")
     }
 
+    /// Marker comment written immediately above every `lxc.mount.entry` line
+    /// that MXC itself adds, so [`clear_mxc_mount_entries`](Self::clear_mxc_mount_entries)
+    /// can remove only MXC's own mounts and leave baseline entries the distro
+    /// template or the user placed in the config untouched. It is a real LXC
+    /// comment (`#`), so liblxc ignores it when parsing the file.
+    const MXC_MOUNT_MARKER: &'static str = "# mxc-managed-mount";
+
     /// Set a configuration item on the container.
     ///
     /// Appends `key = value` to the container's config file. The error
@@ -278,6 +285,96 @@ impl LxcContainer {
             format!(
                 "Failed to rewrite config to clear {}: {} (config file: {})",
                 key, e, config_path
+            )
+        })
+    }
+
+    /// Append an `lxc.mount.entry` that MXC owns, tagged with a marker comment
+    /// so it can later be removed without disturbing baseline mounts.
+    ///
+    /// Writes [`MXC_MOUNT_MARKER`](Self::MXC_MOUNT_MARKER) on its own line
+    /// immediately before the `lxc.mount.entry = value` line. liblxc treats the
+    /// marker as a comment and the entry exactly as if it had been added with
+    /// [`set_config_item`](Self::set_config_item);
+    /// [`clear_mxc_mount_entries`](Self::clear_mxc_mount_entries) keys off the
+    /// marker to reclaim only these lines on a restart.
+    pub fn set_mxc_mount_entry(&self, value: &str) -> Result<(), String> {
+        let config_path = self.config_file_path();
+        let entry = format!("{}\nlxc.mount.entry = {}\n", Self::MXC_MOUNT_MARKER, value);
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&config_path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(entry.as_bytes())
+            })
+            .map_err(|e| {
+                format!(
+                    "Failed to set MXC mount entry {}: {} (config file: {})",
+                    value, e, config_path
+                )
+            })
+    }
+
+    /// Remove only the `lxc.mount.entry` lines MXC itself added, identified by
+    /// the [`MXC_MOUNT_MARKER`](Self::MXC_MOUNT_MARKER) comment written above
+    /// each one by [`set_mxc_mount_entry`](Self::set_mxc_mount_entry).
+    ///
+    /// Unlike [`clear_config_item`](Self::clear_config_item), which drops *every*
+    /// line for a key, this preserves foreign `lxc.mount.entry` lines that the
+    /// distribution template or the user placed in the config. `set_mxc_mount_entry`
+    /// appends and liblxc accumulates every entry across restarts, so a caller
+    /// that re-derives its mounts from policy on each start must reclaim the
+    /// previous run's MXC lines first — but clearing unrelated baseline mounts
+    /// would silently delete container storage the operator relies on.
+    ///
+    /// A marker line and the `lxc.mount.entry` line immediately following it are
+    /// dropped together. An orphaned marker (no entry after it) is dropped on its
+    /// own so a partial write cannot accumulate stray comments. A missing config
+    /// file is treated as already-clear (`Ok`).
+    pub fn clear_mxc_mount_entries(&self) -> Result<(), String> {
+        let config_path = self.config_file_path();
+        let contents = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(format!(
+                    "Failed to read config to clear MXC mounts: {} (config file: {})",
+                    e, config_path
+                ))
+            }
+        };
+
+        let lines: Vec<&str> = contents.lines().collect();
+        let mut out = String::with_capacity(contents.len());
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if line.trim() == Self::MXC_MOUNT_MARKER {
+                // Drop the marker, and the MXC mount entry it tags if one
+                // directly follows. A marker with no following entry is simply
+                // dropped so a half-written pair leaves nothing behind.
+                let next_is_entry = lines
+                    .get(i + 1)
+                    .map(|l| {
+                        l.split_once('=')
+                            .map(|(lhs, _)| lhs.trim() == "lxc.mount.entry")
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                i += if next_is_entry { 2 } else { 1 };
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+            i += 1;
+        }
+
+        std::fs::write(&config_path, out).map_err(|e| {
+            format!(
+                "Failed to rewrite config to clear MXC mounts: {} (config file: {})",
+                e, config_path
             )
         })
     }

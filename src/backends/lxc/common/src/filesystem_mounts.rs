@@ -206,11 +206,14 @@ pub fn configure_filesystem_mounts(
     policy: &ContainerPolicy,
     logger: &mut Logger,
 ) -> Result<(), String> {
-    // Clear any `lxc.mount.entry` lines from a previous start before deriving
-    // the current policy's mounts. `set_config_item` appends, and liblxc
-    // accumulates every entry across restarts, so without this a restart with a
-    // narrower policy would still inherit the earlier run's bind mounts.
-    container.clear_config_item("lxc.mount.entry")?;
+    // Clear the `lxc.mount.entry` lines MXC added on a previous start before
+    // deriving the current policy's mounts. `set_mxc_mount_entry` appends, and
+    // liblxc accumulates every entry across restarts, so without this a restart
+    // with a narrower policy would still inherit the earlier run's bind mounts.
+    // Only MXC's own entries are cleared: baseline mounts the distribution
+    // template or the user placed in the config are identified by the absence of
+    // MXC's marker comment and left intact.
+    container.clear_mxc_mount_entries()?;
 
     let mounts = resolve_mount_order(policy);
 
@@ -242,7 +245,7 @@ pub fn configure_filesystem_mounts(
                     "Adding rw bind mount: {} -> /{}",
                     host_path, container_path
                 ));
-                container.set_config_item("lxc.mount.entry", &mount_entry)?;
+                container.set_mxc_mount_entry(&mount_entry)?;
             }
             FsIntent::ReadOnly => {
                 let mount_entry = format!(
@@ -253,7 +256,7 @@ pub fn configure_filesystem_mounts(
                     "Adding ro bind mount: {} -> /{}",
                     host_path, container_path
                 ));
-                container.set_config_item("lxc.mount.entry", &mount_entry)?;
+                container.set_mxc_mount_entry(&mount_entry)?;
             }
             FsIntent::Denied => {
                 // Resolve the denied path through symlinks to its real host
@@ -307,7 +310,7 @@ pub fn configure_filesystem_mounts(
                     "Masking denied path: /{} ({})",
                     container_path, create_type
                 ));
-                container.set_config_item("lxc.mount.entry", &mount_entry)?;
+                container.set_mxc_mount_entry(&mount_entry)?;
             }
         }
     }
