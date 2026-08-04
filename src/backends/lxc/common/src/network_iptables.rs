@@ -443,6 +443,10 @@ impl Drop for NetworkIptablesManager {
 }
 
 #[cfg(test)]
+#[path = "network_iptables_permissive_spec_tests.rs"]
+mod permissive_spec_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use wxc_common::models::NetworkPolicy;
