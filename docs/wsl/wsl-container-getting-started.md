@@ -11,8 +11,9 @@ MXC, which lets you run Linux containers on Windows using the WSLC SDK.
 | Requirement | Details |
 |---|---|
 | **Windows 11** | Required for WSL2 and the WSLC SDK |
-| **WSL 2.9.3+** | See Step 1 below for installation |
-| **WSLC SDK** | `wslcsdk.dll` must be in the same directory as `wxc-exec.exe` |
+| **Windows 11** | Required for WSL2 and the WSLC SDK |
+| **WSL 2.9.3+** | The installed WSL runtime package must meet the WSLC minimum; see Step 1 below for installation |
+| **WSLC SDK** | `wslcsdk.dll` is a separate client SDK and must be in the same directory as `wxc-exec.exe` |
 | **Container images** | Pre-pulled or available from a registry with network access |
 
 ## Step 1 — Install WSL 2.9.3+
@@ -227,6 +228,66 @@ no separate `--setup-wslc` step is required.
 | `"allowOutbound": true` | Bridged networking (full access) |
 | `"allowOutbound": false` | No networking (isolated) |
 
+### Network proxy (cooperative, unprivileged)
+
+WSLC supports a **cooperative HTTP/HTTPS proxy**: setting `network.proxy`
+routes a container's egress through a proxy you provide. WSLC's kernel has
+**no in-kernel `iptables`**, so — exactly like the Bubblewrap backend — there
+is no netfilter drop-floor; enforcement is *cooperative*, applied by handing
+the workload proxy environment variables that well-behaved clients honor.
+
+**How it works**
+
+1. When `network.proxy` is set, the runner translates it into the
+   `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy` environment
+   variables inside the container (via `WslcSetProcessSettingsEnvVariables`).
+   Any caller-supplied values for these keys — including `NO_PROXY` /
+   `no_proxy` — are **stripped** from the *initial* process environment first.
+   Because WSLC merges the process environment onto the image's baked-in
+   `ENV`, the runner also sets `NO_PROXY` / `no_proxy` to the **empty string**,
+   so an image-baked exemption (e.g. `ENV NO_PROXY=*`) cannot silently disable
+   the proxy. This sanitizes the process's *starting* environment only; see the
+   cooperative-model caveat below.
+2. Cooperative tools (curl, wget, Python `requests`, Node `https`, etc.) honor
+   the env vars and their traffic flows through the proxy.
+
+**Only the `url` form is supported.** A WSLC container runs in its own network
+namespace (a separate WSL system VM), so a host- or distro-loopback proxy is
+**not reachable** from inside the container. The proxy must be a routable
+address the container can reach:
+
+```json
+{
+  "version": "0.6.0-alpha",
+  "containment": "wslc",
+  "process": { "commandLine": "curl -fsSL https://example.com && echo OK" },
+  "network": {
+    "defaultPolicy": "allow",
+    "proxy": { "url": "http://proxy.example:8080" }
+  },
+  "experimental": { "wslc": { "image": "alpine:latest" } }
+}
+```
+
+The `localhost` and `builtinTestServer` proxy forms are **rejected at
+config-parse time** for WSLC (they imply a host-loopback / MXC-run proxy that
+the container cannot reach). The proxy also requires `defaultPolicy: "allow"`
+and no `allowedHosts` / `blockedHosts`: the container must have outbound
+networking to reach the proxy, and host lists are not forwarded to it — configs
+that combine the proxy with a `block` default or host lists are **rejected**.
+
+**Caveats**
+
+- **Cooperative model, not enforcement.** Only clients that honor the proxy
+  env vars are routed through the proxy. Tools that bypass them (raw sockets,
+  custom HTTP clients, statically-linked binaries that ignore the env) are
+  **not** contained. WSLC cannot provide a hard network floor because its
+  kernel lacks `iptables`. For strict network isolation, use
+  `"allowOutbound": false` (no networking) instead.
+- **Consumer-provided proxy.** MXC does not start a proxy for WSLC; you supply
+  a reachable one via `url`. Any host filtering is the proxy's responsibility —
+  the runner does not forward `allowedHosts` / `blockedHosts` to it.
+
 ### Filesystem mounts
 
 Paths in `filesystem.readwritePaths` and `filesystem.readonlyPaths` are mounted
@@ -239,7 +300,7 @@ the container.
 |---|---|---|
 | `WSLC backend not compiled` | Binary built without `--features wslc` | Rebuild with `build.bat --with-wslc` |
 | `Failed to load wslcsdk.dll` | DLL not in same directory as `wxc-exec.exe` | Copy `wslcsdk.dll` next to the binary |
-| `WSLC runtime not available` | WSL version too old or missing components | Update WSL with `wsl --update` or build from the [WSL repo](https://github.com/microsoft/WSL/tree/feature/wsl-for-apps) |
+| `WSLC runtime unavailable` | WSL runtime package is missing, older than 2.9.3, or the Virtual Machine Platform optional component is disabled | Update WSL with `wsl --update --pre-release`, verify the installed version with `wsl --version`, and enable the Virtual Machine Platform optional component if required. The WSLC SDK DLL is a separate dependency and does not replace the WSL runtime package. |
 | `WSLC image '<name>' not found locally` | Image was not pre-pulled, and no `imageTarPath` is set | Run `.\scripts\setup-wslc.ps1 -Image <name>` (or `wxc-exec.exe --setup-wslc --image <name>`); match the `-StoragePath` to your config's `experimental.wslc.storagePath` if set |
 | `WSLC is an experimental feature` | Missing `--experimental` flag | Add `--experimental` to CLI or `{ experimental: true }` in SDK |
 | `experimental mode` error in SDK | `SandboxSpawnOptions.experimental` not set | Pass `{ experimental: true }` to spawn functions |
@@ -249,6 +310,7 @@ the container.
 
 - [`tests/examples/wslc_hello_world.json`](../../tests/examples/wslc_hello_world.json) — Hello world with Alpine
 - [`tests/configs/wslc_network_isolated.json`](../../tests/configs/wslc_network_isolated.json) — Network isolation
+- [`tests/configs/wslc_network_proxy.json`](../../tests/configs/wslc_network_proxy.json) — Cooperative HTTP proxy (`network.proxy.url`)
 - [`tests/configs/wslc_custom_registry_ghcr.json`](../../tests/configs/wslc_custom_registry_ghcr.json) — Pull from GitHub Container Registry
 - [`tests/configs/wslc_custom_registry_quay.json`](../../tests/configs/wslc_custom_registry_quay.json) — Pull from Quay.io
 - [`tests/configs/wslc_tar_import_rootfs.json`](../../tests/configs/wslc_tar_import_rootfs.json) — Import rootfs tar
