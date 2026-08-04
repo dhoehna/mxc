@@ -32,10 +32,10 @@ fail() {
 }
 
 assert_firewall_chain_cleaned_up() {
-    if sudo -n iptables -S "$CHAIN_NAME" >/dev/null 2>&1; then
+    if iptables -S "$CHAIN_NAME" >/dev/null 2>&1; then
         fail "iptables chain '$CHAIN_NAME' was left behind after lxc-exec completed."
     fi
-    if sudo -n ip6tables -S "$CHAIN_NAME" >/dev/null 2>&1; then
+    if ip6tables -S "$CHAIN_NAME" >/dev/null 2>&1; then
         fail "ip6tables chain '$CHAIN_NAME' was left behind after lxc-exec completed."
     fi
 }
