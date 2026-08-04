@@ -25,18 +25,52 @@ pub struct NetworkIptablesManager {
 impl NetworkIptablesManager {
     /// Create a new manager for the given container name.
     pub fn new(container_name: &str) -> Self {
-        // Sanitize container name for use in iptables chain name
-        let sanitized: String = container_name
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-            .take(20)
-            .collect();
-
         Self {
-            chain_name: format!("MXC-{}", sanitized),
+            chain_name: Self::chain_name_for(container_name),
             rules_applied: false,
             veth_interface: None,
         }
+    }
+
+    /// Derive the iptables chain name for a container.
+    ///
+    /// Two distinct container names must never map to the same chain: a
+    /// collision would let one container's teardown flush and delete another's
+    /// rules. Sanitizing and truncating the name alone is not enough — two names
+    /// that share a prefix (`"web-frontend-1"` / `"web-frontend-2"` past the
+    /// truncation point) or differ only in characters the sanitizer strips
+    /// (`"a.b"` / `"ab"`) would collapse onto one chain. A short deterministic
+    /// hash of the **full, unsanitized** name is folded in so distinct names
+    /// always produce distinct chains, independent of any caller-side
+    /// validation. FNV-1a is used rather than the std hasher because its output
+    /// must be reproducible across processes (the signal-time `force_cleanup`
+    /// rebuilds the manager from the name alone) and across builds.
+    ///
+    /// The result stays within the netfilter chain-name limit (28 characters):
+    /// `"MXC-"` (4) + up to 15 sanitized characters + `"-"` (1) + 8 hex digits.
+    fn chain_name_for(container_name: &str) -> String {
+        let sanitized: String = container_name
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .take(15)
+            .collect();
+
+        format!("MXC-{}-{:08x}", sanitized, Self::name_hash(container_name))
+    }
+
+    /// 32-bit FNV-1a hash of the full container name, used to disambiguate
+    /// chain names. Deterministic across processes and builds so the teardown
+    /// path can reconstruct the same chain from the name alone.
+    fn name_hash(name: &str) -> u32 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut hash = FNV_OFFSET;
+        for byte in name.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        (hash & 0xffff_ffff) as u32
     }
 
     /// Whether rules have been applied and need cleanup.
@@ -317,15 +351,28 @@ mod tests {
     #[test]
     fn chain_name_sanitization() {
         let mgr = NetworkIptablesManager::new("my-container_123");
-        assert_eq!(mgr.chain_name, "MXC-my-container_123");
+        // Sanitized-and-truncated prefix (15 chars) plus an 8-hex disambiguating
+        // hash of the full name.
+        assert!(
+            mgr.chain_name.starts_with("MXC-my-container_12-"),
+            "unexpected chain name: {}",
+            mgr.chain_name
+        );
+        assert_eq!(mgr.chain_name.len(), "MXC-my-container_12-".len() + 8);
     }
 
     #[test]
     fn chain_name_truncation() {
         let long_name = "a".repeat(50);
         let mgr = NetworkIptablesManager::new(&long_name);
-        // 4 chars for "MXC-" + 20 chars max
-        assert!(mgr.chain_name.len() <= 24);
+        // Must stay within the netfilter 28-character chain-name limit:
+        // "MXC-" (4) + 15 sanitized + "-" (1) + 8 hex = 28.
+        assert!(
+            mgr.chain_name.len() <= 28,
+            "chain name too long: {} ({} chars)",
+            mgr.chain_name,
+            mgr.chain_name.len()
+        );
     }
 
     #[test]

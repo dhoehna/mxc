@@ -63,25 +63,24 @@ fn extract_container_name(sandbox_id: &str) -> Result<&str, MxcError> {
 
 /// Maximum LXC sandbox container-name length.
 ///
-/// `NetworkIptablesManager::new` derives a per-container iptables chain name
-/// (`MXC-<sanitized>`) by keeping only alphanumeric/`-`/`_` characters and
-/// truncating to 20 characters. Bounding valid container names to that same
-/// length and character set (see [`is_valid_container_name`]) makes the
-/// derivation an identity map on valid names — nothing is filtered out and no
-/// truncation occurs — so two distinct container names can never collide onto
-/// the same firewall chain (e.g. `"a.b"` vs `"ab"`, or long names that differ
-/// only after the 20th character). Such a collision would let one container's
-/// stop/deprovision tear down another container's firewall rules.
+/// Bounds a sandbox container name to a sane length and character set so the
+/// name is well-formed for LXC and for the derived iptables chain name. Chain
+/// uniqueness itself no longer depends on this bound: `NetworkIptablesManager`
+/// folds a deterministic hash of the full container name into the chain name,
+/// so two distinct names can never collide onto the same firewall chain even if
+/// their sanitized prefixes are identical. The length and character rules
+/// remain as input hygiene (a collision would otherwise let one container's
+/// stop/deprovision tear down another container's rules).
 const MAX_CONTAINER_NAME_LEN: usize = 20;
 
 /// Returns whether `name` is a valid LXC sandbox container name: non-empty, at
 /// most [`MAX_CONTAINER_NAME_LEN`] characters, and restricted to ASCII
 /// alphanumerics, `-`, and `_`.
 ///
-/// The character set and length deliberately match the iptables chain-name
-/// derivation in `NetworkIptablesManager::new` so the container-name →
-/// chain-name mapping stays collision-free. `'.'` is intentionally excluded
-/// because it is stripped by that derivation.
+/// The character set keeps the name well-formed for LXC and for the derived
+/// iptables chain name. `'.'` is intentionally excluded because it is stripped
+/// by the chain-name sanitizer; the chain hash guards against collisions
+/// regardless, but rejecting it up front keeps the sandbox id readable.
 fn is_valid_container_name(name: &str) -> bool {
     // Valid characters are ASCII (one byte each), so the byte length reported
     // by `str::len` equals the character count for any otherwise-valid name.
