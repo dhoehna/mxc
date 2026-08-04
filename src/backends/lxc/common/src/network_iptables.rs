@@ -814,6 +814,10 @@ mod rulegen_spec_tests;
 mod lifecycle_spec_tests;
 
 #[cfg(test)]
+#[path = "network_iptables_ip6status_spec_tests.rs"]
+mod ip6status_spec_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
