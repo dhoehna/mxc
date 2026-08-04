@@ -216,8 +216,8 @@ impl LxcScriptRunner {
         );
 
         // Discover the container's init PID so the INPUT rules are applied
-        // inside the container's network namespace (GA enforces LXC ingress
-        // via the container's iptables INPUT chain).
+        // inside the container's network namespace (the inbound deny chain is
+        // enforced via the container's own iptables INPUT chain).
         if let Some(pid) = container.init_pid() {
             let _ = writeln!(logger, "Container init PID: {}", pid);
             fw_manager.set_netns_pid(pid);

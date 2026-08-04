@@ -34,10 +34,12 @@
 //! namespace — never the host's `INPUT` (the host only ever sees such packets
 //! in `FORWARD`, if it routes them). So the rules are executed with
 //! `nsenter -t <init-pid> -n iptables …`, landing them in the container's
-//! netfilter tables. This matches the networking spec, which enforces LXC
-//! ingress "via iptables INPUT" (`docs/sandbox-policy/v2/networking.md`).
-//! Egress (allow/deny lists, DNS, proxy) is a separate control and is
-//! intentionally not handled here.
+//! netfilter tables. This matches the networking design spec, which enforces
+//! the LXC inbound control "via iptables INPUT"
+//! (`docs/sandbox-policy/v2/networking.md`; that spec's forward-looking GA
+//! field is `ingress.hostLoopback`, which this branch does not carry — the
+//! code reads main's `allowLocalNetwork`). Egress (allow/deny lists, DNS,
+//! proxy) is a separate control and is intentionally not handled here.
 
 use std::process::Command;
 
@@ -154,7 +156,7 @@ impl NetworkIptablesManager {
 
         logger.log_line(&format!("Creating iptables chain: {}", self.chain_name));
         logger.log_line(&format!(
-            "Inbound (hostLoopback) policy: {}",
+            "Inbound (allowLocalNetwork) policy: {}",
             if policy.allow_local_network {
                 "ACCEPT new inbound connections"
             } else {
@@ -216,7 +218,7 @@ impl NetworkIptablesManager {
     /// host. Mirrors the bubblewrap `build_args` and seatbelt `build_profile`
     /// builders.
     ///
-    /// **Inbound control (GA `ingress.hostLoopback`).** The chain is hooked
+    /// **Inbound control (`allowLocalNetwork`).** The chain is hooked
     /// into the container's `INPUT` chain (executed inside the container netns
     /// by the caller), so every packet it sees is destined *to a container
     /// socket*. Intra-container loopback and established/related return
@@ -238,7 +240,7 @@ impl NetworkIptablesManager {
         rules.push(argv(&["-N", chain]));
 
         // Intra-container loopback (127.0.0.1 / ::1 inside the sandbox) must
-        // always pass — GA keeps intra-container loopback unaffected by the
+        // always pass — intra-container loopback is unaffected by the
         // host-to-container inbound policy.
         rules.push(argv(&["-A", chain, "-i", "lo", "-j", accept]));
 
@@ -256,8 +258,8 @@ impl NetworkIptablesManager {
             accept,
         ]));
 
-        // hostLoopback toggle: accept or drop NEW inbound connections to the
-        // container's listening sockets.
+        // allowLocalNetwork toggle: accept or drop NEW inbound connections to
+        // the container's listening sockets.
         let inbound_verb = if policy.allow_local_network {
             accept
         } else {
@@ -274,9 +276,9 @@ impl NetworkIptablesManager {
             inbound_verb,
         ]));
 
-        // Ingress default-deny: host/external inbound is blocked by default
-        // (GA). Deliberately independent of the egress `default_network_policy`
-        // — an "allow" egress posture must not open the container to inbound.
+        // Inbound default-deny: host/external inbound is blocked by default.
+        // Deliberately independent of the egress `default_network_policy` — an
+        // "allow" egress posture must not open the container to inbound.
         rules.push(argv(&["-A", chain, "-j", drop]));
 
         // Hook into the container's INPUT chain — only when we have a netns to
@@ -588,8 +590,8 @@ mod tests {
 
     #[test]
     fn terminal_default_is_always_drop_regardless_of_egress_policy() {
-        // Ingress is default-deny per GA; the egress `default_network_policy`
-        // must not turn it into a default-accept.
+        // Inbound is default-deny; the egress `default_network_policy` must not
+        // turn it into a default-accept.
         for default in [NetworkPolicy::Block, NetworkPolicy::Allow] {
             let rules = NetworkIptablesManager::build_firewall_rules(
                 "MXC-t",
@@ -626,8 +628,9 @@ mod tests {
 
     #[test]
     fn no_egress_dest_or_dns_rules_in_ingress_chain() {
-        // GA ingress is loopback-only with no CIDR peers: the ingress chain
-        // must not carry egress-intent destination/DNS accepts.
+        // The inbound chain is loopback + established + a single NEW-state
+        // decision with no CIDR peers, so it must not carry egress-intent
+        // destination or DNS accepts.
         let rules = build(false, true);
         assert!(
             !rules.iter().any(|r| r.iter().any(|a| a == "-d")),
