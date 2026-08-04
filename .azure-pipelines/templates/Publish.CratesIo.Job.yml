@@ -60,7 +60,7 @@ jobs:
       isProduction: true
       inputs:
         - input: pipelineArtifact
-          artifact: ${{ parameters.cratesArtifactName }}
+          artifactName: ${{ parameters.cratesArtifactName }}
           targetPath: $(Pipeline.Workspace)/crates
     variables:
       cratesDir: $(Pipeline.Workspace)/crates

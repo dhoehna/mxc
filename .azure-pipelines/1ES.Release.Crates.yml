@@ -222,14 +222,14 @@ extends:
       displayName: 'Package Crates'
       dependsOn: Validate_Release_Ref
       jobs:
-      - template: templates/Package.Crates.Job.yml@self
+      - template: .azure-pipelines/templates/Package.Crates.Job.yml@self
 
     # ─── Stage 2: Publish ────────────────────────────────────────────────────
     - stage: Publish_to_CratesIo
       displayName: 'Publish Crates.io Packages'
       dependsOn: Package_Crates_For_Release
       jobs:
-      - template: templates/Publish.CratesIo.Job.yml@self
+      - template: .azure-pipelines/templates/Publish.CratesIo.Job.yml@self
         parameters:
           ESRPInfo:
             serviceName: $(serviceName)
