@@ -99,10 +99,13 @@ enum IpFamily {
 
 /// ICMPv6 message types the IPv6 inbound chain accepts so a hardened
 /// default-deny container still has a functioning IPv6 stack. Numeric values
-/// (rather than names) are used because `ip6tables --icmpv6-type` accepts them
-/// on every version and they cannot be mis-spelled (the named forms vary
-/// `neighbour`/`neighbor` across builds); each is annotated with its RFC 4443
-/// name. Selection follows RFC 4890 ("Recommendations for Filtering ICMPv6
+/// are used rather than names because RFC 4443 defines the numbers
+/// normatively, so they are unambiguous and cannot be mis-spelled; each is
+/// annotated with its RFC 4443 name below. Note that the named forms are not
+/// known to be broken — `ip6tables` v1.8.10 (nf_tables) resolves both
+/// `neighbour-solicitation` and `neighbor-solicitation` — so the numbers are
+/// chosen for determinism, not to work around a specific build.
+/// Selection follows RFC 4890 ("Recommendations for Filtering ICMPv6
 /// Messages in Firewalls"):
 ///
 ///   - 133–136 Neighbor Discovery (RS/RA/NS/NA) — RFC 4890 §4.4.1 "must not be
