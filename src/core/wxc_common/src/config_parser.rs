@@ -432,6 +432,26 @@ fn normalize_filesystem_paths(policy: &mut ContainerPolicy, logger: &mut Logger)
 
 // ---------- Conversion from wire model to domain model ----------
 
+/// Whether `host` is a loopback endpoint that a container cannot reach through
+/// its own network namespace: 127.0.0.0/8, ::1, or the name "localhost".
+///
+/// Accepts bracketed IPv6 literals (e.g. `[::1]`) as stored by the proxy URL
+/// parser. Used to reject loopback proxy hosts under the LXC deny-all model,
+/// where the container's loopback is not the host's.
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let candidate = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    candidate
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 /// Convert a typed `wire::Proxy` block into the validated domain `ProxyConfig`.
 /// Exactly one of `builtinTestServer` / `localhost` / `url` may be set.
 fn convert_wire_proxy(proxy: wire::Proxy) -> Result<ProxyConfig, WxcError> {
@@ -987,6 +1007,33 @@ fn convert_wire_config(
                            inside the container";
                 logger.log_line(msg);
                 return Err(WxcError::ConfigParse(msg.to_string()));
+            }
+
+            // A `url`-form proxy whose host is a loopback literal is as
+            // unreachable from the container's network namespace as the
+            // `localhost` shorthand: 127.0.0.0/8, ::1, and the name "localhost"
+            // all name the container's own loopback, not the host. Under a
+            // deny-all-except-proxy policy the container would silently get no
+            // working proxy, so reject it at parse time with a clear error.
+            //
+            // Rejection is at parse time (not resolution time) because the three
+            // forms the reviewer flagged - http://localhost, http://127.0.0.1,
+            // and [::1] - are all literals visible here, and this matches the
+            // file's other parse-time proxy validations. A hostname that only
+            // *resolves* to loopback is not caught: that would require rejecting
+            // in pin_proxy_to_resolved_ip, which also pins `localhost` for the
+            // A-record round-trip test, so it is left as a known residual gap.
+            if containment == ContainmentBackend::Lxc {
+                if let Some(host) = proxy_config.address.as_ref().map(|addr| addr.host()) {
+                    if host_is_loopback(host) {
+                        let msg = "LXC: network.proxy.url host is a loopback address \
+                                   (127.0.0.0/8, ::1, or localhost), which names the \
+                                   container's own loopback rather than the host; use a \
+                                   proxy host routable from inside the container";
+                        logger.log_line(msg);
+                        return Err(WxcError::ConfigParse(msg.to_string()));
+                    }
+                }
             }
 
             // WSLc containers run in their own network namespace, so an
