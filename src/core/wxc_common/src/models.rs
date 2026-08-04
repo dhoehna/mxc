@@ -453,8 +453,16 @@ impl ProxyAddress {
         let mut pinned = parsed.to_string();
         // `Url::to_string` normalises an empty path to "/"; drop it again when
         // the configured URL had none, so the injected value keeps the shape
-        // the caller supplied.
-        if parsed.path() == "/" && !raw.ends_with('/') {
+        // the caller supplied. Only do this when the "/" is actually the last
+        // character — when a query or fragment follows (e.g. ".../?q=1"), the
+        // slash sits mid-string and popping would instead eat the final query
+        // or fragment character.
+        if parsed.path() == "/"
+            && parsed.query().is_none()
+            && parsed.fragment().is_none()
+            && pinned.ends_with('/')
+            && !raw.ends_with('/')
+        {
             pinned.pop();
         }
         Some(pinned)
