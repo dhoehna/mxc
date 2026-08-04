@@ -73,6 +73,22 @@ impl NetworkIptablesManager {
         (hash & 0xffff_ffff) as u32
     }
 
+    /// Derive the deterministic host-side veth interface name for a container.
+    ///
+    /// The firewall must be installed *before* the container starts, but the
+    /// veth pair liblxc creates by default has a random name that is only known
+    /// once the container is running. Pinning `lxc.net.0.veth.pair` to this name
+    /// lets the FORWARD hook reference the interface by name ahead of time —
+    /// iptables accepts a not-yet-existing interface — so there is no window in
+    /// which a started container has unfiltered network.
+    ///
+    /// The name must fit the kernel `IFNAMSIZ` limit of 15 characters and be
+    /// unique per container, so a `mxcv` prefix (4) is followed by the same
+    /// 8-hex FNV-1a hash used for the chain name (12 characters total).
+    pub fn deterministic_veth_name(container_name: &str) -> String {
+        format!("mxcv{:08x}", Self::name_hash(container_name))
+    }
+
     /// Whether rules have been applied and need cleanup.
     pub fn rules_applied(&self) -> bool {
         self.rules_applied

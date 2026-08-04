@@ -8,7 +8,7 @@
 //! the one-shot `lxc-attach` PTY path, stop stops the container, and
 //! deprovision destroys it plus any remaining iptables state.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -190,31 +190,6 @@ fn normalized_policy(
     Ok(policy)
 }
 
-fn wait_for_network(container: &LxcContainer, timeout: Duration) -> bool {
-    let start = Instant::now();
-    let poll_interval = Duration::from_millis(500);
-
-    while start.elapsed() < timeout {
-        let output = std::process::Command::new("lxc-info")
-            .arg("-P")
-            .arg(container.lxc_path())
-            .arg("-n")
-            .arg(container.name())
-            .arg("-iH")
-            .output();
-
-        if let Ok(out) = output {
-            if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
-                return true;
-            }
-        }
-
-        std::thread::sleep(poll_interval);
-    }
-
-    false
-}
-
 fn apply_filesystem_policy(
     container: &LxcContainer,
     request: &ExecutionRequest,
@@ -252,25 +227,27 @@ fn apply_network_policy(
         )));
     }
 
-    if has_network_policy(&policy) {
-        let _ = wait_for_network(container, Duration::from_secs(10));
-    }
-
     let mut fw_manager = NetworkIptablesManager::new(container.name());
-    match NetworkIptablesManager::discover_veth_interface(container.name()) {
-        Some(veth) => fw_manager.set_veth_interface(&veth),
-        // Without the host-side veth the chain cannot be hooked into FORWARD,
-        // so the rules are built but never consulted. `apply_firewall_rules`
-        // only warns in that case, so catch it here: a default-deny policy must
-        // not fail open.
-        None if uses_firewall_mode(&policy) => {
-            return Err(MxcError::policy_validation(
-                "LXC state-aware start could not discover the container's host-side veth \
-                 interface, so iptables rules cannot be scoped to the container and the \
-                 network policy would not be enforced",
-            ));
-        }
-        None => {}
+
+    // Under a firewall-enforced policy, pin a deterministic host-side veth name
+    // in the container config so the chain and its FORWARD hook can be built
+    // *before* the container runs. The prior flow discovered the veth only after
+    // start and applied rules afterward, leaving a window in which a container
+    // with a deny policy had unrestricted network. iptables accepts an interface
+    // name that does not exist yet, so hooking the not-yet-created veth by its
+    // pinned name closes that window entirely.
+    if uses_firewall_mode(&policy) {
+        let veth = NetworkIptablesManager::deterministic_veth_name(container.name());
+
+        // The name is re-derived on every start, so drop any pin from a prior
+        // run before setting it to avoid accumulating duplicate net entries.
+        container
+            .clear_config_item("lxc.net.0.veth.pair")
+            .map_err(|e| MxcError::backend_error(format!("Failed to clear veth pair name: {e}")))?;
+        container
+            .set_config_item("lxc.net.0.veth.pair", &veth)
+            .map_err(|e| MxcError::backend_error(format!("Failed to pin veth pair name: {e}")))?;
+        fw_manager.set_veth_interface(&veth);
     }
 
     match fw_manager.apply_firewall_rules(&policy, logger) {
@@ -285,9 +262,15 @@ fn apply_network_policy(
         Ok(false) => Err(MxcError::policy_validation(
             "Failed to apply network firewall rules",
         )),
-        Err(e) => Err(MxcError::policy_validation(format!(
-            "Network policy error: {e}"
-        ))),
+        Err(e) => {
+            // Fail closed: tear down any partially-applied chain so an aborted
+            // policy application does not leak iptables state, and let the error
+            // propagate so the caller does not start the container unfiltered.
+            cleanup_network(container.name(), None, logger);
+            Err(MxcError::policy_validation(format!(
+                "Network policy error: {e}"
+            )))
+        }
     }
 }
 
@@ -365,18 +348,21 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             }
         } else {
             apply_filesystem_policy(&container, request, &mut logger)?;
-            container
-                .start()
-                .map_err(|e| MxcError::backend_error(format!("Failed to start container: {e}")))?;
-            if let Err(e) = apply_network_policy(&container, request, &mut logger) {
-                // Roll back: stop the container *before* removing any
-                // partially-applied firewall rules so it cannot run without
-                // egress filtering during rollback. Discover the veth first —
-                // it disappears once the container stops.
-                let veth = NetworkIptablesManager::discover_veth_interface(container_name);
-                let _ = container.stop();
-                cleanup_network(container_name, veth.as_deref(), &mut logger);
-                return Err(e);
+            // Install the firewall *before* the container is allowed to run.
+            // Applying it after start left a roughly 10-second window in which a
+            // container with a deny policy had unrestricted network. A
+            // firewall-install failure aborts the start (fail closed) rather
+            // than proceeding unfiltered.
+            apply_network_policy(&container, request, &mut logger)?;
+            if let Err(e) = container.start() {
+                // The firewall is already installed; tear it down so an aborted
+                // start does not leak iptables state. The veth never came up, so
+                // no interface-scoped discovery is needed — force_cleanup removes
+                // the chain and its FORWARD hooks by chain name.
+                cleanup_network(container_name, None, &mut logger);
+                return Err(MxcError::backend_error(format!(
+                    "Failed to start container: {e}"
+                )));
             }
         }
         Ok(StartResult { metadata: None })
@@ -640,8 +626,9 @@ mod tests {
         // pass the enforceability gate in `apply_network_policy`.
         let policy = ContainerPolicy::default();
         assert!(!requires_firewall_enforcement(&policy) || uses_firewall_mode(&policy));
-        // And it must not trip the veth-discovery failure either, which is
-        // scoped to the firewall modes.
+        // And it must stay off the firewall path entirely: veth pinning and the
+        // pre-start iptables install are scoped to the firewall modes, so a
+        // default policy neither touches the container config nor installs rules.
         assert!(!uses_firewall_mode(&policy));
     }
 
