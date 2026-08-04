@@ -3,20 +3,22 @@
 //!
 //! # Decision table
 //!
-//! | allow_local_network | netns PID set | Required outcome | Contract sentence                                        |
-//! |---------------------|---------------|------------------|----------------------------------------------------------|
-//! | false               | no            | NOT refused       | Default-deny path; guard is for the permissive case only.|
-//! | false               | yes           | NOT refused       | Same.                                                    |
-//! | true                | yes           | REFUSED           | "apply_firewall_rules returns a clear not-yet-implemented|
-//! |                     |               |                   |  error for the permissive path"                          |
-//! | true                | no            | CONTRACT GAP      | Contract does not distinguish this cell — see tests.     |
+//! All cells assume `NetworkEnforcementMode::Firewall` unless stated otherwise,
+//! because `apply_firewall_rules` returns early with `Ok(true)` for
+//! `Capabilities` mode before reaching the permissive guard.
+//!
+//! | allow_local_network | netns PID set | enforcement mode   | Required outcome | Source |
+//! |---------------------|---------------|--------------------|------------------|--------|
+//! | false               | no            | Firewall           | NOT refused      | guard is permissive-path only |
+//! | false               | yes           | Firewall           | NOT refused      | same |
+//! | true                | yes           | Firewall           | REFUSED (Err)    | "apply_firewall_rules returns a clear not-yet-implemented error" |
+//! | true                | yes           | Both               | REFUSED (Err)    | Both ∈ firewall-using modes per :116 |
+//! | true                | yes           | Capabilities       | NOT refused      | early-return before guard; no firewall path |
+//! | true                | no            | Firewall           | NOT refused      | refusal is netns-gated by design; no-PID path builds an unhooked chain |
 
 use super::*;
-// Logger and ContainerPolicy are re-exported via super::*.
-// Mode and NetworkPolicy are not in network_iptables.rs's own imports, so we
-// bring them in directly.
 use wxc_common::logger::Mode;
-use wxc_common::models::NetworkPolicy;
+use wxc_common::models::NetworkEnforcementMode;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -24,25 +26,28 @@ fn make_logger() -> Logger {
     Logger::new(Mode::Buffer)
 }
 
-fn policy_with(allow_local: bool, default: NetworkPolicy) -> ContainerPolicy {
+/// Build a policy that reaches the permissive guard.
+///
+/// The guard is only reachable when `network_enforcement_mode` is `Firewall`
+/// or `Both`; `Capabilities` (the default) causes an early return before the
+/// guard.  Every fixture that must exercise the guard must set one of the
+/// firewall-using modes explicitly.
+fn firewall_policy(allow_local: bool) -> ContainerPolicy {
     ContainerPolicy {
         allow_local_network: allow_local,
-        default_network_policy: default,
+        network_enforcement_mode: NetworkEnforcementMode::Firewall,
         ..Default::default()
     }
 }
 
-// ── Refused case: permissive policy with a container netns PID ──────────────
+// ── Refused cases ─────────────────────────────────────────────────────────
 
 /// Contract: "apply_firewall_rules returns a clear not-yet-implemented error
 /// for the permissive path" (module-level doc, permissive-path section).
-/// A netns PID is set so we are in the full LXC container path that would
-/// otherwise install the over-broad accept rule.
+/// NetworkEnforcementMode::Firewall + netns PID reaches the guard.
 #[test]
-#[ignore = "SUSPECTED BUG: apply_firewall_rules returns Ok(true) for allow_local_network=true + netns PID; \
-            the not-yet-implemented guard appears to be absent or gated incorrectly"]
 fn permissive_inbound_in_a_container_netns_is_refused_not_installed() {
-    let policy = policy_with(true, NetworkPolicy::Block);
+    let policy = firewall_policy(true);
     let mut mgr = NetworkIptablesManager::new("test-container-refused");
     mgr.set_netns_pid(12345);
     let mut logger = make_logger();
@@ -81,19 +86,57 @@ fn permissive_inbound_in_a_container_netns_is_refused_not_installed() {
     );
 }
 
+/// NetworkEnforcementMode::Both also uses the firewall path (matches the same
+/// arm as Firewall at :116).  The permissive guard must refuse for Both too.
+#[test]
+fn permissive_inbound_in_both_mode_is_refused_not_installed() {
+    let policy = ContainerPolicy {
+        allow_local_network: true,
+        network_enforcement_mode: NetworkEnforcementMode::Both,
+        ..Default::default()
+    };
+    let mut mgr = NetworkIptablesManager::new("test-container-refused-both");
+    mgr.set_netns_pid(22222);
+    let mut logger = make_logger();
+
+    let result = mgr.apply_firewall_rules(&policy, &mut logger);
+
+    assert!(
+        result.is_err(),
+        "allow_local_network=true, mode=Both, netns_pid=Some(22222): expected Err, got {:?}",
+        result
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("not yet implemented"),
+        "allow_local_network=true, mode=Both: message must contain \"not yet implemented\", \
+         got: {:?}",
+        msg
+    );
+    assert!(
+        msg.contains("allowLocalNetwork"),
+        "allow_local_network=true, mode=Both: message must contain \"allowLocalNetwork\", \
+         got: {:?}",
+        msg
+    );
+    assert!(
+        msg.contains("over-broad accept"),
+        "allow_local_network=true, mode=Both: message must contain \"over-broad accept\", \
+         got: {:?}",
+        msg
+    );
+}
+
 /// A refusal must not mark the manager as having applied rules, because
 /// rules_applied() drives cleanup.  Installing a cleanup pass after a refusal
 /// would be wrong and potentially dangerous.
 ///
 /// The contract does not explicitly address this invariant, but it follows
 /// directly from the semantics of rules_applied(): if no rules were installed,
-/// cleanup must not run.  See ## CONTRACT GAPS in the module doc.
+/// cleanup must not run.
 #[test]
-#[ignore = "SUSPECTED BUG: apply_firewall_rules returns Ok(true) for allow_local_network=true + netns PID; \
-            the not-yet-implemented guard appears to be absent or gated incorrectly — \
-            this test depends on the refusal firing (see permissive_inbound_in_a_container_netns_is_refused_not_installed)"]
 fn permissive_inbound_refusal_does_not_set_rules_applied() {
-    let policy = policy_with(true, NetworkPolicy::Block);
+    let policy = firewall_policy(true);
     let mut mgr = NetworkIptablesManager::new("test-container-refused-state");
     mgr.set_netns_pid(99999);
     let mut logger = make_logger();
@@ -116,33 +159,24 @@ fn permissive_inbound_refusal_does_not_set_rules_applied() {
     );
 }
 
-// ── Non-refused cases: allow_local_network=false ────────────────────────────
+// ── Non-refused cases ────────────────────────────────────────────────────────
 //
-// These paths do NOT trigger the permissive guard.  On this box there is no
-// iptables binary, so we cannot assert Ok.  Instead we assert the
-// discriminating invariant: whatever the outcome, it is NOT the
-// not-yet-implemented refusal.  That invariant is meaningful on Linux and on
-// Windows and cannot be satisfied by accident.
-//
-// CONTRACT: the not-yet-implemented guard is documented only for the
-// permissive path (allow_local_network=true).  The default-deny path has no
-// stated reason to produce this error.
+// On Windows there is no iptables binary, so we cannot assert Ok for paths
+// that would run iptables.  Instead we assert the discriminating invariant:
+// whatever the outcome, it is NOT the not-yet-implemented refusal.  That
+// invariant holds on Linux and Windows and cannot be satisfied by accident.
 
-/// Default-deny policy (allow_local_network=false) with no netns PID —
-/// Bubblewrap shared-net mode.  The chain is "built but left unhooked."
-/// Must not return the not-yet-implemented refusal.
+/// Default-deny policy (allow_local_network=false) with no netns PID.
+/// Guard is permissive-path only; default-deny must not produce the NYI error.
 #[test]
 fn default_deny_without_netns_is_not_the_permissive_refusal() {
-    let policy = policy_with(false, NetworkPolicy::Block);
+    let policy = firewall_policy(false);
     let mut mgr = NetworkIptablesManager::new("test-container-deny-no-netns");
-    // No set_netns_pid call.
     let mut logger = make_logger();
 
     let result = mgr.apply_firewall_rules(&policy, &mut logger);
 
-    // Deliberate negative assertion: we cannot assert Ok on Windows (no
-    // iptables binary), but the not-yet-implemented refusal must never fire
-    // for a default-deny policy regardless of platform.
+    // Deliberate negative assertion — see module comment.
     if let Err(ref msg) = result {
         assert!(
             !msg.contains("not yet implemented"),
@@ -165,18 +199,15 @@ fn default_deny_without_netns_is_not_the_permissive_refusal() {
 }
 
 /// Default-deny policy with a netns PID — normal LXC container, deny mode.
-/// Must not return the not-yet-implemented refusal.
 #[test]
 fn default_deny_with_netns_is_not_the_permissive_refusal() {
-    let policy = policy_with(false, NetworkPolicy::Block);
+    let policy = firewall_policy(false);
     let mut mgr = NetworkIptablesManager::new("test-container-deny-with-netns");
     mgr.set_netns_pid(55555);
     let mut logger = make_logger();
 
     let result = mgr.apply_firewall_rules(&policy, &mut logger);
 
-    // Deliberate negative assertion: same reasoning as the no-netns variant
-    // above.  The not-yet-implemented error must not appear for default-deny.
     if let Err(ref msg) = result {
         assert!(
             !msg.contains("not yet implemented"),
@@ -198,63 +229,82 @@ fn default_deny_with_netns_is_not_the_permissive_refusal() {
     }
 }
 
-// ── CONTRACT GAP cell: allow_local_network=true, no netns PID ───────────────
-//
-// The contract says the no-PID path "never attach[es] a rule to the host's
-// own INPUT chain" and the chain is "left unhooked."  The refusal description
-// does not explicitly state whether it fires when no PID is present.
-//
-// The over-broad-accept argument (the only reason for refusal) still applies:
-// an unscoped NEW -j ACCEPT would be over-broad in any namespace.  However,
-// the contract also says "installs nothing" for this path, which could mean
-// the refusal is a no-op and the code never reaches the guard.
-//
-// Because the contract is ambiguous here, we assert only the unambiguous
-// sub-invariant: if a refusal fires, it must carry the correct message
-// (not some other, unrelated Err).  We do not assert whether it MUST refuse.
-// See ## CONTRACT GAPS.
-
+/// allow_local_network=true + netns PID set + NetworkEnforcementMode::Capabilities.
+///
+/// Capabilities mode returns early before the firewall path is entered; the
+/// permissive guard is never reached.  This is not a refusal — it is
+/// an explicit early exit for configs where no firewall is in use.  This test
+/// catches anyone who hoists the guard above the enforcement-mode gate, which
+/// would break every capabilities-mode config.
 #[test]
-fn permissive_inbound_without_netns_if_refused_carries_correct_message() {
-    let policy = policy_with(true, NetworkPolicy::Block);
-    let mut mgr = NetworkIptablesManager::new("test-container-perm-no-netns");
-    // No set_netns_pid — Bubblewrap / unit-test mode.
+fn permissive_inbound_capabilities_mode_is_not_refused() {
+    let policy = ContainerPolicy {
+        allow_local_network: true,
+        network_enforcement_mode: NetworkEnforcementMode::Capabilities,
+        ..Default::default()
+    };
+    let mut mgr = NetworkIptablesManager::new("test-container-perm-caps");
+    mgr.set_netns_pid(77777);
     let mut logger = make_logger();
 
     let result = mgr.apply_firewall_rules(&policy, &mut logger);
 
-    // CONTRACT GAP: the contract does not say whether this combination must
-    // refuse.  We assert only: if it IS an error, the message content matches
-    // the specified refusal text (not some unrelated error).
+    // Deliberate negative assertion: Capabilities mode must not trigger the
+    // NYI refusal regardless of allow_local_network.
     if let Err(ref msg) = result {
-        // If the guard fires, it must be the documented refusal, not noise.
-        let is_nyi_refusal = msg.contains("not yet implemented")
-            || msg.contains("allowLocalNetwork")
-            || msg.contains("over-broad accept");
-        // Acceptable alternatives: it could be a different Err entirely
-        // (e.g., iptables missing).  We cannot distinguish without reading
-        // the code, so we do NOT assert is_nyi_refusal here.
-        // What we can assert: if it claims to be the NYI refusal, it must
-        // carry all three fingerprints.
-        if msg.contains("not yet implemented") {
-            assert!(
-                msg.contains("allowLocalNetwork"),
-                "allow_local_network=true, netns_pid=None: partial NYI message — missing \
-                 'allowLocalNetwork', got: {:?}",
-                msg
-            );
-            assert!(
-                msg.contains("over-broad accept"),
-                "allow_local_network=true, netns_pid=None: partial NYI message — missing \
-                 'over-broad accept', got: {:?}",
-                msg
-            );
-        }
-        let _ = is_nyi_refusal; // suppress unused warning
+        assert!(
+            !msg.contains("not yet implemented"),
+            "allow_local_network=true, mode=Capabilities, netns_pid=Some(77777): must not \
+             return the not-yet-implemented refusal, got: {:?}",
+            msg
+        );
+        assert!(
+            !msg.contains("over-broad accept"),
+            "allow_local_network=true, mode=Capabilities, netns_pid=Some(77777): must not \
+             return the over-broad-accept refusal, got: {:?}",
+            msg
+        );
         eprintln!(
-            "WARNING: permissive_inbound_without_netns_if_refused_carries_correct_message \
-             got Err (may be iptables-missing on Windows).  CONTRACT GAP: whether \
-             allow_local_network=true + no netns MUST refuse is not specified."
+            "WARNING: permissive_inbound_capabilities_mode_is_not_refused got Err \
+             (unexpected on Windows — Capabilities mode should return Ok before iptables). \
+             Re-run on Linux to verify."
+        );
+    }
+}
+
+/// allow_local_network=true + NO netns PID + Firewall mode.
+///
+/// The refusal is netns-gated by design: the no-PID path builds an unhooked
+/// chain and installs nothing (Bubblewrap shared-net mode); the guard fires
+/// only when a real container netns is present.  Must not refuse.
+#[test]
+fn permissive_inbound_without_netns_is_not_refused() {
+    let policy = firewall_policy(true);
+    let mut mgr = NetworkIptablesManager::new("test-container-perm-no-netns");
+    // No set_netns_pid — Bubblewrap / unit-test shared-net mode.
+    let mut logger = make_logger();
+
+    let result = mgr.apply_firewall_rules(&policy, &mut logger);
+
+    // Deliberate negative assertion: without a netns PID the chain is left
+    // unhooked and nothing is installed; the NYI refusal must not fire.
+    if let Err(ref msg) = result {
+        assert!(
+            !msg.contains("not yet implemented"),
+            "allow_local_network=true, netns_pid=None: must not return the \
+             not-yet-implemented refusal (guard is netns-gated by design), got: {:?}",
+            msg
+        );
+        assert!(
+            !msg.contains("over-broad accept"),
+            "allow_local_network=true, netns_pid=None: must not return the \
+             over-broad-accept refusal (guard is netns-gated), got: {:?}",
+            msg
+        );
+        eprintln!(
+            "WARNING: permissive_inbound_without_netns_is_not_refused got Err \
+             (expected on Windows — no iptables binary).  The non-error branch was not \
+             exercised.  Re-run on Linux to verify the happy path."
         );
     }
 }
