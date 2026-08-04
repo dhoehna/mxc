@@ -317,6 +317,39 @@ fn sdk_error(context: &str, hr: HRESULT, sdk_msg: &str) -> ScriptResponse {
     ScriptResponse::error(&msg)
 }
 
+/// Builds a user-facing prerequisite error for the components `WslcGetMissingComponents`
+/// reports as missing. `missing` may combine multiple bits, and the guidance is branched
+/// per-component so a user missing only `VirtualMachinePlatform` isn't told to update WSL
+/// (which doesn't enable that Windows optional feature), and vice versa.
+fn wslc_prerequisite_error(missing: WslcComponentFlags) -> String {
+    let needs_vmp =
+        missing.0 & WslcComponentFlags::WSLC_COMPONENT_FLAG_VIRTUAL_MACHINE_PLATFORM.0 != 0;
+    let needs_wsl_package = missing.0 & WslcComponentFlags::WSLC_COMPONENT_FLAG_WSL_PACKAGE.0 != 0;
+
+    let mut guidance = Vec::new();
+    if needs_vmp {
+        guidance.push(
+            "enable the \"Virtual Machine Platform\" Windows optional feature (Settings > \
+             Apps > Optional features > More Windows features, or run `dism.exe /online \
+             /enable-feature /featurename:VirtualMachinePlatform /all`) and restart"
+                .to_string(),
+        );
+    }
+    if needs_wsl_package {
+        guidance
+            .push("install WSL 2.9.3 or newer and run `wsl --update --pre-release`".to_string());
+    }
+    if guidance.is_empty() {
+        guidance.push("ensure WSL2 and the WSLC SDK are installed".to_string());
+    }
+
+    format!(
+        "WSLC runtime unavailable. Missing components: {}. Please {}.",
+        missing,
+        guidance.join("; "),
+    )
+}
+
 impl ScriptRunner for WSLContainerRunner {
     fn execute(&mut self, request: &ExecutionRequest, logger: &mut Logger) -> ScriptResponse {
         unsafe { self.run_internal(request, logger) }
@@ -355,11 +388,7 @@ impl WSLContainerRunner {
             return Err(sdk_error("WslcGetMissingComponents failed", hr, ""));
         }
         if missing.any_missing() {
-            return Err(ScriptResponse::error(&format!(
-                "WSLC runtime not available. Missing components: {}. \
-                 Ensure WSL2 and the WSLC SDK are installed.",
-                missing
-            )));
+            return Err(ScriptResponse::error(&wslc_prerequisite_error(missing)));
         }
         let _ = writeln!(logger, "[WSLC] Runtime check passed");
 
@@ -975,17 +1004,57 @@ impl WSLContainerRunner {
             return sdk_error("WslcSetProcessSettingsCmdLine failed", hr, "");
         }
 
-        if !request.env.is_empty() {
-            let env_cstrings: Vec<Vec<u8>> = request
-                .env
+        // Route egress through the cooperative proxy: WSLc has no in-kernel
+        // iptables, so per-host policy is enforced at the proxy layer by
+        // injecting HTTP(S)_PROXY (and scrubbing caller-supplied proxy vars).
+        // See wxc_common::proxy_env.
+        let effective_env: Vec<String> = if request.policy.network_proxy.is_enabled() {
+            // url-only (also enforced at parse time). Fail fast rather than
+            // inject an empty HTTP_PROXY= for the localhost/builtinTestServer
+            // forms, which carry no routable URL.
+            let proxy_url = match request
+                .policy
+                .network_proxy
+                .address
+                .as_ref()
+                .and_then(|addr| addr.original_url.clone())
+            {
+                Some(url) => url,
+                None => {
+                    return ScriptResponse::error(
+                        "WSLC: network.proxy requires the 'url' form (a routable proxy URL); \
+                         the localhost and builtinTestServer forms are not supported because a \
+                         WSLc container runs in its own network namespace.",
+                    );
+                }
+            };
+            let _ = writeln!(
+                logger,
+                "[WSLC] Cooperative network proxy configured: {}",
+                wxc_common::proxy_env::redact_proxy_url(&proxy_url)
+            );
+            wxc_common::proxy_env::apply_cooperative_proxy_env(&request.env, &proxy_url)
+        } else {
+            request.env.clone()
+        };
+
+        // Env buffers must outlive WslcCreateContainer: the SDK stores the
+        // pointers into process_settings (it does not copy), and reads them at
+        // container-create time. Hoisting to function scope keeps them alive —
+        // mirrors the cmdline/_cwd_cstr handling. Scoping them inside the `if`
+        // below frees them early and causes a use-after-free (0xC0000005).
+        let _env_cstrings: Vec<Vec<u8>>;
+        let _env_ptrs: Vec<PCSTR>;
+        if !effective_env.is_empty() {
+            _env_cstrings = effective_env
                 .iter()
                 .map(|e| format!("{}\0", e).into_bytes())
                 .collect();
-            let env_ptrs: Vec<PCSTR> = env_cstrings.iter().map(|e| e.as_ptr() as PCSTR).collect();
+            _env_ptrs = _env_cstrings.iter().map(|e| e.as_ptr() as PCSTR).collect();
             let hr = sdk.WslcSetProcessSettingsEnvVariables(
                 &mut process_settings,
-                env_ptrs.as_ptr(),
-                env_ptrs.len(),
+                _env_ptrs.as_ptr(),
+                _env_ptrs.len(),
             );
             if hr != S_OK {
                 return sdk_error("WslcSetProcessSettingsEnvVariables failed", hr, "");
@@ -1455,5 +1524,47 @@ mod tests {
             "expected the overlap error, got: {}",
             response.error_message
         );
+    }
+
+    #[test]
+    fn prerequisite_error_for_wsl_package_missing() {
+        let message = wslc_prerequisite_error(WslcComponentFlags::WSLC_COMPONENT_FLAG_WSL_PACKAGE);
+
+        assert!(message.contains("WslPackage"));
+        assert!(message.contains("2.9.3"));
+        assert!(message.contains("wsl --update --pre-release"));
+        assert!(!message.contains("Virtual Machine Platform"));
+    }
+
+    #[test]
+    fn prerequisite_error_for_virtual_machine_platform_missing() {
+        let message = wslc_prerequisite_error(
+            WslcComponentFlags::WSLC_COMPONENT_FLAG_VIRTUAL_MACHINE_PLATFORM,
+        );
+
+        assert!(message.contains("VirtualMachinePlatform"));
+        assert!(message.contains("Virtual Machine Platform"));
+        assert!(!message.contains("wsl --update"));
+    }
+
+    #[test]
+    fn prerequisite_error_for_combined_missing_components() {
+        let combined = WslcComponentFlags::WSLC_COMPONENT_FLAG_VIRTUAL_MACHINE_PLATFORM
+            | WslcComponentFlags::WSLC_COMPONENT_FLAG_WSL_PACKAGE;
+        let message = wslc_prerequisite_error(combined);
+
+        assert!(message.contains("VirtualMachinePlatform"));
+        assert!(message.contains("WslPackage"));
+        assert!(message.contains("wsl --update"));
+        assert!(message.contains("Virtual Machine Platform"));
+    }
+
+    #[test]
+    fn prerequisite_error_for_sdk_needs_update() {
+        let message =
+            wslc_prerequisite_error(WslcComponentFlags::WSLC_COMPONENT_FLAG_SDK_NEEDS_UPDATE);
+
+        assert!(message.contains("SdkNeedsUpdate"));
+        assert!(message.contains("ensure WSL2 and the WSLC SDK are installed"));
     }
 }

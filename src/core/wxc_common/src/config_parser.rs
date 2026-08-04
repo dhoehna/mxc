@@ -477,6 +477,20 @@ fn convert_wire_proxy(proxy: wire::Proxy) -> Result<ProxyConfig, WxcError> {
         let parsed = url::Url::parse(&url_str)
             .map_err(|e| WxcError::ConfigParse(format!("network.proxy.url is invalid: {e}")))?;
 
+        // Only http/https are meaningful for the HTTP(S)_PROXY env vars we
+        // inject. A non-HTTP scheme (ftp://, socks5://, …) is silently ignored
+        // by many clients, which fails open under WSLc's defaultPolicy=allow.
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            // Redact any embedded userinfo (`user:password@`) before it reaches
+            // the diagnostic/log stream — a proxy URL commonly carries basic-auth
+            // credentials, and the scheme alone diagnoses the failure.
+            let redacted = crate::proxy_env::redact_proxy_url(&url_str);
+            return Err(WxcError::ConfigParse(format!(
+                "network.proxy.url must use the 'http' or 'https' scheme (got '{scheme}'): {redacted}"
+            )));
+        }
+
         let host = parsed
             .host_str()
             .ok_or_else(|| {
@@ -647,9 +661,9 @@ fn map_wire_containment(c: Option<&wire::Containment>) -> ContainmentBackend {
 
 /// Validates a caller-specified `processContainer.captureDenials.outputPath`: it
 /// must be an absolute path whose parent directory already exists (the runner
-/// opens the file there when it seals the trace, under the caller's own
-/// identity). The path itself must not be an existing directory. A relative
-/// path, directory path, or missing parent yields an actionable error.
+/// writes the JSON denials output file there after the workload exits). The
+/// path itself must not be an existing directory. A relative path, directory
+/// path, or missing parent yields an actionable error.
 fn validate_capture_denials_output_path(path: &str, logger: &mut Logger) -> Result<(), WxcError> {
     let candidate = std::path::Path::new(path);
     if !candidate.is_absolute() {
@@ -815,10 +829,6 @@ fn convert_wire_config(
         // available in every build.
         if ac.learning_mode.unwrap_or(false) {
             policy.capabilities.push("learningModeLogging".to_string());
-            logger.log(
-                "NOTE: 'learningModeLogging' enabled - AppContainer restrictions remain \
-enforced; access denials are recorded for diagnostics.\n",
-            );
         }
 
         // Learning-mode capability names are reserved for the dedicated entry
@@ -863,6 +873,39 @@ enforced; access denials are recorded for diagnostics.\n",
                 Some(wire::CaptureDenialsMode::Allow) => CaptureDenialsMode::Allow,
                 Some(wire::CaptureDenialsMode::Block) | None => CaptureDenialsMode::Block,
             };
+
+            // captureDenials drives the learning-mode ETL capture in the runner,
+            // which requires the corresponding learning-mode capability on the
+            // child token so the OS emits the access-check records the capture
+            // path collects. Inject it additively (preserving the workload's real
+            // capabilities). `block` keeps deny-by-default via
+            // `learningModeLogging`; `allow` replaces deny-and-record with
+            // `permissiveLearningMode` (the runner surfaces the security warning).
+            let capture_capability = match mode {
+                CaptureDenialsMode::Block => {
+                    // Capability entries are exact names. Comma-packed entries
+                    // were rejected above, so substring matching here would
+                    // incorrectly remove unrelated custom capabilities.
+                    policy.capabilities.retain(|capability| {
+                        !capability.eq_ignore_ascii_case("permissiveLearningMode")
+                    });
+                    "learningModeLogging"
+                }
+                CaptureDenialsMode::Allow => {
+                    policy.capabilities.retain(|capability| {
+                        !capability.eq_ignore_ascii_case("learningModeLogging")
+                    });
+                    "permissiveLearningMode"
+                }
+            };
+            if !policy
+                .capabilities
+                .iter()
+                .any(|capability| capability.eq_ignore_ascii_case(capture_capability))
+            {
+                policy.capabilities.push(capture_capability.to_string());
+            }
+
             policy.capture_denials = Some(CaptureDenialsConfig {
                 mode,
                 output_path: cd.output_path,
@@ -915,11 +958,34 @@ enforced; access denials are recorded for diagnostics.\n",
                 && containment != ContainmentBackend::ProcessContainer
                 && containment != ContainmentBackend::Bubblewrap
                 && containment != ContainmentBackend::Seatbelt
+                && containment != ContainmentBackend::Wslc
             {
                 let msg = "Network proxy is only supported with the 'processcontainer', \
-                           'bubblewrap', or 'seatbelt' containment backends";
+                           'bubblewrap', 'seatbelt', or 'wslc' containment backends";
+                logger.log_line(msg);
                 return Err(WxcError::ConfigParse(msg.to_string()));
             }
+
+            // WSLc containers run in their own network namespace, so an
+            // MXC-run host-loopback proxy is unreachable. Accept only the
+            // caller-supplied `url` form (which carries `original_url`); reject
+            // the `localhost` / `builtinTestServer` forms.
+            if containment == ContainmentBackend::Wslc && proxy_config.is_enabled() {
+                let is_url_form = proxy_config
+                    .address
+                    .as_ref()
+                    .is_some_and(|addr| addr.original_url.is_some());
+                if !is_url_form {
+                    let msg = "WSLc: network.proxy must use the 'url' form pointing at a \
+                               routable proxy (e.g. \"url\": \"http://proxy.example:8080\"). \
+                               The 'localhost' and 'builtinTestServer' forms are not supported \
+                               because a WSLc container runs in its own network namespace and \
+                               cannot reach a host-loopback proxy.";
+                    logger.log_line(msg);
+                    return Err(WxcError::ConfigParse(msg.to_string()));
+                }
+            }
+
             policy.network_proxy = proxy_config;
         }
 
@@ -940,6 +1006,24 @@ enforced; access denials are recorded for diagnostics.\n",
         }
         if let Some(v) = net.blocked_hosts {
             policy.blocked_hosts = v;
+        }
+
+        // WSLc routes egress through the cooperative proxy but does not forward
+        // host lists to it, and a 'block' default (the WSLc default) yields no
+        // outbound networking / a drop-floor that can't even reach the proxy.
+        // Require an 'allow' default with no host lists so the proxy is reachable.
+        if containment == ContainmentBackend::Wslc
+            && policy.network_proxy.is_enabled()
+            && (policy.default_network_policy == NetworkPolicy::Block
+                || !policy.allowed_hosts.is_empty()
+                || !policy.blocked_hosts.is_empty())
+        {
+            let msg = "WSLc: network.proxy requires network.defaultPolicy='allow' and no \
+                       allowedHosts/blockedHosts. A WSLc container reaches the proxy only \
+                       with outbound networking enabled, and host lists are enforced by the \
+                       proxy, not forwarded to it.";
+            logger.log_line(msg);
+            return Err(WxcError::ConfigParse(msg.to_string()));
         }
 
         // Bubblewrap is unprivileged by design; iptables-based enforcement
@@ -2434,6 +2518,107 @@ mod tests {
     }
 
     #[test]
+    fn capture_denials_block_injects_learning_mode_logging_capability() {
+        let json = r#"{
+            "process": {"commandLine": "print('test')"},
+            "containment": "processcontainer",
+            "processContainer": {"captureDenials": {"mode": "block"}}
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert!(
+            req.policy
+                .capabilities
+                .contains(&"learningModeLogging".to_string()),
+            "block capture must additively inject learningModeLogging: {:?}",
+            req.policy.capabilities
+        );
+        assert!(
+            !req.policy
+                .capabilities
+                .contains(&"permissiveLearningMode".to_string()),
+            "block must not inject permissiveLearningMode"
+        );
+    }
+
+    #[test]
+    fn capture_denials_allow_injects_permissive_learning_mode_capability() {
+        let json = r#"{
+            "process": {"commandLine": "print('test')"},
+            "containment": "processcontainer",
+            "processContainer": {"captureDenials": {"mode": "allow"}}
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert!(
+            req.policy
+                .capabilities
+                .contains(&"permissiveLearningMode".to_string()),
+            "allow capture must inject permissiveLearningMode: {:?}",
+            req.policy.capabilities
+        );
+    }
+
+    #[test]
+    fn capture_denials_default_injects_learning_mode_logging_capability() {
+        let json = r#"{
+            "process": {"commandLine": "print('test')"},
+            "containment": "processcontainer",
+            "processContainer": {"captureDenials": {}}
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert!(
+            req.policy
+                .capabilities
+                .contains(&"learningModeLogging".to_string()),
+            "default (block) capture must inject learningModeLogging: {:?}",
+            req.policy.capabilities
+        );
+    }
+
+    #[test]
+    fn capture_denials_allow_overrides_learning_mode_boolean() {
+        let json = r#"{
+            "process": {"commandLine": "print('test')"},
+            "containment": "processcontainer",
+            "processContainer": {
+                "learningMode": true,
+                "capabilities": ["internetClient"],
+                "captureDenials": {"mode": "allow"}
+            }
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert!(
+            req.policy
+                .capabilities
+                .contains(&"internetClient".to_string()),
+            "the workload's own capabilities must be preserved"
+        );
+        assert!(
+            req.policy
+                .capabilities
+                .contains(&"permissiveLearningMode".to_string()),
+            "allow capture must inject permissiveLearningMode"
+        );
+        assert!(
+            !req.policy
+                .capabilities
+                .contains(&"learningModeLogging".to_string()),
+            "allow capture must remove deny-and-record mode"
+        );
+        assert!(
+            !logger.get_buffer().contains("restrictions remain enforced"),
+            "parser must not log the superseded deny-and-record mode"
+        );
+    }
+
+    #[test]
     fn capture_denials_unknown_mode_rejected() {
         let json = r#"{
             "process": {"commandLine": "print('test')"},
@@ -2456,7 +2641,7 @@ mod tests {
     #[test]
     fn capture_denials_accepts_valid_absolute_output_path() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("denials.etl");
+        let path = dir.path().join("denials.json");
         let path_json = serde_json::to_string(&path.to_string_lossy()).unwrap();
         let json = format!(
             r#"{{
@@ -2480,7 +2665,7 @@ mod tests {
         let json = r#"{
             "process": {"commandLine": "print('test')"},
             "containment": "processcontainer",
-            "processContainer": {"captureDenials": {"outputPath": "relative/denials.etl"}}
+            "processContainer": {"captureDenials": {"outputPath": "relative/denials.json"}}
         }"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
@@ -2496,7 +2681,7 @@ mod tests {
     fn capture_denials_missing_parent_dir_rejected() {
         let dir = tempfile::tempdir().expect("temp dir");
         // Parent directory `nonexistent` is never created.
-        let path = dir.path().join("nonexistent").join("denials.etl");
+        let path = dir.path().join("nonexistent").join("denials.json");
         let path_json = serde_json::to_string(&path.to_string_lossy()).unwrap();
         let json = format!(
             r#"{{
@@ -3543,6 +3728,161 @@ mod tests {
         assert_eq!(req.policy.default_network_policy, NetworkPolicy::Block);
         // Warning is best-effort surfaced via the logger; the request still
         // succeeds.
+    }
+
+    #[test]
+    fn proxy_accepted_with_wslc_url_form() {
+        // WSLc supports the cooperative env-var proxy via a routable `url`.
+        let json = r#"{
+            "version": "0.6.0-alpha",
+            "containment": "wslc",
+            "process": {"commandLine": "echo hi"},
+            "network": {
+                "proxy": {"url": "http://proxy.example:8080"},
+                "defaultPolicy": "allow"
+            }
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert!(req.policy.network_proxy.is_enabled());
+        assert!(!req.policy.network_proxy.builtin_test_server);
+        let addr = req.policy.network_proxy.address.as_ref().unwrap();
+        assert_eq!(addr.to_url(), "http://proxy.example:8080");
+    }
+
+    #[test]
+    fn proxy_rejects_wslc_localhost_form() {
+        // The localhost form implies a host-loopback proxy, which a WSLc
+        // container (own network namespace) cannot reach. Must be rejected.
+        let json = r#"{
+            "version": "0.6.0-alpha",
+            "containment": "wslc",
+            "process": {"commandLine": "echo hi"},
+            "network": {"proxy": {"localhost": 8080}}
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let err = load_request(&encoded, &mut logger, true).unwrap_err();
+        assert!(
+            format!("{err}").contains("WSLc: network.proxy must use the 'url' form"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn proxy_rejects_wslc_builtin_test_server() {
+        // builtinTestServer spins up an MXC-run in-host proxy, unreachable
+        // from a WSLc container. Must be rejected with the url-form message.
+        let json = r#"{
+            "version": "0.6.0-alpha",
+            "containment": "wslc",
+            "process": {"commandLine": "echo hi"},
+            "network": {"proxy": {"builtinTestServer": true}}
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let err = load_request(&encoded, &mut logger, true).unwrap_err();
+        assert!(
+            format!("{err}").contains("WSLc: network.proxy must use the 'url' form"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn proxy_rejects_non_http_scheme() {
+        // Non-HTTP schemes are silently ignored by many clients when injected
+        // as HTTP(S)_PROXY, which fails open. Reject at parse time.
+        for url in ["socks5://proxy.example:1080", "ftp://proxy.example:21"] {
+            let json = format!(
+                r#"{{
+                    "process": {{"commandLine": "echo hi"}},
+                    "containment": "processcontainer",
+                    "network": {{"proxy": {{"url": "{url}"}}}}
+                }}"#
+            );
+            let encoded = base64_encode(json.as_bytes());
+            let mut logger = test_logger();
+            let err = load_request(&encoded, &mut logger, true).unwrap_err();
+            assert!(
+                format!("{err}").contains("must use the 'http' or 'https' scheme"),
+                "expected scheme rejection for {url}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_scheme_error_redacts_credentials() {
+        // A rejected proxy URL must not echo embedded `user:password@`
+        // userinfo into the error (which reaches the diagnostic/log stream).
+        let json = r#"{
+            "process": {"commandLine": "echo hi"},
+            "containment": "processcontainer",
+            "network": {"proxy": {"url": "socks5://alice:s3cr3t@proxy.example:1080"}}
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+        let err = load_request(&encoded, &mut logger, true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must use the 'http' or 'https' scheme"),
+            "expected scheme rejection, got: {msg}"
+        );
+        assert!(
+            !msg.contains("s3cr3t") && !msg.contains("alice:s3cr3t"),
+            "credentials leaked into error: {msg}"
+        );
+        assert!(
+            msg.contains("***@proxy.example"),
+            "expected redacted userinfo in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_rejects_wslc_url_with_block_default() {
+        // A WSLc url proxy needs outbound networking; the default 'block'
+        // policy (defaultPolicy omitted) leaves the proxy unreachable.
+        let json = r#"{
+            "version": "0.6.0-alpha",
+            "containment": "wslc",
+            "process": {"commandLine": "echo hi"},
+            "network": {"proxy": {"url": "http://proxy.example:8080"}}
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let err = load_request(&encoded, &mut logger, true).unwrap_err();
+        assert!(
+            format!("{err}").contains("requires network.defaultPolicy='allow'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn proxy_rejects_wslc_url_with_host_lists() {
+        // Host lists are not forwarded to the proxy; reject to avoid silently
+        // weaker enforcement.
+        let json = r#"{
+            "version": "0.6.0-alpha",
+            "containment": "wslc",
+            "process": {"commandLine": "echo hi"},
+            "network": {
+                "proxy": {"url": "http://proxy.example:8080"},
+                "defaultPolicy": "allow",
+                "allowedHosts": ["example.com"]
+            }
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let err = load_request(&encoded, &mut logger, true).unwrap_err();
+        assert!(
+            format!("{err}").contains("allowedHosts/blockedHosts"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
