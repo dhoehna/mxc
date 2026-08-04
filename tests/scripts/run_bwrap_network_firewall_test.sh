@@ -73,12 +73,17 @@ fi
 
 # ---------------------------------------------------------------------------
 # Conditional live run: skip loudly when a prerequisite is missing so a skip
-# never reads as a pass.
+# never reads as a pass. Exit 77 is the Automake convention for "skipped";
+# run_bwrap_all_tests.sh counts it separately and never as a pass. Exiting 0
+# here would make a host without root, bwrap, or iptables report this test as
+# passing while none of the live behaviour ran.
 # ---------------------------------------------------------------------------
+SKIP_EXIT=77
+
 skip_live() {
     echo "SKIP: Bubblewrap no-veth firewall behaviour UNVERIFIED — $*"
     echo "      (fixture drift guard still ran and passed)"
-    exit 0
+    exit "$SKIP_EXIT"
 }
 
 LXC_EXEC="$REPO_DIR/src/target/release/lxc-exec"
