@@ -37,7 +37,11 @@
 #       too (host-originated packets reach the container's INPUT); the peer
 #       container is kept as a representative external-inbound client. If the
 #       peer container cannot be launched the layer reports INCONCLUSIVE (it
-#       never silently passes).
+#       never silently passes). The client is launched only AFTER the server
+#       signals NETCHECK_SERVER_READY (bounded wait); if the server never
+#       becomes ready the layer reports UNREADY and fails the suite, so a
+#       "connection refused" caused by a server that never started can never be
+#       misread as proof the firewall blocked the connection.
 #
 # Requires root (container management + iptables), like run_lxc_all_tests.sh.
 set -uo pipefail
@@ -64,13 +68,38 @@ if [ ! -f "$LXC_EXEC" ]; then
 fi
 
 # --- Build the param-driven helper as a static musl binary (runs in Alpine) ---
-echo "== Building netcheck helper (static musl) =="
-if ! rustup target list --installed 2>/dev/null | grep -q '^x86_64-unknown-linux-musl$'; then
-    rustup target add x86_64-unknown-linux-musl
+#
+# The helper executes INSIDE an Alpine container that shares the host's CPU
+# architecture, so a helper built for the wrong arch cannot exec there. LXC is
+# supported on Linux x64 AND ARM64 (README.md "Platforms"; build.sh's `uname -m`
+# switch, x86_64|aarch64), so select the musl target matching the host arch
+# instead of hard-coding x86_64 — which on an aarch64 host produced an x86_64
+# binary that silently fails to run in the container. Any other architecture is
+# skipped honestly (loudly, and not as a pass) rather than building a helper
+# that cannot execute.
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+    x86_64)
+        MUSL_TARGET="x86_64-unknown-linux-musl"
+        ;;
+    aarch64 | arm64)
+        MUSL_TARGET="aarch64-unknown-linux-musl"
+        ;;
+    *)
+        echo "SKIP: no netcheck helper can be produced for host architecture '$HOST_ARCH'."
+        echo "SKIP: this LXC local-network E2E supports x86_64 and aarch64 only; a helper built"
+        echo "SKIP: for another arch cannot exec inside the Alpine container, so nothing was"
+        echo "SKIP: tested. This is an honest skip, NOT a pass."
+        exit 0
+        ;;
+esac
+echo "== Building netcheck helper (static musl, $MUSL_TARGET) =="
+if ! rustup target list --installed 2>/dev/null | grep -q "^${MUSL_TARGET}\$"; then
+    rustup target add "$MUSL_TARGET"
 fi
 mkdir -p "$HELPER_DIR"
 rustc --edition 2021 -O \
-    --target x86_64-unknown-linux-musl \
+    --target "$MUSL_TARGET" \
     -C target-feature=+crt-static \
     "$HELPER_SRC" -o "$HELPER_BIN"
 chmod 0755 "$HELPER_DIR" "$HELPER_BIN"
@@ -81,6 +110,7 @@ rule_fail=0
 behavior_pass=0
 behavior_fail=0
 behavior_inconclusive=0
+behavior_unready=0
 refused_pass=0
 refused_fail=0
 
@@ -228,7 +258,32 @@ run_case() {
 
     # [BEHAVIOR] connect from a PEER container so the traffic is inbound to the
     # server container and actually traverses the server's INPUT-chain hook.
-    if [ -n "$ip" ]; then
+    #
+    # Before connecting, wait for a POSITIVE readiness signal from the server.
+    # Without it, a client `Connection refused` — because the server helper
+    # never started or had not yet bound its socket — surfaces below as
+    # NETCHECK_CONNECT_FAIL and is classified 'blocked', which for the deny case
+    # (want=blocked) is scored a PASS: a FALSE PASS that credits the firewall
+    # for a failure that was really "server not up". The server prints
+    # `NETCHECK_SERVER_READY` to its stdout (captured in $server_log) only after
+    # `TcpListener::bind` succeeds (tests/helpers/netcheck/netcheck.rs), so poll
+    # for it with a bounded timeout, and stop early if the bind is reported
+    # failed. "Server never became ready" is reported as an honest UNREADY that
+    # fails the suite — never as a policy-blocked success.
+    local server_log="/tmp/netcheck_${cid}.log"
+    local server_ready=0 k
+    for k in $(seq 1 40); do
+        if grep -q 'NETCHECK_SERVER_READY' "$server_log" 2>/dev/null; then
+            server_ready=1
+            break
+        fi
+        if grep -q 'NETCHECK_BIND_FAIL' "$server_log" 2>/dev/null; then
+            break
+        fi
+        sleep 0.25
+    done
+
+    if [ -n "$ip" ] && [ "$server_ready" -eq 1 ]; then
         local client_cfg="/tmp/lxc_client_${cid}.json"
         local client_log="/tmp/netcheck_client_${cid}.log"
         write_client_config "$client_cfg" "$ip"
@@ -252,6 +307,14 @@ run_case() {
             behavior_fail=$((behavior_fail + 1))
         fi
         rm -f "$client_cfg"
+    elif [ -n "$ip" ]; then
+        # IP came up but the server never signalled readiness (or its bind
+        # failed). Do NOT launch the client: a refusal here proves nothing about
+        # the firewall. Fail the suite rather than misread it as 'blocked'.
+        echo "[BEHAVIOR] UNREADY  server never signalled NETCHECK_SERVER_READY within timeout;"
+        echo "                    not connecting — a refusal here would be 'server not up', not"
+        echo "                    'policy blocked'. Failing honestly (see $server_log)."
+        behavior_unready=$((behavior_unready + 1))
     else
         echo "[BEHAVIOR] INCONCLUSIVE  no container IP discovered for $cid"
         behavior_inconclusive=$((behavior_inconclusive + 1))
@@ -270,8 +333,10 @@ echo
 echo "==================== SUMMARY ===================="
 echo "[RULE]     pass=$rule_pass fail=$rule_fail"
 echo "[REFUSED]  pass=$refused_pass fail=$refused_fail"
-echo "[BEHAVIOR] pass=$behavior_pass fail=$behavior_fail inconclusive=$behavior_inconclusive"
-# Fail on any rule mismatch, any refusal mismatch, or any decisive behavioral
-# mismatch. INCONCLUSIVE (peer container could not run) does not fail the suite
-# but is reported above.
-[ "$rule_fail" -eq 0 ] && [ "$refused_fail" -eq 0 ] && [ "$behavior_fail" -eq 0 ]
+echo "[BEHAVIOR] pass=$behavior_pass fail=$behavior_fail unready=$behavior_unready inconclusive=$behavior_inconclusive"
+# Fail on any rule mismatch, any refusal mismatch, any decisive behavioral
+# mismatch, or any server-never-ready case (a behavior layer that could not run
+# must not look green). INCONCLUSIVE (peer *client* container could not run)
+# does not fail the suite but is reported above.
+[ "$rule_fail" -eq 0 ] && [ "$refused_fail" -eq 0 ] && [ "$behavior_fail" -eq 0 ] \
+    && [ "$behavior_unready" -eq 0 ]

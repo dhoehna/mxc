@@ -11,9 +11,16 @@
 //! this manager only installs the default-deny chain.
 //!
 //! **Dual-stack.** A dual-stack container is reachable over IPv4 or IPv6, so an
-//! IPv4-only chain would let IPv6 inbound bypass the deny entirely. Every rule
-//! is installed through `iptables` and, when the family is usable, `ip6tables`;
-//! teardown removes both. `ip6tables` being unusable is only safe when IPv6 is
+//! IPv4-only chain would let IPv6 inbound bypass the deny entirely. A rule set
+//! is installed through `iptables` and, when the family is usable, a
+//! separately built one through `ip6tables`; teardown removes both. The IPv6
+//! set is not a verbatim replay of the IPv4 set: because IPv6 uses ICMPv6
+//! Neighbor Discovery (RFC 4861) in place of IPv4's layer-2 ARP, and ND *is*
+//! filtered by `ip6tables`, the IPv6 chain additionally accepts the ICMPv6
+//! control-plane types (see `IpFamily` / `ICMPV6_ALLOW_TYPES`) so a hardened
+//! default-deny container keeps working IPv6 address resolution and
+//! autoconfiguration while ordinary new inbound connections stay dropped.
+//! `ip6tables` being unusable is only safe when IPv6 is
 //! positively known to be disabled on the host (no `/proc/net/if_inet6`
 //! addresses): there the IPv4 chain is enforced alone. When IPv6 is live but
 //! `ip6tables` cannot run, the inbound deny is unenforceable for that family,
@@ -63,12 +70,73 @@ pub struct NetworkIptablesManager {
 
 /// The IP families the inbound chain may exist in. A dual-stack container is
 /// reachable over either family, so a chain that lives only in IPv4 lets IPv6
-/// inbound bypass the default-deny entirely. Every rule this manager emits is
-/// family-agnostic (interface, connection-state, and chain matches — no IP
-/// literals), so the same argv is valid for both binaries. Install replays each
-/// rule through IPv4 and, when `ip6tables` is usable, IPv6; teardown is
-/// best-effort over both families (a stale `-D`/`-F`/`-X` simply no-ops).
+/// inbound bypass the default-deny entirely. Teardown is family-agnostic (the
+/// `-D`/`-F`/`-X` chain operations carry no IP literals), so this constant
+/// drives the best-effort remove path over both families (a stale
+/// `-D`/`-F`/`-X` simply no-ops). Install is *not* family-agnostic: see
+/// [`IpFamily`] and [`NetworkIptablesManager::build_firewall_rules`], because
+/// the IPv6 chain must additionally accept ICMPv6 Neighbor Discovery.
 const IPTABLES_BINARIES: [&str; 2] = ["iptables", "ip6tables"];
+
+/// IP family an inbound chain is being built for.
+///
+/// The two families are *not* interchangeable at install time. IPv4 address
+/// resolution is ARP, a layer-2 protocol that never traverses `iptables`, so
+/// the IPv4 chain needs no special allowances. IPv6 replaces ARP with ICMPv6
+/// Neighbor Discovery (RFC 4861) — Neighbor/Router Solicitation and
+/// Advertisement — which rides on IPv6 and *is* filtered by `ip6tables`.
+/// Inbound ND packets are connection-state `NEW`, so replaying the IPv4 rule
+/// set (a single `--state NEW` accept-or-drop then a terminal `DROP`) into
+/// `ip6tables` drops ND and breaks IPv6 address resolution and stateless
+/// autoconfiguration. [`IpFamily::V6`] therefore additionally permits the
+/// ICMPv6 control-plane types in [`ICMPV6_ALLOW_TYPES`]; [`IpFamily::V4`] does
+/// not, so IPv4 behavior is unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IpFamily {
+    V4,
+    V6,
+}
+
+/// ICMPv6 message types the IPv6 inbound chain accepts so a hardened
+/// default-deny container still has a functioning IPv6 stack. Numeric values
+/// (rather than names) are used because `ip6tables --icmpv6-type` accepts them
+/// on every version and they cannot be mis-spelled (the named forms vary
+/// `neighbour`/`neighbor` across builds); each is annotated with its RFC 4443
+/// name. Selection follows RFC 4890 ("Recommendations for Filtering ICMPv6
+/// Messages in Firewalls"):
+///
+///   - 133–136 Neighbor Discovery (RS/RA/NS/NA) — RFC 4890 §4.4.1 "must not be
+///     dropped"; without these IPv6 address resolution and SLAAC stop working.
+///   - 130–132, 143 Multicast Listener Discovery — RFC 4890 §4.3.1; required
+///     for multicast group membership, which ND itself relies on
+///     (solicited-node multicast).
+///   - 1–4 essential errors (destination-unreachable, packet-too-big,
+///     time-exceeded, parameter-problem) — RFC 4890 §4.4.1 "must not be
+///     dropped"; packet-too-big (2) in particular is required for Path MTU
+///     Discovery.
+///
+/// Echo request/reply (128/129) and Redirect (137) are deliberately *omitted*:
+/// leaving inbound ping and router redirects dropped keeps the hardened
+/// posture (RFC 4890 permits dropping echo at a firewall), while every type
+/// above is needed for basic IPv6 operation. Ordinary `NEW` inbound
+/// connections are still dropped — only these control-plane types are opened.
+const ICMPV6_ALLOW_TYPES: [&str; 12] = [
+    // Neighbor Discovery (RFC 4861), RFC 4890 §4.4.1.
+    "133", // router-solicitation
+    "134", // router-advertisement
+    "135", // neighbour-solicitation
+    "136", // neighbour-advertisement
+    // Multicast Listener Discovery (RFC 2710 / RFC 3810), RFC 4890 §4.3.1.
+    "130", // multicast-listener-query
+    "131", // multicast-listener-report
+    "132", // multicast-listener-done
+    "143", // multicast-listener-report-v2
+    // Essential error messages, RFC 4890 §4.4.1.
+    "1", // destination-unreachable
+    "2", // packet-too-big (Path MTU Discovery)
+    "3", // time-exceeded
+    "4", // parameter-problem
+];
 
 impl NetworkIptablesManager {
     /// Create a new manager for the given container name.
@@ -164,7 +232,12 @@ impl NetworkIptablesManager {
             }
         ));
 
-        let rules = Self::build_firewall_rules(&self.chain_name, policy, self.netns_pid.is_some());
+        let ipv4_rules = Self::build_firewall_rules(
+            &self.chain_name,
+            policy,
+            self.netns_pid.is_some(),
+            IpFamily::V4,
+        );
 
         // IPv6 handling. The inbound chain is *always* default-deny (terminal
         // DROP) on the path that reaches here — the permissive `allowLocalNetwork`
@@ -196,13 +269,26 @@ impl NetworkIptablesManager {
             );
         }
 
-        // Install each rule in IPv4, and in IPv6 too when the family is usable,
+        // Install the IPv4 rule set through `iptables`, and — when the family
+        // is usable — a *separately built* IPv6 rule set through `ip6tables`,
         // so IPv6 inbound cannot bypass an IPv4-only deny on a dual-stack
-        // container.
-        for rule in &rules {
+        // container. The two sets are not identical: the IPv6 set additionally
+        // permits ICMPv6 Neighbor Discovery (see `IpFamily`), so replaying the
+        // IPv4 argv verbatim into `ip6tables` — which would drop ND and break
+        // IPv6 — no longer happens.
+        for rule in &ipv4_rules {
             let argv: Vec<&str> = rule.iter().map(String::as_str).collect();
             Self::run_iptables("iptables", self.netns_pid, &argv, logger)?;
-            if ipv6_enabled {
+        }
+        if ipv6_enabled {
+            let ipv6_rules = Self::build_firewall_rules(
+                &self.chain_name,
+                policy,
+                self.netns_pid.is_some(),
+                IpFamily::V6,
+            );
+            for rule in &ipv6_rules {
+                let argv: Vec<&str> = rule.iter().map(String::as_str).collect();
                 Self::run_iptables("ip6tables", self.netns_pid, &argv, logger)?;
             }
         }
@@ -218,6 +304,15 @@ impl NetworkIptablesManager {
     /// host. Mirrors the bubblewrap `build_args` and seatbelt `build_profile`
     /// builders.
     ///
+    /// `family` selects the IP family. The IPv4 and IPv6 rule sets are
+    /// intentionally *not* identical: the IPv6 set additionally accepts the
+    /// ICMPv6 control-plane types in [`ICMPV6_ALLOW_TYPES`] (Neighbor Discovery,
+    /// Multicast Listener Discovery, and essential errors) so a hardened
+    /// default-deny container keeps a working IPv6 stack. The IPv4 set carries
+    /// no ICMP allowances — IPv4 uses ARP, a layer-2 protocol iptables never
+    /// sees — so [`IpFamily::V4`] reproduces the historical IPv4 sequence
+    /// exactly. See [`IpFamily`].
+    ///
     /// **Inbound control (`allowLocalNetwork`).** The chain is hooked
     /// into the container's `INPUT` chain (executed inside the container netns
     /// by the caller), so every packet it sees is destined *to a container
@@ -227,7 +322,12 @@ impl NetworkIptablesManager {
     /// a terminal `DROP` makes inbound default-deny regardless of the egress
     /// policy. `hook` gates the `-I INPUT` jump so we never attach to the
     /// host's `INPUT` chain when there is no container netns to enter.
-    fn build_firewall_rules(chain: &str, policy: &ContainerPolicy, hook: bool) -> Vec<Vec<String>> {
+    fn build_firewall_rules(
+        chain: &str,
+        policy: &ContainerPolicy,
+        hook: bool,
+        family: IpFamily,
+    ) -> Vec<Vec<String>> {
         fn argv(args: &[&str]) -> Vec<String> {
             args.iter().map(|s| s.to_string()).collect()
         }
@@ -257,6 +357,29 @@ impl NetworkIptablesManager {
             "-j",
             accept,
         ]));
+
+        // IPv6 only: permit the ICMPv6 control-plane types a functioning IPv6
+        // stack needs (Neighbor Discovery, Multicast Listener Discovery, and
+        // essential errors). These arrive as `NEW`, so they MUST precede the
+        // `--state NEW` decision and the terminal `DROP` below or address
+        // resolution and autoconfiguration break. IPv4 emits nothing here —
+        // ARP is layer 2 and never reaches iptables — so the IPv4 sequence is
+        // unchanged. See `ICMPV6_ALLOW_TYPES` for the type list and RFC 4890
+        // citation.
+        if family == IpFamily::V6 {
+            for icmpv6_type in ICMPV6_ALLOW_TYPES {
+                rules.push(argv(&[
+                    "-A",
+                    chain,
+                    "-p",
+                    "icmpv6",
+                    "--icmpv6-type",
+                    icmpv6_type,
+                    "-j",
+                    accept,
+                ]));
+            }
+        }
 
         // allowLocalNetwork toggle: accept or drop NEW inbound connections to
         // the container's listening sockets.
@@ -502,6 +625,7 @@ mod tests {
             "MXC-t",
             &policy_with(allow_local, NetworkPolicy::Block),
             hook,
+            IpFamily::V4,
         )
     }
 
@@ -601,6 +725,7 @@ mod tests {
                 "MXC-t",
                 &policy_with(false, default.clone()),
                 true,
+                IpFamily::V4,
             );
             assert!(
                 has(&rules, &["-A", "MXC-t", "-j", "DROP"]),
@@ -653,5 +778,240 @@ mod tests {
             is(&rules[0], &["-N", "MXC-t"]),
             "chain must be created first"
         );
+    }
+
+    // ---- family-awareness: IPv4 pinned, IPv6 gains ICMPv6 ND ------------
+    //
+    // These pin the exact per-family argv so the fix for the "IPv4 rule set
+    // replayed verbatim into ip6tables" defect is covered by CI: IPv4 must be
+    // byte-for-byte its historical sequence (no ICMP allowances — ARP is
+    // layer 2 and never reaches iptables), while IPv6 must additionally permit
+    // the ICMPv6 Neighbor Discovery / MLD / essential-error types a working
+    // IPv6 stack needs, without opening ordinary new inbound.
+
+    fn build_family(allow_local: bool, hook: bool, family: IpFamily) -> Vec<Vec<String>> {
+        NetworkIptablesManager::build_firewall_rules(
+            "MXC-t",
+            &policy_with(allow_local, NetworkPolicy::Block),
+            hook,
+            family,
+        )
+    }
+
+    /// The IPv4 rule set must be exactly the historical sequence, in order —
+    /// this is the regression pin proving IPv4 behavior did not change when
+    /// IPv6 became family-aware.
+    #[test]
+    fn ipv4_full_sequence_is_pinned_exactly() {
+        let rules = build_family(false, true, IpFamily::V4);
+        let want: &[&[&str]] = &[
+            &["-N", "MXC-t"],
+            &["-A", "MXC-t", "-i", "lo", "-j", "ACCEPT"],
+            &[
+                "-A",
+                "MXC-t",
+                "-m",
+                "state",
+                "--state",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
+            ],
+            &["-A", "MXC-t", "-m", "state", "--state", "NEW", "-j", "DROP"],
+            &["-A", "MXC-t", "-j", "DROP"],
+            &["-I", "INPUT", "-j", "MXC-t"],
+        ];
+        assert_eq!(
+            rules.len(),
+            want.len(),
+            "IPv4 rule count changed: got {rules:?}"
+        );
+        for (i, expected) in want.iter().enumerate() {
+            assert!(
+                is(&rules[i], expected),
+                "IPv4 rule {i} changed: got {:?}, want {:?}",
+                rules[i],
+                expected
+            );
+        }
+    }
+
+    /// IPv4 must emit no ICMP/ICMPv6 rules at all — ARP is layer 2, so the IPv4
+    /// chain never needs a control-plane allowance.
+    #[test]
+    fn ipv4_emits_no_icmpv6_rules() {
+        for allow in [true, false] {
+            let rules = build_family(allow, true, IpFamily::V4);
+            assert!(
+                !rules
+                    .iter()
+                    .any(|r| r.iter().any(|a| a == "--icmpv6-type" || a == "icmpv6")),
+                "IPv4 chain must not emit any ICMPv6 rule (allow_local={allow})"
+            );
+        }
+    }
+
+    /// IPv6 must accept each Neighbor Discovery type (RS/RA/NS/NA), or inbound
+    /// ND is dropped by the NEW rule and IPv6 address resolution breaks.
+    #[test]
+    fn ipv6_permits_neighbor_discovery_types() {
+        let rules = build_family(false, true, IpFamily::V6);
+        for (num, name) in [
+            ("133", "router-solicitation"),
+            ("134", "router-advertisement"),
+            ("135", "neighbour-solicitation"),
+            ("136", "neighbour-advertisement"),
+        ] {
+            assert!(
+                has(
+                    &rules,
+                    &[
+                        "-A",
+                        "MXC-t",
+                        "-p",
+                        "icmpv6",
+                        "--icmpv6-type",
+                        num,
+                        "-j",
+                        "ACCEPT"
+                    ]
+                ),
+                "IPv6 chain must accept ICMPv6 type {num} ({name})"
+            );
+        }
+    }
+
+    /// IPv6 must accept the Multicast Listener Discovery and essential-error
+    /// types (packet-too-big is required for Path MTU Discovery).
+    #[test]
+    fn ipv6_permits_mld_and_essential_error_types() {
+        let rules = build_family(false, true, IpFamily::V6);
+        for (num, name) in [
+            ("130", "multicast-listener-query"),
+            ("131", "multicast-listener-report"),
+            ("132", "multicast-listener-done"),
+            ("143", "multicast-listener-report-v2"),
+            ("1", "destination-unreachable"),
+            ("2", "packet-too-big"),
+            ("3", "time-exceeded"),
+            ("4", "parameter-problem"),
+        ] {
+            assert!(
+                has(
+                    &rules,
+                    &[
+                        "-A",
+                        "MXC-t",
+                        "-p",
+                        "icmpv6",
+                        "--icmpv6-type",
+                        num,
+                        "-j",
+                        "ACCEPT"
+                    ]
+                ),
+                "IPv6 chain must accept ICMPv6 type {num} ({name})"
+            );
+        }
+    }
+
+    /// Every ICMPv6 accept must come before the `--state NEW` decision and the
+    /// terminal DROP, or ND (which is NEW) would be dropped before it matches.
+    #[test]
+    fn ipv6_icmpv6_accepts_precede_new_and_terminal_drop() {
+        let rules = build_family(false, true, IpFamily::V6);
+        let new = pos(
+            &rules,
+            &["-A", "MXC-t", "-m", "state", "--state", "NEW", "-j", "DROP"],
+        )
+        .expect("NEW rule must be emitted");
+        let terminal = rules
+            .iter()
+            .rposition(|r| is(r, &["-A", "MXC-t", "-j", "DROP"]))
+            .expect("terminal DROP must be emitted");
+        for num in ["133", "134", "135", "136", "130", "143", "2"] {
+            let at = pos(
+                &rules,
+                &[
+                    "-A",
+                    "MXC-t",
+                    "-p",
+                    "icmpv6",
+                    "--icmpv6-type",
+                    num,
+                    "-j",
+                    "ACCEPT",
+                ],
+            )
+            .unwrap_or_else(|| panic!("ICMPv6 type {num} accept must be emitted"));
+            assert!(
+                at < new,
+                "ICMPv6 type {num} accept must precede the NEW decision"
+            );
+            assert!(
+                at < terminal,
+                "ICMPv6 type {num} accept must precede the terminal DROP"
+            );
+        }
+    }
+
+    /// The IPv6 fix must not become a blanket ICMPv6 accept: only the specific
+    /// control-plane types are opened, and ordinary new inbound (and inbound
+    /// ping / redirects) stay dropped.
+    #[test]
+    fn ipv6_does_not_blanket_accept_icmpv6_or_new_inbound() {
+        let rules = build_family(false, true, IpFamily::V6);
+        // No untyped `-p icmpv6 -j ACCEPT` (would accept every ICMPv6 message).
+        assert!(
+            !has(&rules, &["-A", "MXC-t", "-p", "icmpv6", "-j", "ACCEPT"]),
+            "IPv6 chain must not blanket-accept all ICMPv6"
+        );
+        // Echo request (128) and Redirect (137) are deliberately not opened.
+        for num in ["128", "137"] {
+            assert!(
+                !has(
+                    &rules,
+                    &[
+                        "-A",
+                        "MXC-t",
+                        "-p",
+                        "icmpv6",
+                        "--icmpv6-type",
+                        num,
+                        "-j",
+                        "ACCEPT"
+                    ]
+                ),
+                "IPv6 chain must not accept ICMPv6 type {num}"
+            );
+        }
+        // Default-deny still holds: NEW inbound dropped, terminal DROP present.
+        assert!(
+            has(
+                &rules,
+                &["-A", "MXC-t", "-m", "state", "--state", "NEW", "-j", "DROP"]
+            ),
+            "IPv6 chain must still drop NEW inbound by default"
+        );
+        assert!(
+            has(&rules, &["-A", "MXC-t", "-j", "DROP"]),
+            "IPv6 chain must still end in a terminal DROP"
+        );
+    }
+
+    /// With `allowLocalNetwork: true` the IPv6 NEW decision flips to ACCEPT
+    /// just like IPv4 — the ICMPv6 allowances are independent of the toggle.
+    #[test]
+    fn ipv6_new_decision_follows_allow_local_toggle() {
+        let allow = build_family(true, true, IpFamily::V6);
+        assert!(has(
+            &allow,
+            &["-A", "MXC-t", "-m", "state", "--state", "NEW", "-j", "ACCEPT"]
+        ));
+        let deny = build_family(false, true, IpFamily::V6);
+        assert!(has(
+            &deny,
+            &["-A", "MXC-t", "-m", "state", "--state", "NEW", "-j", "DROP"]
+        ));
     }
 }
