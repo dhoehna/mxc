@@ -341,9 +341,30 @@ impl NetworkIptablesManager {
 
     /// Build the allow/deny rule args for a container policy.
     ///
-    /// Test-only: production uses [`Self::build_policy_rules_logged`] so each
-    /// destination is resolved exactly once. This resolves each entry a second
-    /// time relative to the warning pass and so must not be on the apply path.
+    /// Test-only shim over the shipping path [`Self::build_policy_rules_logged`]
+    /// so the rulegen spec assertions — including the allow-before-block
+    /// ordering that is a tracked security-semantics contract (AB#62830341) —
+    /// bind to the code that actually runs, not to a duplicate iteration. The
+    /// unresolved-host warning is irrelevant to rule generation, so it is
+    /// discarded to a buffer logger. Production must never call this: it takes
+    /// no logger and would resolve entries a second time relative to the
+    /// warning pass.
+    #[cfg(test)]
+    fn build_policy_rule_args(chain_name: &str, policy: &ContainerPolicy) -> FirewallRuleArgs {
+        let mut logger = wxc_common::logger::Logger::new(wxc_common::logger::Mode::Buffer);
+        Self::build_policy_rules_logged(chain_name, policy, &mut logger)
+    }
+
+    /// Resolve every allow/block entry exactly once and build the rule args
+    /// from that single resolution, logging a warning for any entry that
+    /// resolved to nothing. This is the shipping rule-generation path.
+    ///
+    /// Resolving once is a correctness requirement, not just an optimization:
+    /// the previous apply path resolved each host once for the warning pass
+    /// and again inside rule construction, and two lookups of the same name
+    /// can disagree — DNS round-robin returns a different address, or a TTL
+    /// expires between the calls — so the rule installed would not match the
+    /// rule that was validated and logged.
     ///
     /// NOTE — interim ordering (tracked by AB#62830341): rules are emitted in
     /// allow-list then block-list order, and iptables/ip6tables apply
@@ -352,37 +373,6 @@ impl NetworkIptablesManager {
     /// the allow and block lists is ACCEPTed. Reconciling this to the GA
     /// "deny-wins" ordering is owned by net-model-2 (AB#62830341); until then
     /// callers must not assume deny-precedence.
-    #[cfg(test)]
-    fn build_policy_rule_args(chain_name: &str, policy: &ContainerPolicy) -> FirewallRuleArgs {
-        let mut args = FirewallRuleArgs::default();
-        for host in &policy.allowed_hosts {
-            args.extend(Self::build_host_rule_args(
-                chain_name,
-                host,
-                &RuleAction::Allow,
-            ));
-        }
-        for host in &policy.blocked_hosts {
-            args.extend(Self::build_host_rule_args(
-                chain_name,
-                host,
-                &RuleAction::Deny,
-            ));
-        }
-        args
-    }
-
-    /// Resolve every allow/block entry exactly once and build the rule args
-    /// from that single resolution, logging a warning for any entry that
-    /// resolved to nothing.
-    ///
-    /// Resolving once is a correctness requirement, not just an optimization:
-    /// the previous apply path resolved each host once for the warning pass
-    /// and again inside rule construction, and two lookups of the same name
-    /// can disagree — DNS round-robin returns a different address, or a TTL
-    /// expires between the calls — so the rule installed would not match the
-    /// rule that was validated and logged. The allow-before-block order and
-    /// the interim AB#62830341 ordering semantics are unchanged.
     fn build_policy_rules_logged(
         chain_name: &str,
         policy: &ContainerPolicy,
