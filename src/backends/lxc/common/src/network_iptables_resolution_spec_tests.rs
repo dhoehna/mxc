@@ -189,30 +189,64 @@ fn assert_buckets_are_family_pure(input: &str, resolved: &ResolvedDestinations) 
     }
 }
 
-// The DNS branch is where the dual-stack bypass lived: AAAA records must land in
-// the v6 bucket. `localhost` alone cannot pin this -- on many hosts it resolves
-// to 127.0.0.1 only, leaving the v6 DNS arm unexecuted -- so this uses
-// well-known dual-stack names and asserts family purity on whatever comes back.
-//
-// If no name yields an AAAA record the environment has no v6 DNS. The purity
-// assertions still run and the shortfall is reported loudly rather than passing
-// silently. End-to-end coverage lives in run_lxc_network_dualstack_test.sh.
+// The dual-stack bypass lived in the DNS family split: an AAAA record must land
+// in the v6 bucket and must never leak into the v4 bucket. The split is a pure
+// function (`bucket_resolved_addrs`), so it is exercised here with injected A
+// and AAAA addresses -- no dependency on the host having live IPv6 DNS -- and
+// the presence of a v6 destination is asserted **hard**. If the split routed
+// AAAA records into the v4 bucket, `resolved.ipv6` would be empty (failing the
+// non-empty assertion) and the v4 bucket would hold a value that does not parse
+// as IPv4 (failing family purity).
 #[test]
 fn aaaa_records_land_in_the_v6_bucket_and_never_in_the_v4_bucket() {
-    let hosts = ["dns.google", "one.one.one.one", "localhost"];
-    let mut saw_v6 = false;
+    let injected: Vec<IpAddr> = [
+        "93.184.216.34",
+        "2606:2800:220:1:248:1893:25c8:1946",
+        "8.8.8.8",
+        "2001:4860:4860::8888",
+    ]
+    .iter()
+    .map(|value| {
+        value
+            .parse::<IpAddr>()
+            .expect("injected test address must parse")
+    })
+    .collect();
 
-    for host in hosts {
+    let resolved = NetworkIptablesManager::bucket_resolved_addrs(injected);
+
+    assert_eq!(
+        resolved.ipv4.len(),
+        2,
+        "both injected A records must land in the v4 bucket, got {:?}",
+        resolved.ipv4
+    );
+    assert_eq!(
+        resolved.ipv6.len(),
+        2,
+        "both injected AAAA records must land in the v6 bucket, got {:?}",
+        resolved.ipv6
+    );
+    assert!(
+        !resolved.ipv6.is_empty(),
+        "AAAA records must produce at least one v6 destination; an empty v6 \
+         bucket means the IPv6 arm was dropped or misrouted into the v4 bucket"
+    );
+    assert_buckets_are_family_pure("injected A/AAAA mix", &resolved);
+}
+
+// Live characterization: over whatever the host's resolver returns for
+// well-known dual-stack names, the buckets must stay family-pure. This does not
+// depend on the host having IPv6 DNS -- the purity invariant holds for any
+// result -- and it does not paper over a missing v6 arm with a warning that
+// still passes. The deterministic proof that AAAA records reach the v6 bucket
+// lives in `aaaa_records_land_in_the_v6_bucket_and_never_in_the_v4_bucket`, and
+// end-to-end IPv6 rule coverage lives in run_lxc_network_dualstack_test.sh.
+#[test]
+fn live_dual_stack_resolution_keeps_buckets_family_pure() {
+    for host in ["dns.google", "one.one.one.one", "localhost"] {
         let resolved = NetworkIptablesManager::resolve_host(host);
         assert_buckets_are_family_pure(host, &resolved);
-        saw_v6 |= !resolved.ipv6.is_empty();
-    }
-
-    if !saw_v6 {
-        eprintln!(
-            "WARNING: no AAAA record resolved for any of {hosts:?}; the IPv6 DNS \
-             arm of resolve_host was not exercised by this run."
-        );
     }
 }
 

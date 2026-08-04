@@ -20,10 +20,19 @@ if [ ! -f "$LXC_EXEC" ]; then
     LXC_EXEC="$REPO_DIR/src/target/debug/lxc-exec"
 fi
 
-if [ ! -f "$LXC_EXEC" ]; then
-    echo "Error: lxc-exec not found. Run build.sh first."
-    exit 1
-fi
+# An honest skip for a missing prerequisite: exit 77 so run_lxc_all_tests.sh
+# records SKIPPED rather than PASS. A suite that could not run must not look green.
+SKIP_EXIT=77
+skip() {
+    echo "SKIP: $1"
+    exit "$SKIP_EXIT"
+}
+
+[ "$(id -u)" -eq 0 ] || skip "requires root for iptables/ip6tables and LXC."
+command -v iptables >/dev/null 2>&1 || skip "iptables is not installed."
+command -v ip6tables >/dev/null 2>&1 || skip "ip6tables is not installed."
+command -v lxc-create >/dev/null 2>&1 || skip "LXC (lxc-create) is not installed."
+[ -f "$LXC_EXEC" ] || skip "lxc-exec binary not built; run build.sh first."
 
 CONFIG="$REPO_DIR/tests/configs/lxc_network_ipv6_cidr.json"
 CHAIN_NAME="MXC-CLI-LXC-Network-IPv6"
@@ -39,6 +48,19 @@ EXPECTED_HOSTS=(
 fail() {
     echo "FAIL: $1"
     exit 1
+}
+
+assert_programmed_rule() {
+    local table="$1" dest="$2" target="$3"
+    # The --debug log emits one line per destination rule actually generated,
+    # derived from the built rule args. Asserting it here fails if
+    # destination-rule emission is deleted while chain/default/hook logging is
+    # kept -- the exact vacuity flagged in review. This inspects the rule
+    # contents while the chain is being programmed rather than only checking
+    # post-run cleanup.
+    if ! grep -Fq "Programmed $table rule: -A $CHAIN_NAME -d $dest -j $target" <<<"$OUTPUT"; then
+        fail "expected $table rule for '$dest' -> $target was not programmed."
+    fi
 }
 
 assert_firewall_chain_cleaned_up() {
@@ -94,6 +116,17 @@ for host in "${EXPECTED_HOSTS[@]}"; do
         fail "host '$host' was not resolved."
     fi
 done
+
+# Inspect the actual destination rules that were generated -- not merely the
+# absence of an unresolved-host warning. Each allow entry must yield an ACCEPT
+# rule and each block entry a DROP rule, in the correct family's table, so that
+# deleting destination-rule emission fails this test.
+assert_programmed_rule iptables "140.82.112.0/20" ACCEPT
+assert_programmed_rule ip6tables "2606:50c0::/32" ACCEPT
+assert_programmed_rule ip6tables "2606:50c0:8000::153" ACCEPT
+assert_programmed_rule iptables "10.0.0.0/8" DROP
+assert_programmed_rule ip6tables "2001:db8::/32" DROP
+assert_programmed_rule ip6tables "fe80::1" DROP
 
 # A rejected rule aborts setup.
 if echo "$OUTPUT" | grep -qE "^(ip6?tables) .* failed:|Firewall setup failed:"; then

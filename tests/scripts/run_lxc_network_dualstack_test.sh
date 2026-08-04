@@ -15,10 +15,19 @@ if [ ! -f "$LXC_EXEC" ]; then
     LXC_EXEC="$REPO_DIR/src/target/debug/lxc-exec"
 fi
 
-if [ ! -f "$LXC_EXEC" ]; then
-    echo "Error: lxc-exec not found. Run build.sh first."
-    exit 1
-fi
+# An honest skip for a missing prerequisite: exit 77 so run_lxc_all_tests.sh
+# records SKIPPED rather than PASS. A suite that could not run must not look green.
+SKIP_EXIT=77
+skip() {
+    echo "SKIP: $1"
+    exit "$SKIP_EXIT"
+}
+
+[ "$(id -u)" -eq 0 ] || skip "requires root for iptables/ip6tables and LXC."
+command -v iptables >/dev/null 2>&1 || skip "iptables is not installed."
+command -v ip6tables >/dev/null 2>&1 || skip "ip6tables is not installed."
+command -v lxc-create >/dev/null 2>&1 || skip "LXC (lxc-create) is not installed."
+[ -f "$LXC_EXEC" ] || skip "lxc-exec binary not built; run build.sh first."
 
 CONFIG="$REPO_DIR/tests/configs/lxc_network_dualstack_hostname.json"
 CHAIN_NAME="MXC-CLI-LXC-Network-Dual"
@@ -50,6 +59,18 @@ OFFLINE_SAFE_HOSTS=(
 fail() {
     echo "FAIL: $1"
     exit 1
+}
+
+assert_programmed_rule() {
+    local table="$1" dest="$2" target="$3"
+    # The --debug log emits one line per destination rule actually generated,
+    # derived from the built rule args. Asserting it here fails if
+    # destination-rule emission is deleted while chain/default/hook logging is
+    # kept. This inspects the rule contents while the chain is being programmed
+    # rather than only checking that an unresolved-host warning is absent.
+    if ! grep -Fq "Programmed $table rule: -A $CHAIN_NAME -d $dest -j $target" <<<"$OUTPUT"; then
+        fail "expected $table rule for '$dest' -> $target was not programmed."
+    fi
 }
 
 assert_firewall_chain_cleaned_up() {
@@ -137,7 +158,9 @@ done
 ASSERT_RESOLVED_HOSTS=("${OFFLINE_SAFE_HOSTS[@]}")
 if external_dualstack_hosts_resolve; then
     ASSERT_RESOLVED_HOSTS=("${EXPECTED_HOSTS[@]}")
+    EXTERNAL_DUALSTACK=1
 else
+    EXTERNAL_DUALSTACK=0
     echo "SKIP: external dual-stack DNS unavailable; skipping external hostname resolution assertions."
 fi
 
@@ -153,6 +176,29 @@ for host in "${ASSERT_RESOLVED_HOSTS[@]}"; do
         fail "host '$host' was not resolved."
     fi
 done
+
+# Prove a positive IPv6 rule exists rather than only checking that no
+# unresolved-host warning appeared. The IPv6 literal and the IPv6 CIDR are
+# offline-safe and deterministic, so their v6 rules are always asserted.
+assert_programmed_rule ip6tables "2001:4860:4860::8888" ACCEPT
+assert_programmed_rule ip6tables "2001:db8::/32" DROP
+
+# The dual-stack point of AB#62830559: a hostname's AAAA record must become an
+# IPv6 rule. When external DNS is available, resolve an AAAA for a dual-stack
+# hostname ourselves and require the firewall to have programmed an IPv6 ACCEPT
+# rule for that exact address -- proving the hostname's AAAA became a v6 rule,
+# not merely that a warning was absent. When external DNS is unavailable this is
+# skipped loudly (never silently passed).
+if [ "$EXTERNAL_DUALSTACK" -eq 1 ]; then
+    aaaa=$(getent ahostsv6 dns.google 2>/dev/null | awk 'NF {print $1; exit}')
+    if [ -n "${aaaa:-}" ]; then
+        assert_programmed_rule ip6tables "$aaaa" ACCEPT
+    else
+        echo "SKIP: could not obtain an AAAA for dns.google; hostname-derived IPv6 rule not asserted."
+    fi
+else
+    echo "SKIP: external dual-stack DNS unavailable; hostname-derived IPv6 rule not asserted."
+fi
 
 if ! grep -Fq "Creating iptables/ip6tables chain:" <<<"$OUTPUT"; then
     fail "iptables/ip6tables chain creation was not logged."

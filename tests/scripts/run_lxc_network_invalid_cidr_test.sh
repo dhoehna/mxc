@@ -13,10 +13,19 @@ if [ ! -f "$LXC_EXEC" ]; then
     LXC_EXEC="$REPO_DIR/src/target/debug/lxc-exec"
 fi
 
-if [ ! -f "$LXC_EXEC" ]; then
-    echo "Error: lxc-exec not found. Run build.sh first."
-    exit 1
-fi
+# An honest skip for a missing prerequisite: exit 77 so run_lxc_all_tests.sh
+# records SKIPPED rather than PASS. A suite that could not run must not look green.
+SKIP_EXIT=77
+skip() {
+    echo "SKIP: $1"
+    exit "$SKIP_EXIT"
+}
+
+[ "$(id -u)" -eq 0 ] || skip "requires root for iptables/ip6tables and LXC."
+command -v iptables >/dev/null 2>&1 || skip "iptables is not installed."
+command -v ip6tables >/dev/null 2>&1 || skip "ip6tables is not installed."
+command -v lxc-create >/dev/null 2>&1 || skip "LXC (lxc-create) is not installed."
+[ -f "$LXC_EXEC" ] || skip "lxc-exec binary not built; run build.sh first."
 
 CONFIG="$REPO_DIR/tests/configs/lxc_network_invalid_cidr.json"
 CHAIN_NAME="MXC-CLI-LXC-Network-Inva"

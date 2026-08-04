@@ -86,6 +86,29 @@ enum Ip6tablesStatus {
     UnusableButIpv6Active,
 }
 
+/// Whether the host has egress-capable IPv6, or whether that could not be
+/// determined.
+///
+/// Distinguishing `Unknown` from `Inactive` keeps a failed read of
+/// `/proc/net/if_inet6` from being silently converted into a confirmed "IPv6
+/// is off". That conflation would fail open — proceeding with an IPv4-only
+/// policy that leaves IPv6 egress unfiltered — on a host whose IPv6 state we
+/// could not actually read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostIpv6State {
+    /// A non-loopback interface carries an IPv6 address, so IPv6 egress is
+    /// possible and must be filtered.
+    Active,
+    /// No IPv6 addresses beyond loopback (`::1` on `lo`), or the kernel never
+    /// created `/proc/net/if_inet6` at all (IPv6 disabled at boot). Either way
+    /// there is no IPv6 egress to filter.
+    Inactive,
+    /// The IPv6 state could not be read. This is deliberately **not** treated
+    /// as a confirmed negative: an unreadable `/proc/net/if_inet6` means "we
+    /// do not know", not "IPv6 is off".
+    Unknown,
+}
+
 /// Manages iptables rules for an LXC container's network policy.
 pub struct NetworkIptablesManager {
     /// Chain name unique to this container (e.g., "MXC-<container-name>").
@@ -205,14 +228,27 @@ impl NetworkIptablesManager {
             };
         }
 
-        // Try DNS resolution.
-        let mut resolved = ResolvedDestinations::default();
+        // Try DNS resolution. The family split is factored into
+        // `bucket_resolved_addrs` so it can be exercised with injected
+        // addresses, independent of whether this host has live IPv6 DNS.
         if let Ok(addrs) = format!("{}:0", host).to_socket_addrs() {
-            for addr in addrs {
-                match addr.ip() {
-                    IpAddr::V4(ip) => resolved.ipv4.push(ip.to_string()),
-                    IpAddr::V6(ip) => resolved.ipv6.push(ip.to_string()),
-                }
+            return Self::bucket_resolved_addrs(addrs.map(|addr| addr.ip()));
+        }
+        ResolvedDestinations::default()
+    }
+
+    /// Split resolved addresses into per-family destination buckets: every A
+    /// record lands in the IPv4 bucket and every AAAA record in the IPv6
+    /// bucket. Pure so the bucketing — the step that keeps an AAAA record from
+    /// being handed to `iptables` (the dual-stack bypass AB#62830559 exists to
+    /// close) — can be asserted with injected input rather than depending on
+    /// the host having live IPv6 DNS.
+    fn bucket_resolved_addrs<I: IntoIterator<Item = IpAddr>>(addrs: I) -> ResolvedDestinations {
+        let mut resolved = ResolvedDestinations::default();
+        for ip in addrs {
+            match ip {
+                IpAddr::V4(ip) => resolved.ipv4.push(ip.to_string()),
+                IpAddr::V6(ip) => resolved.ipv6.push(ip.to_string()),
             }
         }
         resolved
@@ -394,11 +430,21 @@ impl NetworkIptablesManager {
             if destinations.is_empty() {
                 logger.log_line(&format!("Warning: could not resolve host '{}'", host));
             }
-            args.extend(Self::build_resolved_destination_rule_args(
-                chain_name,
-                &destinations,
-                &action,
-            ));
+            let rule_args =
+                Self::build_resolved_destination_rule_args(chain_name, &destinations, &action);
+            // Log each destination rule that will be programmed, derived from
+            // the built args rather than from `destinations`, so that removing
+            // destination-rule emission also removes these lines. This is the
+            // observable surface the end-to-end scripts assert on to prove a
+            // rule for a specific destination was actually generated while the
+            // chain is live (a warning-only or chain-only run would not).
+            for rule in &rule_args.ipv4 {
+                logger.log_line(&format!("Programmed iptables rule: {}", rule.join(" ")));
+            }
+            for rule in &rule_args.ipv6 {
+                logger.log_line(&format!("Programmed ip6tables rule: {}", rule.join(" ")));
+            }
+            args.extend(rule_args);
         }
         args
     }
@@ -431,19 +477,86 @@ impl NetworkIptablesManager {
         }
     }
 
-    /// Whether the host has an active IPv6 stack, independent of `ip6tables`.
+    /// Whether the host has an active, egress-capable IPv6 stack, independent
+    /// of `ip6tables`.
+    ///
+    /// Reads `/proc/net/if_inet6` and defers the parse/classify decision to
+    /// [`Self::classify_host_ipv6_state`] so the file-content → state mapping
+    /// is unit-testable without a privileged Linux host.
+    fn host_ipv6_state() -> HostIpv6State {
+        Self::classify_host_ipv6_state(std::fs::read_to_string("/proc/net/if_inet6"))
+    }
+
+    /// Classify host IPv6 activity from the result of reading
+    /// `/proc/net/if_inet6`. Pure so every branch — including the read-error
+    /// case — can be exercised with injected input.
     ///
     /// `/proc/net/if_inet6` is populated by the kernel only when the IPv6
-    /// module is loaded, and lists every interface IPv6 address (including the
-    /// link-local `fe80::` address present on any interface with IPv6 up). A
-    /// host booted with `ipv6.disable=1` never creates the file, and a host
-    /// with IPv6 fully disabled via sysctl has no addresses to list; either
-    /// way there is no IPv6 egress to filter. A non-empty file means IPv6 is
-    /// live, so a broken `ip6tables` is a real gap rather than a no-op.
-    fn host_has_active_ipv6() -> bool {
-        match std::fs::read_to_string("/proc/net/if_inet6") {
-            Ok(contents) => contents.lines().any(|line| !line.trim().is_empty()),
-            Err(_) => false,
+    /// module is loaded, and lists one interface IPv6 address per line with
+    /// the device name in the final whitespace-delimited field. Loopback
+    /// (`::1` on `lo`) is present even on IPv4-only hosts and is not
+    /// egress-capable, so a line is treated as evidence of active IPv6 only
+    /// when its device is something other than `lo`.
+    ///
+    /// The error handling is deliberate:
+    /// - A `NotFound` error means the kernel never created the file (IPv6
+    ///   disabled at boot via `ipv6.disable=1`, or the module is not loaded).
+    ///   That is a genuine, confirmed negative → `Inactive`.
+    /// - Any other read error (permission denied, I/O error, `/proc` not
+    ///   mounted) leaves the state `Unknown` rather than asserting IPv6 is
+    ///   off. Converting such an error into `Inactive` would fail open.
+    fn classify_host_ipv6_state(read_result: std::io::Result<String>) -> HostIpv6State {
+        match read_result {
+            Ok(contents) => {
+                let has_egress_capable_interface = contents.lines().any(|line| {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        return false;
+                    }
+                    // The device name is the final field; loopback carries only
+                    // `::1`, which is not egress-capable.
+                    match line.split_whitespace().last() {
+                        Some(device) => device != "lo",
+                        None => false,
+                    }
+                });
+                if has_egress_capable_interface {
+                    HostIpv6State::Active
+                } else {
+                    HostIpv6State::Inactive
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HostIpv6State::Inactive,
+            Err(_) => HostIpv6State::Unknown,
+        }
+    }
+
+    /// Whether the IPv6 status probe should treat the host as capable of IPv6
+    /// egress. Reads the host state, logs the `Unknown` case distinctly so the
+    /// uncertainty is visible in the run output, then defers the mapping to the
+    /// pure [`Self::ipv6_state_treated_as_active`].
+    fn host_ipv6_egress_possible(logger: &mut Logger) -> bool {
+        let state = Self::host_ipv6_state();
+        if state == HostIpv6State::Unknown {
+            logger.log_line(
+                "Could not read /proc/net/if_inet6 to determine host IPv6 state; \
+                 treating IPv6 as potentially active and refusing to fail open.",
+            );
+        }
+        Self::ipv6_state_treated_as_active(state)
+    }
+
+    /// Map a host IPv6 state to whether the `ip6tables` probe should treat IPv6
+    /// as active. `Active` obviously counts; `Unknown` also counts, because an
+    /// unreadable IPv6 state must not be silently downgraded to "IPv6 is off" —
+    /// under a drop-required stance the safe reaction to "we do not know" is to
+    /// keep filtering (and, if `ip6tables` is then unusable, to fail closed)
+    /// rather than to leave IPv6 egress unfiltered. Pure so the decision is
+    /// unit-testable.
+    fn ipv6_state_treated_as_active(state: HostIpv6State) -> bool {
+        match state {
+            HostIpv6State::Active | HostIpv6State::Unknown => true,
+            HostIpv6State::Inactive => false,
         }
     }
 
@@ -467,7 +580,10 @@ impl NetworkIptablesManager {
             }
         };
 
-        let status = Self::classify_ip6tables_status(probe_succeeded, Self::host_has_active_ipv6());
+        let status = Self::classify_ip6tables_status(
+            probe_succeeded,
+            Self::host_ipv6_egress_possible(logger),
+        );
         match status {
             Ip6tablesStatus::Available => {}
             Ip6tablesStatus::KernelIpv6Disabled => {
@@ -816,6 +932,10 @@ mod lifecycle_spec_tests;
 #[cfg(test)]
 #[path = "network_iptables_ip6status_spec_tests.rs"]
 mod ip6status_spec_tests;
+
+#[cfg(test)]
+#[path = "network_iptables_ipv6state_spec_tests.rs"]
+mod ipv6state_spec_tests;
 
 #[cfg(test)]
 mod tests {

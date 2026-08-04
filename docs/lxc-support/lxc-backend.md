@@ -120,7 +120,15 @@ Network policies are enforced with parallel `iptables` and `ip6tables` chains sc
 
 `allowedHosts` and `blockedHosts` entries may be bare IPv4/IPv6 literals, IPv4/IPv6 CIDR blocks, or hostnames. Hostnames are resolved to both A and AAAA records; IPv4 destinations are applied to the `iptables` chain and IPv6 destinations are applied to the `ip6tables` chain. Entries whose CIDR prefix is out of range for its family (or otherwise malformed) are reported as unresolved and skipped, leaving the rest of the policy in force. Host-list rules match all ports and protocols; port- and protocol-specific egress rules are not supported.
 
-If `ip6tables` is unavailable or IPv6 is disabled in the host kernel, MXC applies the IPv4 chain, skips IPv6 rules, and logs a warning with the number of unapplied IPv6 rules. On such hosts, IPv6 egress is unfiltered.
+Before programming the IPv6 chain, MXC probes `ip6tables` with a read-only `ip6tables -S` and classifies the result three ways:
+
+| Classification | Condition | Behavior |
+|----------------|-----------|----------|
+| `Available` | The `ip6tables` probe succeeds | Programs the parallel `ip6tables` chain alongside the IPv4 chain |
+| `KernelIpv6Disabled` | The probe fails **and** the host has no active IPv6 | Skips the IPv6 chain and logs that there is no IPv6 egress to filter — safe, because there is nothing to filter |
+| `UnusableButIpv6Active` | The probe fails **and** the host has active IPv6 | **Fails firewall setup** rather than applying an IPv4-only policy that would silently leave IPv6 egress unfiltered |
+
+Host IPv6 activity is read from `/proc/net/if_inet6`: a non-loopback interface with an IPv6 address counts as active, while loopback-only `::1` on `lo` (present even on IPv4-only hosts) does not. If that file cannot be read at all — as opposed to being absent, which means IPv6 is disabled — the state is treated as *unknown* rather than as a confirmed "IPv6 is off", so an unreadable IPv6 state fails closed instead of leaving IPv6 unfiltered.
 
 The chains are hooked into `FORWARD` for container egress by matching the host-side veth as the input interface. If MXC cannot discover the container veth, it skips the `FORWARD` hook with a warning rather than applying host-wide rules.
 
