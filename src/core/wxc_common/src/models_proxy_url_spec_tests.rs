@@ -247,7 +247,8 @@ fn an_ipv6_target_ip_is_bracketed_in_the_rewrite_output() {
         "input={input:?} — port must survive; output was {out:?}"
     );
     // Strongest assertion: the output must be a parseable URL with [::1] as host.
-    let parsed = url::Url::parse(&out).expect(&format!("output {out:?} must be parseable"));
+    let parsed =
+        url::Url::parse(&out).unwrap_or_else(|_| panic!("output {out:?} must be parseable"));
     assert_eq!(
         parsed.host_str(),
         Some("[::1]"),
@@ -274,7 +275,7 @@ fn pinned_to_ip_with_ipv6_and_no_original_url_produces_parseable_url() {
         .as_deref()
         .expect("pinned_to_ip must set original_url");
     let parsed = url::Url::parse(url_str)
-        .expect(&format!("original_url={url_str:?} must be a parseable URL"));
+        .unwrap_or_else(|_| panic!("original_url={url_str:?} must be a parseable URL"));
     assert_eq!(
         parsed.host_str(),
         Some("[::1]"),
@@ -303,7 +304,7 @@ fn pinned_to_ip_with_ipv6_and_original_url_produces_parseable_url() {
         .as_deref()
         .expect("pinned_to_ip must set original_url");
     let parsed = url::Url::parse(url_str)
-        .expect(&format!("original_url={url_str:?} must be a parseable URL"));
+        .unwrap_or_else(|_| panic!("original_url={url_str:?} must be a parseable URL"));
     assert_eq!(
         parsed.host_str(),
         Some("[::1]"),
