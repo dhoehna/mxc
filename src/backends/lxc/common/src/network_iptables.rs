@@ -46,12 +46,23 @@ impl NetworkIptablesManager {
     /// must be reproducible across processes (the signal-time `force_cleanup`
     /// rebuilds the manager from the name alone) and across builds.
     ///
-    /// This is collision-*resistant*, not injective: the derivation compresses
-    /// an unbounded name space into a fixed-width string, so collisions still
-    /// exist in principle. The hash width is chosen so that finding one requires
-    /// ~2^56.9 work (infeasible to search adversarially) and accidental
-    /// collision follows a birthday bound of ~2^28 names. Injectivity over all
-    /// inputs is not — and cannot be — guaranteed.
+    /// This is a *collapse-avoidance* measure, not a security boundary, and not
+    /// injective: the derivation compresses an unbounded name space into a
+    /// fixed-width string, so collisions still exist in principle. Accidental
+    /// collision follows a birthday bound of ~2^28 names, which no realistic
+    /// host approaches. Adversarial collision is a different matter: 36^11 is
+    /// ~56.9 bits, so the generic birthday work to find *some* colliding pair is
+    /// only ~2^28.5, and FNV-1a is non-cryptographic — every step is a bijection
+    /// (XOR, then multiplication by an odd constant mod 2^64), so it is cheap to
+    /// invert rather than search. A caller that chooses `containerId` can
+    /// therefore construct a colliding pair sharing the 12-character sanitized
+    /// prefix, and make teardown of one name remove the other's chain.
+    ///
+    /// Defending against that needs persisted ownership — a provisioned random
+    /// token recorded at install time and verified before any flush or delete —
+    /// not a wider hash. Tracked in AB#62953349; the state-aware path bounds
+    /// this today by validating container names, but the one-shot LXC path
+    /// (`lxc_runner.rs:42-47`) still accepts arbitrary caller-supplied names.
     ///
     /// The result stays within the netfilter chain-name limit (28 characters):
     /// `"MXC-"` (4) + up to 12 sanitized characters + `"-"` (1) + 11 base36
@@ -70,7 +81,10 @@ impl NetworkIptablesManager {
     /// processes and builds so the teardown path can reconstruct the same chain
     /// from the name alone. The full 64 bits are retained — the previous
     /// implementation truncated to the low 32 bits, which collapsed the hash
-    /// space and made adversarial chain-name collisions a sub-second brute force.
+    /// space badly enough that unrelated names collided by accident. Widening it
+    /// removes the accidental collapse; it does not make the token unforgeable,
+    /// because FNV-1a is invertible. See `chain_name_for` for what that means
+    /// for a caller that picks its own `containerId`.
     fn name_hash(name: &str) -> u64 {
         const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
         const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
