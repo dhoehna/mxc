@@ -58,7 +58,11 @@ production configs and the dev schema when working on experimental features:
                                            // WSLC supports the cooperative proxy too, but only via
                                            // { "url": "http://proxy.example:8080" } (own-netns:
                                            //  localhost/builtinTestServer are unreachable, rejected)
-        "allowLocalNetwork": true          // "true" or "false"
+        "allowLocalNetwork": true          // "true" or "false" (default false).
+                                           // On LXC, "true" (permissive host-loopback
+                                           // inbound) is not yet implemented and the
+                                           // firewall path returns an error; "false" installs
+                                           // the inbound default-deny. See lxc-backend.md.
     },
 
     "processContainer": {                  // Process-based container-specific

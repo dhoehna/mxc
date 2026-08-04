@@ -8,7 +8,7 @@ On Linux, MXC uses LXC to create lightweight containers for script execution. Th
 
 - **Process isolation** via Linux namespaces (PID, mount, network, user)
 - **Filesystem isolation** via bind mounts with read-only/read-write/denied enforcement
-- **Network isolation** via iptables rules applied inside the container's network namespace (INPUT chain)
+- **Network isolation** via `iptables`/`ip6tables` inbound rules applied inside the container's network namespace (INPUT chain)
 
 ## Prerequisites
 
@@ -109,21 +109,40 @@ Filesystem policies are enforced via bind mounts in the container configuration:
 
 ## Network Policy
 
-Inbound network policy is enforced with `iptables` rules applied **inside the
-container's own network namespace** (via `nsenter -t <init-pid> -n`), hooked
-into the container's `INPUT` chain. This matches the GA networking spec, which
-enforces the LXC `ingress.hostLoopback` control via `INPUT`:
+Inbound network policy is enforced with `iptables` and `ip6tables` rules
+applied **inside the container's own network namespace** (via
+`nsenter -t <init-pid> -n`), hooked into the container's `INPUT` chain. A
+packet destined to a container socket traverses the *container's* `INPUT`
+chain inside its netns, never the host's, so that is where the deny is
+installed:
 
 | Policy | Implementation |
 |--------|---------------|
-| `allowLocalNetwork: true` | `-m state --state NEW -j ACCEPT` in the container `INPUT` chain — accepts new inbound connections to the container (enables listening servers) |
-| `allowLocalNetwork: false` (default) | `-m state --state NEW -j DROP` — new inbound connections are dropped |
+| `allowLocalNetwork: false` (default) | `-m state --state NEW -j DROP` in the container `INPUT` chain — new inbound connections are dropped |
+| `allowLocalNetwork: true` | **Not yet implemented — the LXC firewall path returns an error.** See below |
 
 The chain also unconditionally accepts intra-container loopback (`-i lo`) and
 `ESTABLISHED,RELATED` return traffic, and ends with a terminal `-j DROP`
-(ingress default-deny). The chain name is `MXC-<sanitized containerId>`. Rules
+(inbound default-deny). The chain name is `MXC-<sanitized containerId>`. Rules
 are cleaned up when the container exits, and in any case vanish with the
 container's network namespace on destroy.
+
+**Dual-stack.** A dual-stack container is reachable over IPv4 or IPv6, so every
+rule is installed and torn down through both `iptables` and `ip6tables`;
+otherwise IPv6 inbound would bypass an IPv4-only deny. If either family's
+tooling cannot install the chain the run fails closed rather than leaving that
+family open.
+
+**`allowLocalNetwork: true` is not yet implemented.** It is meant to open
+*host-loopback* inbound only, but scoping to host loopback needs a schema field
+that does not exist yet (`loopbackPorts`) plus an MXC-owned host-loopback
+forwarder. The only rule available today is an unscoped
+`-m state --state NEW -j ACCEPT`, which would accept new inbound from every
+interface and source (LAN and WAN), not just host loopback. Rather than install
+that over-broad accept, the LXC firewall path returns a clear
+not-yet-implemented error. A container that requires a firewall but cannot have
+its init PID discovered is likewise aborted rather than run with the inbound
+chain silently inert.
 
 > **Egress is a separate control and is not enforced by this iptables path.**
 > The outbound-oriented `defaultPolicy`, `allowedHosts`, and `blockedHosts`
