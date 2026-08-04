@@ -4,22 +4,35 @@
 //! Inbound network policy enforcement via iptables, scoped to the container's
 //! own network namespace.
 //!
-//! Implements the GA `ingress.hostLoopback` control for the LXC backend (and,
-//! when a netns target is supplied, Bubblewrap): host-to-container and
-//! external inbound traffic is dropped by default; `allowLocalNetwork` /
-//! `ingress.hostLoopback: "allow"` opens new inbound connections to the
-//! container's listening sockets.
+//! Implements the `allowLocalNetwork` inbound control for the LXC backend (and,
+//! when a netns target is supplied, Bubblewrap): host-to-container and external
+//! inbound traffic is dropped by default. The permissive form
+//! (`allowLocalNetwork: true`) is not yet implemented — see below — so today
+//! this manager only installs the default-deny chain.
+//!
+//! **Dual-stack.** A dual-stack container is reachable over IPv4 or IPv6, so an
+//! IPv4-only chain would let IPv6 inbound bypass the deny entirely. Every rule
+//! is installed through both `iptables` and `ip6tables` (see
+//! [`IPTABLES_BINARIES`]), and teardown removes both.
+//!
+//! **Permissive path is not yet implemented.** `allowLocalNetwork: true` is
+//! meant to open *host-loopback* inbound only, but scoping to host loopback
+//! needs a schema field that does not exist yet (`loopbackPorts`) plus an
+//! MXC-owned host-loopback forwarder. The only rule available today is an
+//! unscoped `--state NEW -j ACCEPT` that would accept inbound from every
+//! interface and source (LAN and WAN). Rather than install that over-broad
+//! accept, [`Self::apply_firewall_rules`] returns a clear not-yet-implemented
+//! error for the permissive path (MGudgin's requested interim).
 //!
 //! **Why the container netns.** A packet destined to a container socket
 //! traverses the *container's* `INPUT` chain, inside the container's network
 //! namespace — never the host's `INPUT` (the host only ever sees such packets
 //! in `FORWARD`, if it routes them). So the rules are executed with
 //! `nsenter -t <init-pid> -n iptables …`, landing them in the container's
-//! netfilter tables. This matches the GA networking spec, which enforces LXC
+//! netfilter tables. This matches the networking spec, which enforces LXC
 //! ingress "via iptables INPUT" (`docs/sandbox-policy/v2/networking.md`).
 //! Egress (allow/deny lists, DNS, proxy) is a separate control and is
-//! intentionally not handled here — GA ingress is loopback-only with no CIDR
-//! peers.
+//! intentionally not handled here.
 
 use std::process::Command;
 
@@ -40,6 +53,14 @@ pub struct NetworkIptablesManager {
     /// attach a rule to the host's own `INPUT` chain.
     netns_pid: Option<u32>,
 }
+
+/// The IP families the inbound chain is installed for. A dual-stack container
+/// is reachable over either family, so a chain that lives only in IPv4 lets
+/// IPv6 inbound bypass the default-deny entirely. Every rule this manager
+/// emits is family-agnostic (interface, connection-state, and chain matches —
+/// no IP literals), so the same argv is replayed through both binaries and the
+/// teardown removes both.
+const IPTABLES_BINARIES: [&str; 2] = ["iptables", "ip6tables"];
 
 impl NetworkIptablesManager {
     /// Create a new manager for the given container name.
@@ -103,6 +124,28 @@ impl NetworkIptablesManager {
             );
         }
 
+        // Permissive host-loopback inbound (`allowLocalNetwork: true`) is not
+        // yet implementable safely. Scoping it to host loopback needs a schema
+        // field that does not exist yet (`loopbackPorts`) plus an MXC-owned
+        // host-loopback forwarder. The only rule we could emit today is an
+        // unscoped `--state NEW -j ACCEPT`, which opens the container to new
+        // inbound connections from every interface and source — LAN and WAN
+        // included, not just host loopback. Refuse with a clear error rather
+        // than silently installing that over-broad accept (MGudgin's requested
+        // interim, comment 5120422486). Gate on a real netns hook so the inert
+        // Bubblewrap shared-net path, which installs nothing, keeps working.
+        if policy.allow_local_network && self.netns_pid.is_some() {
+            return Err(
+                "allowLocalNetwork (permissive host-loopback inbound) is not yet implemented \
+                 for the LXC firewall path. Scoping inbound to host loopback requires a \
+                 loopbackPorts policy field and an MXC-owned host-loopback forwarder that do \
+                 not exist yet; the only rule available today would accept new inbound \
+                 connections from every interface and source (LAN and WAN), which is broader \
+                 than requested. Refusing rather than installing an over-broad accept."
+                    .to_string(),
+            );
+        }
+
         logger.log_line(&format!("Creating iptables chain: {}", self.chain_name));
         logger.log_line(&format!(
             "Inbound (hostLoopback) policy: {}",
@@ -115,9 +158,16 @@ impl NetworkIptablesManager {
 
         let rules = Self::build_firewall_rules(&self.chain_name, policy, self.netns_pid.is_some());
 
+        // Replay every rule through both IP families so IPv6 inbound cannot
+        // bypass an IPv4-only deny on a dual-stack container. An `ip6tables`
+        // failure is treated exactly like an `iptables` failure (fail-closed):
+        // a default-deny inbound control that cannot be installed for a family
+        // must abort the run, not silently leave that family open.
         for rule in &rules {
             let argv: Vec<&str> = rule.iter().map(String::as_str).collect();
-            Self::run_iptables(self.netns_pid, &argv, logger)?;
+            for binary in IPTABLES_BINARIES {
+                Self::run_iptables(binary, self.netns_pid, &argv, logger)?;
+            }
         }
 
         self.rules_applied = true;
@@ -216,18 +266,23 @@ impl NetworkIptablesManager {
 
         logger.log_line(&format!("Removing iptables chain: {}", self.chain_name));
 
-        // Unhook from INPUT (only if we hooked it, i.e. had a netns target).
-        if self.netns_pid.is_some() {
-            let _ = Self::run_iptables(
-                self.netns_pid,
-                &["-D", "INPUT", "-j", &self.chain_name],
-                logger,
-            );
-        }
+        // Tear the chain down in both IP families, mirroring the dual-stack
+        // install. Unhook from INPUT (only if we hooked it, i.e. had a netns
+        // target), then flush and delete. Each call is best-effort: a `-D`/`-F`/
+        // `-X` simply no-ops if the netns (and its chain) is already gone.
+        for binary in IPTABLES_BINARIES {
+            if self.netns_pid.is_some() {
+                let _ = Self::run_iptables(
+                    binary,
+                    self.netns_pid,
+                    &["-D", "INPUT", "-j", &self.chain_name],
+                    logger,
+                );
+            }
 
-        // Flush and delete the chain.
-        let _ = Self::run_iptables(self.netns_pid, &["-F", &self.chain_name], logger);
-        let _ = Self::run_iptables(self.netns_pid, &["-X", &self.chain_name], logger);
+            let _ = Self::run_iptables(binary, self.netns_pid, &["-F", &self.chain_name], logger);
+            let _ = Self::run_iptables(binary, self.netns_pid, &["-X", &self.chain_name], logger);
+        }
 
         self.rules_applied = false;
         Ok(())
@@ -249,32 +304,33 @@ impl NetworkIptablesManager {
         let _ = mgr.remove_firewall_rules(logger);
     }
 
-    /// Run an `iptables` command, entering the container's network namespace
-    /// first when `netns_pid` is set. Uses the host `iptables` binary via
-    /// `nsenter -t <pid> -n` so no `iptables` need exist in the container
-    /// image; the runner is host-root and holds `CAP_NET_ADMIN` over the
-    /// (child) network namespace.
+    /// Run an `iptables`/`ip6tables` command, entering the container's network
+    /// namespace first when `netns_pid` is set. Uses the host `binary` via
+    /// `nsenter -t <pid> -n` so no packet-filter tools need exist in the
+    /// container image; the runner is host-root and holds `CAP_NET_ADMIN` over
+    /// the (child) network namespace.
     fn run_iptables(
+        binary: &str,
         netns_pid: Option<u32>,
         args: &[&str],
         logger: &mut Logger,
     ) -> Result<bool, String> {
         let mut command = if let Some(pid) = netns_pid {
             let mut c = Command::new("nsenter");
-            c.arg("-t").arg(pid.to_string()).arg("-n").arg("iptables");
+            c.arg("-t").arg(pid.to_string()).arg("-n").arg(binary);
             c
         } else {
-            Command::new("iptables")
+            Command::new(binary)
         };
         command.args(args);
 
         let output = command
             .output()
-            .map_err(|e| format!("Failed to run iptables: {}", e))?;
+            .map_err(|e| format!("Failed to run {}: {}", binary, e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let msg = format!("iptables {} failed: {}", args.join(" "), stderr);
+            let msg = format!("{} {} failed: {}", binary, args.join(" "), stderr);
             logger.log_line(&msg);
             return Err(msg);
         }
