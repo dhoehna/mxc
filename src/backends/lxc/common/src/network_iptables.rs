@@ -34,34 +34,44 @@ impl NetworkIptablesManager {
 
     /// Derive the iptables chain name for a container.
     ///
-    /// Two distinct container names must never map to the same chain: a
+    /// Two distinct container names should not map to the same chain: a
     /// collision would let one container's teardown flush and delete another's
-    /// rules. Sanitizing and truncating the name alone is not enough — two names
-    /// that share a prefix (`"web-frontend-1"` / `"web-frontend-2"` past the
+    /// rules, leaving the incumbent running with no firewall (fail-open).
+    /// Sanitizing and truncating the name alone is not enough — two names that
+    /// share a prefix (`"web-frontend-1"` / `"web-frontend-2"` past the
     /// truncation point) or differ only in characters the sanitizer strips
-    /// (`"a.b"` / `"ab"`) would collapse onto one chain. A short deterministic
-    /// hash of the **full, unsanitized** name is folded in so distinct names
-    /// always produce distinct chains, independent of any caller-side
-    /// validation. FNV-1a is used rather than the std hasher because its output
+    /// (`"a.b"` / `"ab"`) would collapse onto one chain. A deterministic hash of
+    /// the **full, unsanitized** name is folded in to break that systematic
+    /// collapse. FNV-1a is used rather than the std hasher because its output
     /// must be reproducible across processes (the signal-time `force_cleanup`
     /// rebuilds the manager from the name alone) and across builds.
     ///
+    /// This is collision-*resistant*, not injective: the derivation compresses
+    /// an unbounded name space into a fixed-width string, so collisions still
+    /// exist in principle. The hash width is chosen so that finding one requires
+    /// ~2^56.9 work (infeasible to search adversarially) and accidental
+    /// collision follows a birthday bound of ~2^28 names. Injectivity over all
+    /// inputs is not — and cannot be — guaranteed.
+    ///
     /// The result stays within the netfilter chain-name limit (28 characters):
-    /// `"MXC-"` (4) + up to 15 sanitized characters + `"-"` (1) + 8 hex digits.
+    /// `"MXC-"` (4) + up to 12 sanitized characters + `"-"` (1) + 11 base36
+    /// digits. The sanitized allowance is 12 (not 15) so the wider hash fits.
     fn chain_name_for(container_name: &str) -> String {
         let sanitized: String = container_name
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-            .take(15)
+            .take(12)
             .collect();
 
-        format!("MXC-{}-{:08x}", sanitized, Self::name_hash(container_name))
+        format!("MXC-{}-{}", sanitized, Self::hash_token(container_name))
     }
 
-    /// 32-bit FNV-1a hash of the full container name, used to disambiguate
-    /// chain names. Deterministic across processes and builds so the teardown
-    /// path can reconstruct the same chain from the name alone.
-    fn name_hash(name: &str) -> u32 {
+    /// 64-bit FNV-1a hash of the full container name. Deterministic across
+    /// processes and builds so the teardown path can reconstruct the same chain
+    /// from the name alone. The full 64 bits are retained — the previous
+    /// implementation truncated to the low 32 bits, which collapsed the hash
+    /// space and made adversarial chain-name collisions a sub-second brute force.
+    fn name_hash(name: &str) -> u64 {
         const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
         const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -70,7 +80,29 @@ impl NetworkIptablesManager {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(FNV_PRIME);
         }
-        (hash & 0xffff_ffff) as u32
+        hash
+    }
+
+    /// Encode the full 64-bit name hash as a fixed 11-character base36 token
+    /// (`0-9a-z`). 36^11 ≈ 2^56.9, so the hash is reduced modulo 36^11 rather
+    /// than truncated to 32 bits: this preserves ~56.9 bits of the hash while
+    /// fitting the tight length budget shared by the chain name (28 chars) and
+    /// the veth interface name (`IFNAMSIZ` = 15 chars). Base36 is valid in both
+    /// iptables chain names and Linux interface names. Zero-padded so the token
+    /// is always exactly 11 characters, keeping both derived names fixed-width.
+    fn hash_token(name: &str) -> String {
+        const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        // 36^11 = 131_601_804_755_189_760 ≈ 2^56.9, fits in u64.
+        const MODULUS: u64 = 36u64.pow(11);
+
+        let mut value = Self::name_hash(name) % MODULUS;
+        let mut buf = [b'0'; 11];
+        for slot in buf.iter_mut().rev() {
+            *slot = ALPHABET[(value % 36) as usize];
+            value /= 36;
+        }
+        // `value` is now 0: 11 base36 digits cover the full [0, 36^11) range.
+        String::from_utf8(buf.to_vec()).expect("base36 alphabet is valid ASCII")
     }
 
     /// Derive the deterministic host-side veth interface name for a container.
@@ -84,9 +116,9 @@ impl NetworkIptablesManager {
     ///
     /// The name must fit the kernel `IFNAMSIZ` limit of 15 characters and be
     /// unique per container, so a `mxcv` prefix (4) is followed by the same
-    /// 8-hex FNV-1a hash used for the chain name (12 characters total).
+    /// 11-character base36 hash token used for the chain name (15 chars total).
     pub fn deterministic_veth_name(container_name: &str) -> String {
-        format!("mxcv{:08x}", Self::name_hash(container_name))
+        format!("mxcv{}", Self::hash_token(container_name))
     }
 
     /// Whether rules have been applied and need cleanup.
@@ -417,14 +449,14 @@ mod tests {
     #[test]
     fn chain_name_sanitization() {
         let mgr = NetworkIptablesManager::new("my-container_123");
-        // Sanitized-and-truncated prefix (15 chars) plus an 8-hex disambiguating
-        // hash of the full name.
+        // Sanitized-and-truncated prefix (12 chars) plus an 11-char base36
+        // disambiguating hash of the full name.
         assert!(
-            mgr.chain_name.starts_with("MXC-my-container_12-"),
+            mgr.chain_name.starts_with("MXC-my-container-"),
             "unexpected chain name: {}",
             mgr.chain_name
         );
-        assert_eq!(mgr.chain_name.len(), "MXC-my-container_12-".len() + 8);
+        assert_eq!(mgr.chain_name.len(), "MXC-my-container-".len() + 11);
     }
 
     #[test]
@@ -432,7 +464,7 @@ mod tests {
         let long_name = "a".repeat(50);
         let mgr = NetworkIptablesManager::new(&long_name);
         // Must stay within the netfilter 28-character chain-name limit:
-        // "MXC-" (4) + 15 sanitized + "-" (1) + 8 hex = 28.
+        // "MXC-" (4) + 12 sanitized + "-" (1) + 11 base36 = 28.
         assert!(
             mgr.chain_name.len() <= 28,
             "chain name too long: {} ({} chars)",
@@ -478,5 +510,22 @@ mod tests {
         // IPv4-only filter must not regress the happy path.
         let ips = NetworkIptablesManager::resolve_host("10.0.0.1");
         assert_eq!(ips, vec!["10.0.0.1"]);
+    }
+
+    #[test]
+    fn regression_previously_colliding_names_now_get_distinct_chains() {
+        // TASK-1/TASK-4 REGRESSION: with the 32-bit-truncated hash these two
+        // distinct names collided onto a byte-identical chain
+        // ("MXC-web-frontend-01-3d4a49a5"), found by brute force after 793,379
+        // candidates — a fail-open teardown hazard. With the full-64-bit base36
+        // token they must now differ. This assertion fails against the pre-fix
+        // code and passes after.
+        let a = NetworkIptablesManager::chain_name_for("web-frontend-017m3b");
+        let b = NetworkIptablesManager::chain_name_for("web-frontend-01kgar");
+        assert_ne!(
+            a, b,
+            "previously-colliding names must now produce distinct chains; \
+             both produced {a:?}"
+        );
     }
 }

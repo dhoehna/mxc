@@ -736,7 +736,9 @@ mod tests {
     #[test]
     fn generated_container_name_fits_iptables_chain_bound() {
         // The auto-generated name must itself satisfy the tightened rules so the
-        // firewall chain derived from it is collision-free.
+        // firewall chain derived from it stays within the netfilter length bound
+        // and is collision-resistant (a deterministic hash of the full name is
+        // folded in; the mapping is not injective, only hard to collide).
         let name = resolve_container_name(&ExecutionRequest::default()).unwrap();
         assert!(
             is_valid_container_name(&name),
