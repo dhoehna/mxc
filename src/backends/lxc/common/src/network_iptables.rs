@@ -407,6 +407,10 @@ impl Drop for NetworkIptablesManager {
 }
 
 #[cfg(test)]
+#[path = "network_iptables_chainname_spec_tests.rs"]
+mod chainname_spec_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
