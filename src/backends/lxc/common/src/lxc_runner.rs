@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use wxc_common::logger::Logger;
 use wxc_common::models::{
-    ExecutionRequest, LifecycleConfig, LxcConfig, NetworkEnforcementMode, ScriptResponse,
+    ContainerPolicy, ExecutionRequest, LifecycleConfig, LxcConfig, NetworkEnforcementMode,
+    ScriptResponse,
 };
 use wxc_common::script_runner::ScriptRunner;
 
@@ -26,6 +27,25 @@ pub struct LxcScriptRunner {
     container_id: String,
     destroy_on_exit: bool,
     cleanup_policy: bool,
+}
+
+/// Outcome of reconciling the discovered veth against the policy's enforcement
+/// needs.
+///
+/// Extracted from `run_internal` so the fail-closed invariant — a policy that
+/// needs veth-scoped firewall enforcement but has no veth must be refused,
+/// never run unenforced — is assertable without a live LXC container.
+#[derive(Debug, PartialEq, Eq)]
+enum VethReconcile<'a> {
+    /// A veth was discovered; scope the firewall rules to it.
+    Scope(&'a str),
+    /// No veth, and none is required because no firewall enforcement was
+    /// requested.
+    ProceedUnscoped,
+    /// No veth, but firewall enforcement was requested — refuse to start
+    /// rather than launch a container with the firewall it asked for silently
+    /// absent.
+    Refuse,
 }
 
 impl LxcScriptRunner {
@@ -85,6 +105,35 @@ impl LxcScriptRunner {
             timeout.as_secs_f64()
         );
         false
+    }
+
+    /// Whether the policy asks for veth-scoped firewall enforcement.
+    ///
+    /// LXC scopes every iptables hook to the container's veth, so a policy that
+    /// uses `Firewall`/`Both` enforcement, or configures a network proxy,
+    /// cannot be applied without a veth. Kept as a pure predicate so the
+    /// fail-closed decision in [`Self::reconcile_veth`] is assertable off a
+    /// live container.
+    fn needs_firewall_enforcement(policy: &ContainerPolicy) -> bool {
+        matches!(
+            policy.network_enforcement_mode,
+            NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
+        ) || policy.network_proxy.is_enabled()
+    }
+
+    /// Decide what to do with a discovered veth given the policy's needs.
+    ///
+    /// This is the fail-closed seam: when firewall enforcement is required but
+    /// no veth is available the run is refused, never allowed to proceed with
+    /// the firewall silently absent. A present veth is always scoped; a missing
+    /// veth is tolerated only when no firewall enforcement was requested (the
+    /// Bubblewrap-style host-namespace case handled up the stack).
+    fn reconcile_veth(veth: Option<&str>, needs_firewall: bool) -> VethReconcile<'_> {
+        match (veth, needs_firewall) {
+            (Some(iface), _) => VethReconcile::Scope(iface),
+            (None, true) => VethReconcile::Refuse,
+            (None, false) => VethReconcile::ProceedUnscoped,
+        }
     }
 
     /// Core execution logic.
@@ -239,21 +288,19 @@ impl LxcScriptRunner {
         // the policy uses firewall enforcement and the veth cannot be
         // discovered, refuse to start rather than launch an unenforced
         // container.
-        let needs_firewall = matches!(
-            effective_policy.network_enforcement_mode,
-            NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-        ) || effective_policy.network_proxy.is_enabled();
-        match NetworkIptablesManager::discover_veth_interface(&container_name) {
-            Some(veth) => {
+        let needs_firewall = Self::needs_firewall_enforcement(&effective_policy);
+        let discovered_veth = NetworkIptablesManager::discover_veth_interface(&container_name);
+        match Self::reconcile_veth(discovered_veth.as_deref(), needs_firewall) {
+            VethReconcile::Scope(veth) => {
                 let _ = writeln!(logger, "Discovered veth interface: {}", veth);
-                fw_manager.set_veth_interface(&veth);
+                fw_manager.set_veth_interface(veth);
                 if self.destroy_on_exit {
                     // Tell the watchdog about the veth so signal-time cleanup
                     // can also remove the FORWARD hook, not just the chain.
-                    signal_cleanup::set_active_veth(&veth);
+                    signal_cleanup::set_active_veth(veth);
                 }
             }
-            None if needs_firewall => {
+            VethReconcile::Refuse => {
                 if self.destroy_on_exit || container_created {
                     let _ = container.destroy();
                 }
@@ -263,7 +310,7 @@ impl LxcScriptRunner {
                      an unenforceable network policy.",
                 );
             }
-            None => {
+            VethReconcile::ProceedUnscoped => {
                 let _ = writeln!(
                     logger,
                     "No veth interface discovered; network policy does not require firewall \
@@ -360,6 +407,7 @@ fn uuid_simple() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wxc_common::models::ProxyConfig;
 
     #[test]
     fn uuid_simple_is_8_chars() {
@@ -383,5 +431,67 @@ mod tests {
         let runner = LxcScriptRunner::new(&config, "", &lifecycle);
         let name = runner.resolve_container_name();
         assert!(name.starts_with("mxc-"));
+    }
+
+    #[test]
+    fn needs_firewall_enforcement_tracks_mode_and_proxy() {
+        let mut policy = ContainerPolicy::default();
+
+        // Default is Capabilities enforcement with no proxy, so no veth-scoped
+        // firewall is needed.
+        assert!(!LxcScriptRunner::needs_firewall_enforcement(&policy));
+
+        policy.network_enforcement_mode = NetworkEnforcementMode::Firewall;
+        assert!(LxcScriptRunner::needs_firewall_enforcement(&policy));
+
+        policy.network_enforcement_mode = NetworkEnforcementMode::Both;
+        assert!(LxcScriptRunner::needs_firewall_enforcement(&policy));
+
+        // A configured proxy forces firewall enforcement even under
+        // Capabilities mode, because deny-all-except-proxy is enforced with the
+        // same veth-scoped chain.
+        policy.network_enforcement_mode = NetworkEnforcementMode::Capabilities;
+        policy.network_proxy = ProxyConfig {
+            address: None,
+            builtin_test_server: true,
+        };
+        assert!(LxcScriptRunner::needs_firewall_enforcement(&policy));
+    }
+
+    #[test]
+    fn missing_veth_with_firewall_policy_is_refused() {
+        // The security invariant restored here: firewall enforcement requested
+        // but no veth available must refuse to start, never proceed with the
+        // firewall silently absent. Previously asserted by
+        // `firewall_mode_without_veth_fails_fast` against the old (regressive)
+        // check in `apply_firewall_rules`; that check was removed because it
+        // also broke Bubblewrap, and the invariant now lives here in the LXC
+        // runner's own veth reconciliation.
+        assert_eq!(
+            LxcScriptRunner::reconcile_veth(None, true),
+            VethReconcile::Refuse
+        );
+    }
+
+    #[test]
+    fn missing_veth_without_firewall_proceeds_unscoped() {
+        // No firewall enforcement requested, so a missing veth is tolerated
+        // rather than fatal.
+        assert_eq!(
+            LxcScriptRunner::reconcile_veth(None, false),
+            VethReconcile::ProceedUnscoped
+        );
+    }
+
+    #[test]
+    fn present_veth_is_scoped_regardless_of_policy() {
+        assert_eq!(
+            LxcScriptRunner::reconcile_veth(Some("veth1234"), true),
+            VethReconcile::Scope("veth1234")
+        );
+        assert_eq!(
+            LxcScriptRunner::reconcile_veth(Some("veth1234"), false),
+            VethReconcile::Scope("veth1234")
+        );
     }
 }
