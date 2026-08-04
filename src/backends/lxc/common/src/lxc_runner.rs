@@ -229,14 +229,46 @@ impl LxcScriptRunner {
             }
         }
 
-        // Try to discover the container's veth interface for scoped rules
-        if let Some(veth) = NetworkIptablesManager::discover_veth_interface(&container_name) {
-            let _ = writeln!(logger, "Discovered veth interface: {}", veth);
-            fw_manager.set_veth_interface(&veth);
-            if self.destroy_on_exit {
-                // Tell the watchdog about the veth so signal-time cleanup
-                // can also remove the FORWARD hook, not just the chain.
-                signal_cleanup::set_active_veth(&veth);
+        // Discover the container's veth interface for scoped rules.
+        //
+        // LXC enforcement is veth-scoped: every iptables hook matches
+        // `-i <veth>`, so without the veth the policy cannot be scoped to this
+        // container. `apply_firewall_rules` no longer rejects a missing veth
+        // (Bubblewrap shares that manager and legitimately has none), so the
+        // fail-closed requirement lives here, where LXC actually needs it: when
+        // the policy uses firewall enforcement and the veth cannot be
+        // discovered, refuse to start rather than launch an unenforced
+        // container.
+        let needs_firewall = matches!(
+            effective_policy.network_enforcement_mode,
+            NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
+        ) || effective_policy.network_proxy.is_enabled();
+        match NetworkIptablesManager::discover_veth_interface(&container_name) {
+            Some(veth) => {
+                let _ = writeln!(logger, "Discovered veth interface: {}", veth);
+                fw_manager.set_veth_interface(&veth);
+                if self.destroy_on_exit {
+                    // Tell the watchdog about the veth so signal-time cleanup
+                    // can also remove the FORWARD hook, not just the chain.
+                    signal_cleanup::set_active_veth(&veth);
+                }
+            }
+            None if needs_firewall => {
+                if self.destroy_on_exit || container_created {
+                    let _ = container.destroy();
+                }
+                return ScriptResponse::error(
+                    "LXC: could not discover the container's veth interface; network policy \
+                     enforcement is veth-scoped and cannot be applied. Refusing to start with \
+                     an unenforceable network policy.",
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    logger,
+                    "No veth interface discovered; network policy does not require firewall \
+                     enforcement, continuing."
+                );
             }
         }
 

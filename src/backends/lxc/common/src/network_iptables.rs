@@ -496,6 +496,17 @@ impl NetworkIptablesManager {
     }
 
     /// Apply network firewall rules based on the container policy.
+    ///
+    /// LXC and Bubblewrap share this manager but not their scoping contract, so
+    /// a missing veth is **not** rejected here. LXC enforcement is veth-scoped
+    /// (every hook matches `-i <veth>`), and an LXC container whose veth cannot
+    /// be discovered is refused up-stream in `lxc_runner` — failing closed
+    /// where the backend that needs the veth actually runs. Bubblewrap has no
+    /// veth (it runs in the host network namespace), so it builds the policy
+    /// chain and skips the veth-scoped hooks rather than failing; see
+    /// [`Self::apply_firewall_rules_inner`]. Rejecting a missing veth here made
+    /// every Bubblewrap request with firewall host rules fail before `bwrap`
+    /// started.
     pub fn apply_firewall_rules(
         &mut self,
         policy: &ContainerPolicy,
@@ -509,13 +520,6 @@ impl NetworkIptablesManager {
         if !use_firewall {
             logger.log_line("Network enforcement mode does not use firewall, skipping iptables.");
             return Ok(true);
-        }
-
-        if self.veth_interface.is_none() {
-            return Err(
-                "No veth interface set for container; cannot scope iptables FORWARD hook"
-                    .to_string(),
-            );
         }
 
         let mut created = CreatedFirewallState::default();
@@ -553,10 +557,6 @@ impl NetworkIptablesManager {
         logger: &mut Logger,
         created: &mut CreatedFirewallState,
     ) -> Result<(), String> {
-        let iface = self.veth_interface.as_ref().ok_or_else(|| {
-            "No veth interface set for container; cannot scope iptables FORWARD hook".to_string()
-        })?;
-
         logger.log_line(&format!(
             "Creating iptables/ip6tables chain: {}",
             self.chain_name
@@ -651,60 +651,83 @@ impl NetworkIptablesManager {
             )?;
         }
 
-        // Hook the chains for the container's egress traffic.
+        // Hook the chains for the container's egress traffic — but only when a
+        // veth interface is known.
         //
-        // FORWARD covers traffic being routed *through* the host to somewhere
-        // else. Packets originating in the container arrive at the host on the
-        // host-side veth, so they match by input interface (`-i`); `-o` would
-        // instead match traffic flowing toward the container and leave
-        // container egress — the thing this policy exists to restrict —
-        // entirely unfiltered.
-        //
-        // INPUT covers traffic addressed to the *host itself*. Netfilter sends
-        // locally-destined packets to INPUT and never to FORWARD, so hooking
-        // only FORWARD would leave the bridge gateway and every service on the
-        // host reachable from inside the container — a hole straight through
-        // "the proxy is the only destination you can reach". The same chain is
-        // reused, so a host-local proxy is still permitted by its own ACCEPT
-        // rule while everything else on the host is dropped.
-        // Flags are set *before* the inserts: every hook delete is scoped to
-        // this container's own veth, so a `-D` for a rule that was never
-        // inserted is a harmless no-op, whereas marking afterwards would leak
-        // the FORWARD hook if the INPUT insert failed. (The chain flags are the
-        // opposite case — `-F`/`-X` are name-scoped and can hit another
-        // container, so those are only set once `-N` has succeeded.)
-        created.v4_hooks = true;
-        for hook in ["FORWARD", "INPUT"] {
-            Self::run_iptables(&["-I", hook, "-i", iface, "-j", &self.chain_name], logger)?;
-        }
-
-        // DHCP must survive the INPUT hook or the container loses its lease on
-        // renewal: `lxc-net` runs dnsmasq on the bridge, so DHCPREQUEST is
-        // addressed to the host and would otherwise hit the chain's DROP. `-I`
-        // pushes this ahead of the jump inserted above. It is a link-local
-        // exchange with the bridge, not an egress path, so it does not weaken
-        // the deny-all posture.
-        created.v4_dhcp = true;
-        Self::run_iptables(
-            &[
-                "-I", "INPUT", "-i", iface, "-p", "udp", "--dport", "67", "-j", "ACCEPT",
-            ],
-            logger,
-        )?;
-
-        if ipv6_enabled {
-            created.v6_hooks = true;
+        // The hooks are the point where LXC's and Bubblewrap's scoping
+        // contracts diverge. LXC always has a veth and its enforcement is
+        // veth-scoped, so the hooks below match `-i <veth>`. Bubblewrap runs in
+        // the host network namespace and has no veth: there is no per-container
+        // interface to scope to, and hooking an unscoped rule into FORWARD or
+        // INPUT would filter the *host's* own traffic. So the no-veth path
+        // builds the policy chain (above) and installs no hooks, which is the
+        // behavior Bubblewrap had before veth-scoping was introduced. An LXC
+        // container that reaches here without a veth is a bug caught up-stream
+        // in `lxc_runner`, which fails closed before calling this.
+        if let Some(iface) = self.veth_interface.as_ref() {
+            // FORWARD covers traffic being routed *through* the host to
+            // somewhere else. Packets originating in the container arrive at the
+            // host on the host-side veth, so they match by input interface
+            // (`-i`); `-o` would instead match traffic flowing toward the
+            // container and leave container egress — the thing this policy
+            // exists to restrict — entirely unfiltered.
+            //
+            // INPUT covers traffic addressed to the *host itself*. Netfilter
+            // sends locally-destined packets to INPUT and never to FORWARD, so
+            // hooking only FORWARD would leave the bridge gateway and every
+            // service on the host reachable from inside the container — a hole
+            // straight through "the proxy is the only destination you can
+            // reach". The same chain is reused, so a host-local proxy is still
+            // permitted by its own ACCEPT rule while everything else on the host
+            // is dropped.
+            // Flags are set *before* the inserts: every hook delete is scoped to
+            // this container's own veth, so a `-D` for a rule that was never
+            // inserted is a harmless no-op, whereas marking afterwards would
+            // leak the FORWARD hook if the INPUT insert failed. (The chain flags
+            // are the opposite case — `-F`/`-X` are name-scoped and can hit
+            // another container, so those are only set once `-N` has succeeded.)
+            created.v4_hooks = true;
             for hook in ["FORWARD", "INPUT"] {
-                Self::run_ip6tables(&["-I", hook, "-i", iface, "-j", &self.chain_name], logger)?;
+                Self::run_iptables(&["-I", hook, "-i", iface, "-j", &self.chain_name], logger)?;
             }
 
-            created.v6_dhcp = true;
-            Self::run_ip6tables(
+            // DHCP must survive the INPUT hook or the container loses its lease
+            // on renewal: `lxc-net` runs dnsmasq on the bridge, so DHCPREQUEST is
+            // addressed to the host and would otherwise hit the chain's DROP.
+            // `-I` pushes this ahead of the jump inserted above. It is a
+            // link-local exchange with the bridge, not an egress path, so it
+            // does not weaken the deny-all posture.
+            created.v4_dhcp = true;
+            Self::run_iptables(
                 &[
-                    "-I", "INPUT", "-i", iface, "-p", "udp", "--dport", "547", "-j", "ACCEPT",
+                    "-I", "INPUT", "-i", iface, "-p", "udp", "--dport", "67", "-j", "ACCEPT",
                 ],
                 logger,
             )?;
+
+            if ipv6_enabled {
+                created.v6_hooks = true;
+                for hook in ["FORWARD", "INPUT"] {
+                    Self::run_ip6tables(
+                        &["-I", hook, "-i", iface, "-j", &self.chain_name],
+                        logger,
+                    )?;
+                }
+
+                created.v6_dhcp = true;
+                Self::run_ip6tables(
+                    &[
+                        "-I", "INPUT", "-i", iface, "-p", "udp", "--dport", "547", "-j", "ACCEPT",
+                    ],
+                    logger,
+                )?;
+            }
+        } else {
+            logger.log_line(
+                "No veth interface set (Bubblewrap host-namespace scoping): built the policy \
+                 chain but installed no FORWARD/INPUT hooks. Host-wide hooks would filter the \
+                 host's own traffic, so none are applied.",
+            );
         }
 
         Ok(())
@@ -1023,21 +1046,6 @@ mod tests {
             "proxy.example.com"
         ));
         assert!(!NetworkIptablesManager::host_is_ip_literal("localhost"));
-    }
-
-    #[test]
-    fn firewall_mode_without_veth_fails_fast() {
-        let mut mgr = NetworkIptablesManager::new("no-veth");
-        let policy = ContainerPolicy {
-            network_enforcement_mode: NetworkEnforcementMode::Firewall,
-            ..Default::default()
-        };
-        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
-
-        let err = mgr.apply_firewall_rules(&policy, &mut logger).unwrap_err();
-
-        assert!(err.contains("No veth interface set"));
-        assert!(!mgr.rules_applied());
     }
 
     #[test]
