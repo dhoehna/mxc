@@ -153,6 +153,16 @@ if echo "$OUTPUT" | grep -qE "^(ip6?tables) .* failed:|Firewall setup failed:"; 
     fail "iptables/ip6tables rejected a boundary-valid rule."
 fi
 
+# The FORWARD hook is what scopes the chain to this container's egress; a run
+# that skipped it enforces nothing, so PASS must require it. Fail on the
+# skipped-hook warning and require the positive install confirmation.
+if echo "$OUTPUT" | grep -Fq "Skipping FORWARD hook"; then
+    fail "FORWARD hook was skipped; the container's veth interface was not discovered."
+fi
+if ! echo "$OUTPUT" | grep -Fq "FORWARD hook installed"; then
+    fail "FORWARD hook installation was not confirmed."
+fi
+
 assert_firewall_chain_cleaned_up
 
 echo "PASS: CIDR boundary entries were resolved and programmed with default allow."

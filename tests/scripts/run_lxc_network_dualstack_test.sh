@@ -168,6 +168,16 @@ if grep -Fq "IPv6 firewall rule(s) not applied" <<<"$OUTPUT"; then
     fail "IPv6 rules were skipped; the dual-stack bypass is still open on this run."
 fi
 
+# The FORWARD hook is what scopes the chain to this container's egress; a run
+# that skipped it enforces nothing, so PASS must require it. Fail on the
+# skipped-hook warning and require the positive install confirmation.
+if grep -Fq "Skipping FORWARD hook" <<<"$OUTPUT"; then
+    fail "FORWARD hook was skipped; the container's veth interface was not discovered."
+fi
+if ! grep -Fq "FORWARD hook installed" <<<"$OUTPUT"; then
+    fail "FORWARD hook installation was not confirmed."
+fi
+
 assert_firewall_chain_cleaned_up
 
 echo "PASS: dual-stack hostnames and mixed-family destinations were resolved and programmed."
