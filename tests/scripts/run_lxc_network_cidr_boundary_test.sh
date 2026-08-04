@@ -122,6 +122,9 @@ STATUS=$?
 set -e
 echo "$OUTPUT"
 
+# The container command is a local success command (see the fixture), so a
+# non-zero status reflects a firewall-setup failure on boundary-valid prefixes
+# rather than an unrelated network outage.
 if [ "$STATUS" -ne 0 ]; then
     fail "lxc-exec exited with status $STATUS for boundary-valid prefixes."
 fi
