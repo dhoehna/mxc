@@ -68,6 +68,8 @@ CRATES: list[str] = [
     "bwrap_common",
     "seatbelt_common",
     "sandbox_spec",
+    "learning_mode_core",
+    "learning_mode_windows",
     "appcontainer_common",
     "isolation_session_bindings",
     "isolation_session_common",

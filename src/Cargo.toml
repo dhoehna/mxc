@@ -114,8 +114,8 @@ windows_sandbox_common = { path = "backends/windows_sandbox/common", version = "
 windows_sandbox_lifecycle = { path = "backends/windows_sandbox/lifecycle", version = "0.7.0" }
 isolation_session_common = { path = "backends/isolation_session/common", version = "0.7.0" }
 hyperlight_common = { path = "backends/hyperlight/common", version = "0.7.0" }
-learning_mode_windows = { path = "backends/learning_mode/windows" }
-learning_mode_core = { path = "core/learning_mode_core" }
+learning_mode_windows = { path = "backends/learning_mode/windows", version = "0.7.0" }
+learning_mode_core = { path = "core/learning_mode_core", version = "0.7.0" }
 nanvix_runner = { path = "backends/nanvix/runner", version = "0.7.0" }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
