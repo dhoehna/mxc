@@ -92,7 +92,7 @@ impl NetworkIptablesManager {
     /// is always exactly 11 characters, keeping both derived names fixed-width.
     fn hash_token(name: &str) -> String {
         const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-        // 36^11 = 131_601_804_755_189_760 ≈ 2^56.9, fits in u64.
+        // 36^11 = 131_621_703_842_267_136 ≈ 2^56.9, fits in u64.
         const MODULUS: u64 = 36u64.pow(11);
 
         let mut value = Self::name_hash(name) % MODULUS;
