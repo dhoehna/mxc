@@ -680,12 +680,14 @@ impl NetworkIptablesManager {
             // reach". The same chain is reused, so a host-local proxy is still
             // permitted by its own ACCEPT rule while everything else on the host
             // is dropped.
-            // Flags are set *before* the inserts: every hook delete is scoped to
-            // this container's own veth, so a `-D` for a rule that was never
-            // inserted is a harmless no-op, whereas marking afterwards would
-            // leak the FORWARD hook if the INPUT insert failed. (The chain flags
-            // are the opposite case — `-F`/`-X` are name-scoped and can hit
-            // another container, so those are only set once `-N` has succeeded.)
+            // The hook flags (`v4_hooks`/`v6_hooks`) are set *before* the
+            // inserts: each covers a FORWARD+INPUT pair, so marking after the
+            // loop would leak the FORWARD hook if the INPUT insert failed, and a
+            // rollback `-D` for a hook that was never inserted is a harmless
+            // no-op because it is scoped to this container's own veth. (The
+            // chain flags are the opposite case — `-F`/`-X` are name-scoped and
+            // can hit another container, so those are only set once `-N` has
+            // succeeded.)
             created.v4_hooks = true;
             for hook in ["FORWARD", "INPUT"] {
                 Self::run_iptables(&["-I", hook, "-i", iface, "-j", &self.chain_name], logger)?;
@@ -697,13 +699,18 @@ impl NetworkIptablesManager {
             // `-I` pushes this ahead of the jump inserted above. It is a
             // link-local exchange with the bridge, not an egress path, so it
             // does not weaken the deny-all posture.
-            created.v4_dhcp = true;
+            //
+            // Unlike the hooks, this is a single insert, so the flag is set
+            // *after* the command succeeds. Marking before would let a rollback
+            // run `-D INPUT ... --dport 67` for a rule this attempt never
+            // created, deleting a matching DHCP accept the host already had.
             Self::run_iptables(
                 &[
                     "-I", "INPUT", "-i", iface, "-p", "udp", "--dport", "67", "-j", "ACCEPT",
                 ],
                 logger,
             )?;
+            created.v4_dhcp = true;
 
             if ipv6_enabled {
                 created.v6_hooks = true;
@@ -714,13 +721,16 @@ impl NetworkIptablesManager {
                     )?;
                 }
 
-                created.v6_dhcp = true;
+                // Same as the v4 DHCP accept: mark ownership only after the
+                // insert succeeds so a rollback never deletes a pre-existing
+                // rule this attempt did not create.
                 Self::run_ip6tables(
                     &[
                         "-I", "INPUT", "-i", iface, "-p", "udp", "--dport", "547", "-j", "ACCEPT",
                     ],
                     logger,
                 )?;
+                created.v6_dhcp = true;
             }
         } else {
             logger.log_line(
