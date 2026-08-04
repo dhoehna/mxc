@@ -298,15 +298,15 @@ impl NetworkIptablesManager {
 
         logger.log_line(&format!("Removing iptables chain: {}", self.chain_name));
 
-        // Remove from FORWARD (only if we had a veth interface and hooked it).
-        // Must match the `-i` direction used at insertion, or the delete finds
-        // no rule and the FORWARD hook leaks.
-        if let Some(ref iface) = self.veth_interface {
-            let _ = Self::run_iptables(
-                &["-D", "FORWARD", "-i", iface, "-j", &self.chain_name],
-                logger,
-            );
-        }
+        // Remove every FORWARD rule that jumps to this chain, regardless of the
+        // interface it was hooked on. The old code deleted only the
+        // `-i <veth>` rule it remembered installing, so a teardown that never
+        // learned the veth (signal-time force_cleanup, or a veth that was never
+        // discovered) left the FORWARD jump behind. Because the chain then
+        // stayed referenced, the `-X` below failed too and the whole chain
+        // leaked. Enumerating FORWARD and deleting by the `-j <chain>` target
+        // removes exactly what was installed.
+        self.remove_forward_hooks(logger);
 
         // Flush and delete the chain
         let _ = Self::run_iptables(&["-F", &self.chain_name], logger);
@@ -314,6 +314,52 @@ impl NetworkIptablesManager {
 
         self.rules_applied = false;
         Ok(())
+    }
+
+    /// Delete every rule in the FORWARD chain that jumps to this manager's
+    /// chain, whatever interface each was scoped to.
+    ///
+    /// Reads the live ruleset with `iptables -S FORWARD` and issues a matching
+    /// `-D` for each jump, so the hook is removed even when the veth is unknown
+    /// or was never discovered. If FORWARD cannot be read (no privilege, no
+    /// iptables) it is a no-op — there is nothing this process can safely delete
+    /// without the ruleset.
+    fn remove_forward_hooks(&self, logger: &mut Logger) {
+        let output = match Command::new("iptables").args(["-S", "FORWARD"]).output() {
+            Ok(o) if o.status.success() => o,
+            _ => return,
+        };
+        let dump = String::from_utf8_lossy(&output.stdout);
+        for deletion in Self::forward_hook_deletions(&dump, &self.chain_name) {
+            let args: Vec<&str> = deletion.iter().map(String::as_str).collect();
+            let _ = Self::run_iptables(&args, logger);
+        }
+    }
+
+    /// Parse `iptables -S FORWARD` output into a `-D` argument list for every
+    /// rule that jumps to `chain`.
+    ///
+    /// Each `-A FORWARD ... -j <chain>` line becomes the same rule spec with the
+    /// leading `-A` swapped for `-D`, so the delete matches the exact rule that
+    /// was appended regardless of the `-i`/`-o` interface qualifiers it carries.
+    /// Split out from process execution so the matching is testable without
+    /// iptables.
+    fn forward_hook_deletions(forward_dump: &str, chain: &str) -> Vec<Vec<String>> {
+        let mut deletions = Vec::new();
+        for line in forward_dump.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.first() != Some(&"-A") || tokens.get(1) != Some(&"FORWARD") {
+                continue;
+            }
+            let jumps_to_chain = tokens.windows(2).any(|w| w[0] == "-j" && w[1] == chain);
+            if !jumps_to_chain {
+                continue;
+            }
+            let mut deletion: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+            deletion[0] = "-D".to_string();
+            deletions.push(deletion);
+        }
+        deletions
     }
 
     /// Best-effort cleanup of any iptables state the runner may have
