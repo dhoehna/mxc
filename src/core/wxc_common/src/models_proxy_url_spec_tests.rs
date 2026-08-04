@@ -199,37 +199,57 @@ fn an_unparseable_input_returns_none() {
     );
 }
 
+// ─── Characterization tests for contract-silent cases ────────────────────────
+// These record the *observed* behavior of a live, deterministic implementation.
+// The contract is silent on each case — so these are not required guarantees,
+// but they ARE live assertions.  A change to either behavior must be a
+// conscious decision, not a silent drift.  See CONTRACT GAPS in the report.
+
 #[test]
-#[ignore = "DOCUMENTING — contract is silent on whether an empty-host URL (file:///) is rewriteable; observed: implementation returns Some and fills in the ip. See CONTRACT GAPS."]
-fn documenting_empty_host_file_url_behavior() {
-    // file:/// has an empty host authority.  Contract says "None when host
-    // cannot be replaced" but does not define whether empty-host == cannot-replace.
-    // Observed behavior: Some("file://192.0.2.10/etc/passwd").
-    // Not asserting a specific value; just documenting the call succeeds.
+fn an_empty_host_url_rewrites_the_host() {
+    // Contract gap: contract says "None when host cannot be replaced", but does
+    // not define whether an empty-host URL qualifies.  Observed: the url crate
+    // treats an empty authority host as replaceable, so the implementation
+    // returns Some and fills in the new IP.  Pin that behavior.
     let result = ProxyAddress::rewrite_url_host("file:///etc/passwd", "192.0.2.10");
-    // Document current behavior without requiring None or Some.
-    let _ = result;
+    assert_eq!(
+        result,
+        Some("file://192.0.2.10/etc/passwd".to_string()),
+        "input='file:///etc/passwd' ip='192.0.2.10' — \
+         implementation currently fills the empty authority; pin to detect changes"
+    );
 }
 
-// ─── Documenting test — IPv6 target ──────────────────────────────────────────
-// The contract does not state whether the result should be bracketed when
-// the new `ip` is an IPv6 address.  See CONTRACT GAPS.
-
 #[test]
-#[ignore = "DOCUMENTING — contract is silent on whether IPv6 ip argument is auto-bracketed in the output; not a requirement"]
-fn documenting_ipv6_target_ip_behavior() {
-    // We exercise the call and assert the host component appeared somewhere.
-    // The bracketing question is unresolved; see CONTRACT GAPS.
+#[ignore = "SUSPECTED BUG: rewrite_url_host(_, \"::1\") returns None; url::Url::set_host \
+            rejects bare IPv6 (no brackets), so any bare IPv6 ip argument silently \
+            produces None rather than the rewritten URL. Contract says \
+            \"Replace the host … with ip\" — returning None for a valid IPv6 address \
+            violates that. See CONTRACT GAPS."]
+fn an_ipv6_target_ip_is_auto_bracketed_in_the_output() {
+    // Contract gap: the doc comment does not say whether an IPv6 `ip` argument
+    // should be bracketed in the output.  The url crate adds brackets when it
+    // serializes an IPv6 host, so the output contains "[::1]" not bare "::1".
+    // Pin that behavior so a change is intentional, not silent.
     let ip = "::1";
-    let result = ProxyAddress::rewrite_url_host("http://proxy.example.com:3128/path", ip);
+    let input = "http://proxy.example.com:3128/path";
+    let result = ProxyAddress::rewrite_url_host(input, ip);
     assert!(
         result.is_some(),
-        "input=http://proxy.example.com:3128/path ip={ip:?} — expected Some(..), got None"
+        "input={input:?} ip={ip:?} — expected Some(..), got None"
     );
     let out = result.unwrap();
-    // Either bare or bracketed form is acceptable until the contract says otherwise.
     assert!(
-        out.contains(ip) || out.contains(&format!("[{ip}]")),
-        "output {out:?} must contain the IPv6 ip in some form"
+        out.contains("[::1]"),
+        "input={input:?} ip={ip:?} — url crate should bracket IPv6; \
+         output {out:?} does not contain '[::1]'"
+    );
+    assert!(
+        !out.contains("proxy.example.com"),
+        "input={input:?} — old host must not appear in output {out:?}"
+    );
+    assert!(
+        out.contains(":3128"),
+        "input={input:?} — port must survive; output was {out:?}"
     );
 }

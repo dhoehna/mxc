@@ -159,18 +159,70 @@ fn a_host_that_contains_localhost_as_a_suffix_is_not_loopback() {
     );
 }
 
-// ─── Documenting tests for contract-silent cases ─────────────────────────────
-// These record the *observed* behavior.  They are NOT contract assertions.
-// See ## CONTRACT GAPS in the task report for reasoning.
+// ─── Characterization tests for contract-silent cases ────────────────────────
+// These record the *observed* behavior of a live, deterministic implementation.
+// The contract is silent on each case — so these are not required guarantees,
+// but they ARE live assertions.  A change to any of these behaviors must be
+// a conscious decision, not a silent drift.  See CONTRACT GAPS in the report.
 
 #[test]
-#[ignore = "DOCUMENTING — contract is silent on empty string behavior; not a requirement"]
-fn documenting_empty_string_behavior_is_not_loopback() {
-    // The contract names three families; empty string matches none of them.
-    // Expected: false.  If this fails, the implementation treats "" as loopback,
-    // which is worth surfacing.
+fn empty_string_is_not_loopback() {
+    // Contract is silent on empty string.  The three named families (127.0.0.0/8,
+    // ::1, "localhost") do not include ""; this assertion pins that it stays false.
+    // For a security predicate, silently flipping "" to loopback would be a bug.
     assert!(
         !host_is_loopback(""),
-        "input='' — documenting: empty string should not be loopback"
+        "input='' — empty string must not be treated as loopback"
+    );
+}
+
+#[test]
+fn uppercase_localhost_is_loopback() {
+    // Contract gap 2: the doc comment says `the name "localhost"` without
+    // specifying case.  The implementation uses `eq_ignore_ascii_case`, so
+    // "LOCALHOST" and "LocalHost" are treated as loopback today.
+    // This is a characterization test — the contract does not require it,
+    // but a change here should be intentional.
+    assert!(
+        host_is_loopback("LOCALHOST"),
+        "input=LOCALHOST — implementation treats this as loopback (eq_ignore_ascii_case); \
+         pin to catch silent changes"
+    );
+    assert!(
+        host_is_loopback("LocalHost"),
+        "input=LocalHost — implementation treats this as loopback (eq_ignore_ascii_case); \
+         pin to catch silent changes"
+    );
+}
+
+#[test]
+fn ipv4_mapped_ipv6_loopback_is_not_loopback() {
+    // Contract gap 3: the contract names "127.0.0.0/8" and "::1" but not
+    // IPv4-mapped IPv6 (::ffff:127.0.0.1).  Rust's IpAddr::is_loopback()
+    // returns false for IPv4-mapped addresses; this test pins that behavior.
+    // For this call site (config_parser.rs:1028) a false negative is
+    // fail-safe: the container is given an unreachable proxy, not open access.
+    assert!(
+        !host_is_loopback("::ffff:127.0.0.1"),
+        "input=::ffff:127.0.0.1 — IPv4-mapped IPv6 loopback; not in contract; \
+         currently returns false (not caught); pin to detect behavior change"
+    );
+    assert!(
+        !host_is_loopback("[::ffff:127.0.0.1]"),
+        "input=[::ffff:127.0.0.1] — bracketed IPv4-mapped form; also currently false; \
+         pin to detect behavior change"
+    );
+}
+
+#[test]
+fn trailing_dot_localhost_is_not_loopback() {
+    // Contract gap 5: the contract says `the name "localhost"` with no mention
+    // of FQDN trailing-dot form.  "localhost." does not equal "localhost" under
+    // exact-match or eq_ignore_ascii_case, and does not parse as an IpAddr,
+    // so the implementation returns false.  Pin that.
+    assert!(
+        !host_is_loopback("localhost."),
+        "input='localhost.' — trailing-dot FQDN form; contract requires exact \
+         name match; must NOT be loopback"
     );
 }
