@@ -39,6 +39,7 @@ run_test "Bubblewrap Object Validation" "$SCRIPT_DIR/run_bwrap_filesystem_object
 run_test "Bubblewrap Most-Specific Path" "$SCRIPT_DIR/run_bwrap_most_specific_test.sh"
 run_test "Bubblewrap Denied Masking" "$SCRIPT_DIR/run_bwrap_denied_masking_test.sh"
 run_test "Bubblewrap Network Block" "$SCRIPT_DIR/run_bwrap_network_test.sh"
+run_test "Bubblewrap Network Firewall" "$SCRIPT_DIR/run_bwrap_network_firewall_test.sh"
 run_test "Bubblewrap Network Proxy" "$SCRIPT_DIR/run_bwrap_network_proxy_test.sh"
 run_test "Linux Process Default" "$SCRIPT_DIR/run_linux_process_default_test.sh"
 
