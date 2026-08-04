@@ -431,7 +431,8 @@ impl ProxyAddress {
     /// hostname itself and, under round-robin or split-horizon DNS, can pick an
     /// address the firewall never allowed.
     pub fn pinned_to_ip(&self, ip: &str) -> Self {
-        let fallback = || format!("http://{}:{}", ip, self.port);
+        let ip_host = Self::bracket_if_ipv6(ip);
+        let fallback = || format!("http://{}:{}", ip_host, self.port);
         let rewritten = match &self.original_url {
             Some(raw) => Self::rewrite_url_host(raw, ip).unwrap_or_else(fallback),
             None => fallback(),
@@ -444,12 +445,26 @@ impl ProxyAddress {
         }
     }
 
+    /// Return `ip` unchanged unless it is a bare (unbracketed) IPv6 literal, in
+    /// which case wrap it in `[` `]` so it is valid as a URL host component and
+    /// as the argument to `Url::set_host`.
+    fn bracket_if_ipv6(ip: &str) -> std::borrow::Cow<'_, str> {
+        if ip.starts_with('[') {
+            return std::borrow::Cow::Borrowed(ip);
+        }
+        match ip.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(_)) => std::borrow::Cow::Owned(format!("[{ip}]")),
+            _ => std::borrow::Cow::Borrowed(ip),
+        }
+    }
+
     /// Replace the host of `raw` with `ip`, preserving scheme, credentials,
     /// port and path. Returns `None` when `raw` is not a parseable URL or the
     /// host cannot be replaced, letting the caller fall back.
     fn rewrite_url_host(raw: &str, ip: &str) -> Option<String> {
+        let ip_host = Self::bracket_if_ipv6(ip);
         let mut parsed = url::Url::parse(raw).ok()?;
-        parsed.set_host(Some(ip)).ok()?;
+        parsed.set_host(Some(&ip_host)).ok()?;
         let mut pinned = parsed.to_string();
         // `Url::to_string` normalises an empty path to "/"; drop it again when
         // the configured URL had none, so the injected value keeps the shape

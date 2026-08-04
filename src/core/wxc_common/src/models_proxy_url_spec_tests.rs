@@ -221,16 +221,11 @@ fn an_empty_host_url_rewrites_the_host() {
 }
 
 #[test]
-#[ignore = "SUSPECTED BUG: rewrite_url_host(_, \"::1\") returns None; url::Url::set_host \
-            rejects bare IPv6 (no brackets), so any bare IPv6 ip argument silently \
-            produces None rather than the rewritten URL. Contract says \
-            \"Replace the host … with ip\" — returning None for a valid IPv6 address \
-            violates that. See CONTRACT GAPS."]
-fn an_ipv6_target_ip_is_auto_bracketed_in_the_output() {
-    // Contract gap: the doc comment does not say whether an IPv6 `ip` argument
-    // should be bracketed in the output.  The url crate adds brackets when it
-    // serializes an IPv6 host, so the output contains "[::1]" not bare "::1".
-    // Pin that behavior so a change is intentional, not silent.
+fn an_ipv6_target_ip_is_bracketed_in_the_rewrite_output() {
+    // Previously SUSPECTED BUG; now fixed by bracket_if_ipv6.
+    // Contract gap: the doc comment is silent on whether an IPv6 ip is bracketed
+    // in the output.  The fix brackets before set_host, so the output contains
+    // "[::1]" and is a parseable URL.
     let ip = "::1";
     let input = "http://proxy.example.com:3128/path";
     let result = ProxyAddress::rewrite_url_host(input, ip);
@@ -241,8 +236,7 @@ fn an_ipv6_target_ip_is_auto_bracketed_in_the_output() {
     let out = result.unwrap();
     assert!(
         out.contains("[::1]"),
-        "input={input:?} ip={ip:?} — url crate should bracket IPv6; \
-         output {out:?} does not contain '[::1]'"
+        "input={input:?} ip={ip:?} — output {out:?} must contain bracketed '[::1]'"
     );
     assert!(
         !out.contains("proxy.example.com"),
@@ -251,5 +245,106 @@ fn an_ipv6_target_ip_is_auto_bracketed_in_the_output() {
     assert!(
         out.contains(":3128"),
         "input={input:?} — port must survive; output was {out:?}"
+    );
+    // Strongest assertion: the output must be a parseable URL with [::1] as host.
+    let parsed = url::Url::parse(&out).expect(&format!("output {out:?} must be parseable"));
+    assert_eq!(
+        parsed.host_str(),
+        Some("[::1]"),
+        "parsed host must be [::1] (url crate includes brackets in host_str for IPv6); output={out:?}"
+    );
+}
+
+// ─── pinned_to_ip with IPv6 ip ────────────────────────────────────────────────
+// These cover the production call site (models.rs:pinned_to_ip) for the fallback
+// and rewrite paths with a bare IPv6 ip.
+
+#[test]
+fn pinned_to_ip_with_ipv6_and_no_original_url_produces_parseable_url() {
+    // The None branch: fallback = format!("http://{}:{}", ip_host, port).
+    // Without bracket_if_ipv6 this was "http://::1:3128" — an unparseable URL.
+    let proxy = ProxyAddress {
+        address: "proxy.example.com".to_string(),
+        port: 3128,
+        original_url: None,
+    };
+    let pinned = proxy.pinned_to_ip("::1");
+    let url_str = pinned
+        .original_url
+        .as_deref()
+        .expect("pinned_to_ip must set original_url");
+    let parsed = url::Url::parse(url_str)
+        .expect(&format!("original_url={url_str:?} must be a parseable URL"));
+    assert_eq!(
+        parsed.host_str(),
+        Some("[::1]"),
+        "original_url={url_str:?} — host must round-trip to [::1]"
+    );
+    assert_eq!(
+        parsed.port(),
+        Some(3128),
+        "original_url={url_str:?} — port must be 3128"
+    );
+}
+
+#[test]
+fn pinned_to_ip_with_ipv6_and_original_url_produces_parseable_url() {
+    // The Some(raw) branch: rewrite_url_host uses bracket_if_ipv6.
+    // Without the fix, rewrite_url_host returned None and fell back to the broken
+    // fallback; now it rewrites correctly.
+    let proxy = ProxyAddress {
+        address: "proxy.example.com".to_string(),
+        port: 3128,
+        original_url: Some("http://proxy.example.com:3128/path?q=1".to_string()),
+    };
+    let pinned = proxy.pinned_to_ip("::1");
+    let url_str = pinned
+        .original_url
+        .as_deref()
+        .expect("pinned_to_ip must set original_url");
+    let parsed = url::Url::parse(url_str)
+        .expect(&format!("original_url={url_str:?} must be a parseable URL"));
+    assert_eq!(
+        parsed.host_str(),
+        Some("[::1]"),
+        "original_url={url_str:?} — host must round-trip to [::1]"
+    );
+    assert_eq!(
+        parsed.port(),
+        Some(3128),
+        "original_url={url_str:?} — port must survive"
+    );
+    assert_eq!(
+        parsed.query(),
+        Some("q=1"),
+        "original_url={url_str:?} — query must survive"
+    );
+}
+
+// ─── IpAddr parsing behavior — evidence for bracket_if_ipv6 strategy ─────────
+
+#[test]
+fn ipaddr_parse_behavior_underlying_bracket_if_ipv6() {
+    // Evidence that the IpAddr-parse approach used in bracket_if_ipv6 is correct:
+    // V6 addresses parse as V6 (need bracketing), V4 and hostnames do not.
+    // Verified by running this test before the fix was written.
+    use std::net::IpAddr;
+    assert!(
+        matches!("::1".parse::<IpAddr>().unwrap(), IpAddr::V6(_)),
+        "'::1' must parse as IpAddr::V6 — these are the inputs that need bracketing"
+    );
+    assert!(
+        matches!("10.0.0.2".parse::<IpAddr>().unwrap(), IpAddr::V4(_)),
+        "'10.0.0.2' must parse as IpAddr::V4 — must NOT be bracketed"
+    );
+    assert!(
+        "proxy.example.com".parse::<IpAddr>().is_err(),
+        "'proxy.example.com' must not parse as IpAddr — must NOT be bracketed"
+    );
+    // Already-bracketed form does not parse; bracket_if_ipv6 catches this via
+    // starts_with('[') before attempting the parse.
+    assert!(
+        "[::1]".parse::<IpAddr>().is_err(),
+        "'[::1]' must not parse as IpAddr — brackets are not IpAddr notation"
     );
 }
