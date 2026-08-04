@@ -394,6 +394,34 @@ impl NetworkIptablesManager {
         candidate.parse::<std::net::IpAddr>().is_ok()
     }
 
+    /// Whether `host` is an IPv6 literal (bracketed `[..]` or bare).
+    ///
+    /// The proxy firewall rule is emitted with IPv4 `iptables` only, so an IPv6
+    /// proxy endpoint cannot be enforced. It must be rejected explicitly rather
+    /// than passed to IPv4-only resolution, which would drop it and leave a
+    /// deny-all container whose proxy was silently discarded.
+    fn host_is_ipv6_literal(host: &str) -> bool {
+        let candidate = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        matches!(
+            candidate.parse::<std::net::IpAddr>(),
+            Ok(std::net::IpAddr::V6(_))
+        )
+    }
+
+    /// The error returned when a proxy endpoint is an IPv6 literal, which the
+    /// IPv4-only proxy firewall rule cannot enforce.
+    fn ipv6_proxy_unsupported(host: &str) -> String {
+        format!(
+            "IPv6 network proxy endpoints are not supported: the proxy firewall rule is \
+             emitted with IPv4 iptables only, so '{}' cannot be enforced and would be \
+             silently dropped. Use an IPv4 proxy address.",
+            host
+        )
+    }
+
     /// Pin an enabled, hostname-addressed proxy to a single host-resolved IPv4
     /// address.
     ///
@@ -405,9 +433,10 @@ impl NetworkIptablesManager {
     /// port 53 would otherwise leave in a deny-all posture.
     ///
     /// Returns the config unchanged when the proxy is disabled, has no address
-    /// (built-in test server), or is already an IP literal. Multi-A-record
-    /// hostnames collapse to the first resolved address, which is the point:
-    /// both sides then agree on one IP instead of racing DNS.
+    /// (built-in test server), or is already an IPv4 literal. An IPv6 literal is
+    /// rejected explicitly (the rule set is IPv4-only). Multi-A-record hostnames
+    /// collapse to the first resolved address, which is the point: both sides
+    /// then agree on one IP instead of racing DNS.
     pub fn pin_proxy_to_resolved_ip(
         proxy: &ProxyConfig,
         logger: &mut Logger,
@@ -419,6 +448,13 @@ impl NetworkIptablesManager {
         let Some(address) = proxy.address.as_ref() else {
             return Ok(proxy.clone());
         };
+
+        // Reject an IPv6 literal before the `host_is_ip_literal` short-circuit
+        // below would treat it as "already pinned" and hand it downstream to
+        // IPv4-only resolution, which drops it.
+        if Self::host_is_ipv6_literal(address.host()) {
+            return Err(Self::ipv6_proxy_unsupported(address.host()));
+        }
 
         if Self::host_is_ip_literal(address.host()) {
             return Ok(proxy.clone());
@@ -468,6 +504,14 @@ impl NetworkIptablesManager {
 
         if address.port() == 0 {
             return Err("Network proxy port must be between 1 and 65535".to_string());
+        }
+
+        // Reject an IPv6 literal explicitly. `resolve_host` is IPv4-only and
+        // would return an empty vec for a v6 address, which the check below
+        // would then report as an unresolvable host — a misleading error for a
+        // perfectly valid literal we simply cannot enforce.
+        if Self::host_is_ipv6_literal(address.host()) {
+            return Err(Self::ipv6_proxy_unsupported(address.host()));
         }
 
         let ips = Self::resolve_host(address.host());
