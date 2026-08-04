@@ -29,11 +29,19 @@ WORK_DIR="$(mktemp -d)"
 SANDBOX_ID=""
 PASSED=0
 FAILED=0
+CLEANED_UP=0
 
 # Always attempt to tear the container down, including on an early failure or a
 # signal. A leaked container outlives the test run and breaks the next one, so
 # this is best-effort and deliberately ignores its own exit status.
+#
+# A signal fires this trap and then the shell exits, firing the EXIT trap as
+# well, so the guard makes the deprovision run at most once rather than twice.
 cleanup() {
+    if [ "$CLEANED_UP" -ne 0 ]; then
+        return
+    fi
+    CLEANED_UP=1
     if [ -n "$SANDBOX_ID" ]; then
         echo "--- cleanup: deprovision $SANDBOX_ID ---"
         run_phase deprovision "$SANDBOX_ID" >/dev/null 2>&1 || true
