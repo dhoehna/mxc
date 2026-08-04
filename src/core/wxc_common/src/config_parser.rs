@@ -995,6 +995,11 @@ fn convert_wire_config(
 
         if let Some(p) = net.default_policy {
             policy.default_network_policy = p.into();
+            // Preserve the presence bit the wire `Option<NetworkPolicy>` carried:
+            // once flattened, an explicit `defaultPolicy: "block"` is otherwise
+            // indistinguishable from the struct default a policy-free start
+            // produces.
+            policy.default_network_policy_present = true;
         }
 
         if let Some(m) = net.enforcement_mode {
