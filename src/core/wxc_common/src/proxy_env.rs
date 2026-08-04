@@ -148,9 +148,11 @@ pub fn apply_proxy_env(env: &mut Vec<String>, proxy: &ProxyConfig) -> bool {
 
     // Proxy disabled: still strip inherited proxy vars so a caller cannot point
     // the sandbox at an egress path the policy never authorized.
-    let original_len = env.len();
+    // Always return true so the caller emits --clear-env even when the input
+    // was empty — an empty env must still prevent lxc-attach from inheriting
+    // the full MXC host process environment (including proxy vars and tokens).
     env.retain(|entry| !is_managed_proxy_key(env_key(entry)));
-    env.len() != original_len
+    true
 }
 
 #[cfg(test)]
@@ -373,12 +375,20 @@ mod tests {
     }
 
     #[test]
-    fn apply_proxy_env_disabled_no_proxy_vars_does_not_force_clear() {
+    fn apply_proxy_env_disabled_always_forces_clear_even_without_proxy_vars() {
+        // Previously asserted !force_clear, which was wrong and masked the leak.
+        // The fix makes apply_proxy_env return true unconditionally in the
+        // proxy-disabled branch so --clear-env is always emitted.  Non-proxy
+        // vars (PATH) must survive the scrub unchanged.
+        // Safe to assert true here: with a non-empty env the !env.is_empty()
+        // arm of build_attach_args already triggered --clear-env before the fix,
+        // so the produced argv is byte-identical for this input.  The bool only
+        // changed observable attach-args behavior for the empty-env case.
         let mut env = vec!["PATH=/usr/bin".to_string()];
 
         let force_clear = apply_proxy_env(&mut env, &ProxyConfig::default());
 
-        assert!(!force_clear);
+        assert!(force_clear);
         assert_eq!(env, vec!["PATH=/usr/bin"]);
     }
 }
