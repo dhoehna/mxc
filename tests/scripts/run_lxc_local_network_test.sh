@@ -7,15 +7,24 @@
 #       Runs each config, dumps the container's iptables chain from INSIDE the
 #       container's network namespace (via `nsenter -t <init-pid> -n`), and
 #       asserts the NEW-inbound decision that actually enforces the field:
-#           allowLocalNetwork: true   =>  -m state --state NEW -j ACCEPT
 #           allowLocalNetwork: absent =>  -m state --state NEW -j DROP  (default)
-#       It also asserts loopback is an UNCONDITIONAL accept (`-i lo -j ACCEPT`)
-#       in both cases. The chain is hooked into the container's INPUT chain, so
-#       it governs NEW connections *destined to the container's sockets* — from
-#       the host or from a peer alike. See network_iptables.rs
-#       build_firewall_rules() and lxc_runner.rs (init-PID discovery ->
-#       set_netns_pid). The chain is NOT on the host, so a host-side
-#       `iptables -S MXC-<id>` shows nothing; the dump must enter the netns.
+#       It also asserts loopback is an UNCONDITIONAL accept (`-i lo -j ACCEPT`).
+#       The chain is hooked into the container's INPUT chain, so it governs NEW
+#       connections *destined to the container's sockets* — from the host or from
+#       a peer alike. See network_iptables.rs build_firewall_rules() and
+#       lxc_runner.rs (init-PID discovery -> set_netns_pid). The chain is NOT on
+#       the host, so a host-side `iptables -S MXC-<id>` shows nothing; the dump
+#       must enter the netns.
+#
+#   [REFUSED]  --- asserts the permissive path is not silently over-broad ---
+#       allowLocalNetwork: true is not yet implemented: scoping inbound to host
+#       loopback needs a loopbackPorts schema field and a host-loopback forwarder
+#       that do not exist yet, and the only rule available today is an unscoped
+#       `--state NEW -j ACCEPT` that accepts inbound from every interface and
+#       source. So the run is REFUSED with a not-yet-implemented error before any
+#       chain is built (network_iptables.rs apply_firewall_rules), rather than
+#       installing the over-broad accept. This layer asserts the refusal and that
+#       no NEW-ACCEPT chain was installed.
 #
 #   [BEHAVIOR]  --- end-to-end over a GOVERNED path ---
 #       Starts a `netcheck serve` listener INSIDE a server container (launched
@@ -23,7 +32,6 @@
 #       `netcheck connect` against the server's IP. Peer->server traffic is
 #       inbound to the server container and therefore traverses the server's
 #       INPUT chain, so the NEW-inbound rule applies:
-#           allowLocalNetwork: true   =>  reachable
 #           allowLocalNetwork: absent =>  blocked
 #       Under the INPUT design a host->container-direct probe is now governed
 #       too (host-originated packets reach the container's INPUT); the peer
@@ -73,6 +81,8 @@ rule_fail=0
 behavior_pass=0
 behavior_fail=0
 behavior_inconclusive=0
+refused_pass=0
+refused_fail=0
 
 # Write a peer client config that connects to the server IP over the bridge.
 # Generated at runtime because the server IP isn't known until the server is
@@ -99,11 +109,55 @@ write_client_config() {
   },
   "network": {
     "defaultPolicy": "block",
-    "enforcementMode": "firewall",
-    "allowLocalNetwork": true
+    "enforcementMode": "firewall"
   }
 }
 EOF
+}
+
+# Assert that a config requesting the not-yet-implemented permissive inbound
+# path (allowLocalNetwork: true) is REFUSED rather than silently installing an
+# over-broad `--state NEW -j ACCEPT`. The run must fail with the
+# not-yet-implemented error and must not leave a NEW-ACCEPT chain in the netns.
+#
+# lxc-exec's process exit code for a ScriptResponse error is not relied on here
+# (it is reported for diagnostics only); the authoritative signal is the error
+# text captured from the runner's combined stdout/stderr, plus the absence of
+# an installed accept chain.
+run_error_case() {
+    local label="$1" config="$2" cid="$3"
+    echo
+    echo "===================== $label ====================="
+
+    local log="/tmp/netcheck_${cid}.log"
+    "$LXC_EXEC" "$config" > "$log" 2>&1
+    local rc=$?
+
+    local ok=1
+    if ! grep -qi 'not yet implemented' "$log" 2>/dev/null; then
+        ok=0
+        echo "[REFUSED] FAIL  runner log missing the not-yet-implemented error (rc=$rc; see $log)"
+    fi
+
+    # Best-effort corroboration: the container is destroyed on refusal, but if a
+    # PID is still visible, confirm no over-broad NEW ACCEPT chain was installed.
+    local pid dump
+    pid="$(lxc-info -pH -n "$cid" 2>/dev/null | grep -oE '[0-9]+' | head -n1)"
+    if [ -n "$pid" ]; then
+        dump="$(nsenter -t "$pid" -n iptables -S "MXC-${cid}" 2>/dev/null)"
+        if echo "$dump" | grep -q -- '-m state --state NEW -j ACCEPT'; then
+            ok=0
+            echo "[REFUSED] FAIL  an over-broad NEW ACCEPT chain was installed despite refusal"
+        fi
+    fi
+
+    if [ "$ok" -eq 1 ]; then
+        echo "[REFUSED] PASS  permissive path refused (not-yet-implemented; rc=$rc); no accept chain"
+        refused_pass=$((refused_pass + 1))
+    else
+        sed 's/^/       /' "$log" 2>/dev/null | tail -n 20
+        refused_fail=$((refused_fail + 1))
+    fi
 }
 
 run_case() {
@@ -207,15 +261,17 @@ run_case() {
     wait "$mxc_pid" 2>/dev/null
 }
 
-run_case "allowLocalNetwork: TRUE  (expect NEW ACCEPT, reachable)" \
-    "$CONFIG_DIR/lxc_local_network_allow.json" "lxc-localnet-allow" "ACCEPT" "yes"
+run_error_case "allowLocalNetwork: TRUE  (permissive path not yet implemented -> refused)" \
+    "$CONFIG_DIR/lxc_local_network_allow.json" "lxc-localnet-allow"
 run_case "allowLocalNetwork: FALSE (expect NEW DROP, blocked)" \
     "$CONFIG_DIR/lxc_local_network_deny.json" "lxc-localnet-deny" "DROP" "no"
 
 echo
 echo "==================== SUMMARY ===================="
 echo "[RULE]     pass=$rule_pass fail=$rule_fail"
+echo "[REFUSED]  pass=$refused_pass fail=$refused_fail"
 echo "[BEHAVIOR] pass=$behavior_pass fail=$behavior_fail inconclusive=$behavior_inconclusive"
-# Fail on any rule mismatch or any decisive behavioral mismatch. INCONCLUSIVE
-# (peer container could not run) does not fail the suite but is reported above.
-[ "$rule_fail" -eq 0 ] && [ "$behavior_fail" -eq 0 ]
+# Fail on any rule mismatch, any refusal mismatch, or any decisive behavioral
+# mismatch. INCONCLUSIVE (peer container could not run) does not fail the suite
+# but is reported above.
+[ "$rule_fail" -eq 0 ] && [ "$refused_fail" -eq 0 ] && [ "$behavior_fail" -eq 0 ]
