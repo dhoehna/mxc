@@ -27,11 +27,16 @@ Subcommands
 package       Validate and package the complete first-party closure, then write
               `.crate` files and release-order.json.
 
+order         Print the leaf-first publish order, derived from `cargo metadata`.
+              Developer-facing: paste its output over the `crateOrder` default
+              in templates/Publish.CratesIo.Job.yml. Not used by the pipeline.
+
 verify-order  Assert that the crates the pipeline is about to publish are a
               correctly-ordered subset of what was packaged. A partial subset is
               allowed so an operator can resume a release that failed partway.
 
-stage         Copy one `.crate` file into a clean directory for an ESRP task.
+stage         Copy one `.crate` file into a clean directory for an ESRP task,
+              re-checking its recorded SHA-256 first.
 
 Resuming a failed release
 -------------------------
