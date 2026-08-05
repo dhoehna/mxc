@@ -80,13 +80,20 @@ actual_policy="$(read_json_field network.defaultPolicy)"
 echo "Fixture drift guard passed (proxy.url=$actual_url, defaultPolicy=$actual_policy)."
 
 # ---------------------------------------------------------------------------
-# Conditional assertions: the live container run. Skip (loudly) when a
-# prerequisite is missing so a skip never masquerades as a pass.
+# Conditional assertions: the live container run. Skip with exit 77 when a
+# prerequisite is missing, matching run_bwrap_network_firewall_test.sh, so a
+# skip is never tallied as a pass. Aggregators that do not yet classify 77
+# (run_lxc_all_tests.sh gains that in PR #724) count it as a failure, which is
+# the safe direction: the siblings in this suite already exit 1 on a missing
+# prerequisite, so this reports no worse than they do and never reports green
+# on assertions it did not run.
 # ---------------------------------------------------------------------------
+SKIP_EXIT=77
+
 skip_live() {
     echo "SKIP: LXC deny-all-except-proxy behaviour UNVERIFIED — $*"
     echo "      (fixture drift guard still ran and passed)"
-    exit 0
+    exit "$SKIP_EXIT"
 }
 
 LXC_EXEC="$REPO_DIR/src/target/release/lxc-exec"
