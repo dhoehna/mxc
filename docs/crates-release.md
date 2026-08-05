@@ -47,11 +47,32 @@ Defined in `.azure-pipelines/scripts/crates_release.py`:
 | 20 | `mxc-sdk` |
 
 These names are provisional until the public naming scheme is approved. The
-same sequence is duplicated as the `crateOrder` default in
-`.azure-pipelines/1ES.Release.Crates.yml`, and `verify-order` fails the run if
-the two disagree. It accepts an ordered subset of the packaged closure, so a
-`crateOrder` that omits crates will pass — that is what makes a partial resume
-possible, and it is why the list must be edited deliberately.
+same sequence is mirrored as the `crateOrder` default in
+`.azure-pipelines/templates/Publish.CratesIo.Job.yml`, and `verify-order` fails
+the run if the two disagree. It accepts an ordered subset of the packaged
+closure, so a `crateOrder` that omits crates will pass — that is what makes a
+partial resume possible, and it is why the list must be edited deliberately.
+
+**You do not work the order out by hand.** It is a topological sort of the
+workspace dependency graph, derived from `cargo metadata`:
+
+```bash
+# validate the current order against the real dependency graph
+python3 .azure-pipelines/scripts/crates_release.py order --check
+
+# emit the list ready to paste into Publish.CratesIo.Job.yml
+python3 .azure-pipelines/scripts/crates_release.py order --format yaml
+
+# compute a FRESH order after adding a crate (see caveat below)
+python3 .azure-pipelines/scripts/crates_release.py order --derive
+```
+
+`--derive` computes a new order from the graph; `--format yaml` mirrors the
+existing `CRATES` list. They differ deliberately. Any dependency graph admits
+several valid topological orders, and `verify-order` requires the template's
+`crateOrder` to be an ordered subset of the *packaged* order — which comes from
+`CRATES`. So a derived order pasted into the template alone will fail the run.
+**When adding a crate, update `CRATES` and the template together.**
 
 ## How versions are determined
 
@@ -140,11 +161,12 @@ means cutting a new release ref.
    | **ESRP release owners email** (`esrpOwnersEmail`) | Defaults to `Darren.Hoehna@microsoft.com`; see [ESRP identity](#esrp-identity) below. |
    | **ESRP release approvers email** (`esrpApproversEmail`) | Defaults to `Darren.Hoehna@microsoft.com`; see [ESRP identity](#esrp-identity) below. |
 
-   `crateOrder` is an `object` parameter whose default is the full 20-crate
-   list baked into the YAML, so a full release needs no input here. Whether
-   Azure DevOps renders an `object` parameter as an editable field in the Run
-   dialog is unverified; to change the list (to resume a partial release), edit
-   the pipeline file — see [Resuming a failed release](#resuming-a-failed-release).
+   The Run dialog shows exactly these three fields. `crateOrder` is
+   deliberately **not** a pipeline parameter — it is a dependency-derived
+   topological order, not an operator choice, so it lives in
+   `.azure-pipelines/templates/Publish.CratesIo.Job.yml` where the dialog
+   cannot render it. To change it (to resume a partial release), edit that
+   template — see [Resuming a failed release](#resuming-a-failed-release).
 
 5. Click **Run**.
 6. Confirm the package stage succeeds, `verify-order` passes, and each crate
@@ -203,10 +225,12 @@ To resume:
 
 1. Identify which crates were already published (check the pipeline logs — each
    successful `EsrpRelease@12` task confirms its crate).
-2. Edit the `crateOrder` default in `.azure-pipelines/1ES.Release.Crates.yml`,
-   removing the already-published crates, and merge that change to `main`.
-   `crateOrder` is an `object` parameter; changing it means editing the
-   pipeline file.
+2. Edit the `crateOrder` default in
+   `.azure-pipelines/templates/Publish.CratesIo.Job.yml`, removing the
+   already-published crates, and merge that change to `main`. Keep the
+   remaining entries in their existing relative order — do not regenerate the
+   list with `order --derive`, which produces a different (though equally
+   valid) sequence that `verify-order` will reject as not a subset.
 3. Cut a **new** release branch containing that edit (for example
    `release/v0.8.0-resume1`) and run the pipeline against it. The ref supplies
    the pipeline definition as well as the source, so the edited `crateOrder`

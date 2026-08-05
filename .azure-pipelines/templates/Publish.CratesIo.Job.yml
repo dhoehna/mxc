@@ -34,11 +34,45 @@
 parameters:
   - name: ESRPInfo
     type: object
-  # Leaf-first crate order. MUST be a correctly-ordered subset of the CRATES
-  # list in scripts/crates_release.py; `verify-order` enforces this at run time.
+  # Leaf-first crate order -- a topological sort of the workspace dependency
+  # graph, NOT an operator choice, which is why it lives here rather than in
+  # the release pipeline's `parameters:` block (anything declared there renders
+  # as an editable field in the Run dialog, and no human should be hand-editing
+  # a dependency order at queue time).
+  #
+  # Regenerate with:
+  #   python3 .azure-pipelines/scripts/crates_release.py order
+  #
+  # That command derives the order from `cargo metadata`, so it is always
+  # correct by construction.  MUST remain a correctly-ordered subset of the
+  # CRATES list in scripts/crates_release.py; `verify-order` enforces that at
+  # run time, and `_validate_release_graph` proves CRATES itself is a valid
+  # topological order at package time.
+  #
   # Drop already-published crates from this list to resume a failed release.
   - name: crateOrder
     type: object
+    default:
+    - nanvix_common
+    - mxc_telemetry
+    - wxc_common
+    - nanvix_runner
+    - hyperlight_common
+    - mxc_pty
+    - lxc_common
+    - bwrap_common
+    - seatbelt_common
+    - sandbox_spec
+    - learning_mode_core
+    - learning_mode_windows
+    - appcontainer_common
+    - isolation_session_bindings
+    - isolation_session_common
+    - windows_sandbox_common
+    - windows_sandbox_lifecycle
+    - wslc_common
+    - mxc_engine
+    - mxc-sdk
   - name: cratesArtifactName
     type: string
     default: mxc-crates-package

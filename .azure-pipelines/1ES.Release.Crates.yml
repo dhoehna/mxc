@@ -128,35 +128,6 @@ parameters:
     type: string
     default: '$(Build.RequestedForEmail)'
 
-  # Leaf-first crate publish order. Must match `scripts/crates_release.py`
-  # CRATES list; `verify-order` fails the run at run time if this is not an
-  # ordered SUBSET of what was packaged. A subset passes on purpose, so that a
-  # partial release can be resumed -- which also means an accidental omission
-  # here will not be caught. Edit deliberately.
-  - name: crateOrder
-    type: object
-    default:
-    - nanvix_common
-    - mxc_telemetry
-    - wxc_common
-    - nanvix_runner
-    - hyperlight_common
-    - mxc_pty
-    - lxc_common
-    - bwrap_common
-    - seatbelt_common
-    - sandbox_spec
-    - learning_mode_core
-    - learning_mode_windows
-    - appcontainer_common
-    - isolation_session_bindings
-    - isolation_session_common
-    - windows_sandbox_common
-    - windows_sandbox_lifecycle
-    - wslc_common
-    - mxc_engine
-    - mxc-sdk
-
 variables:
   - group: MXC-ESRP-Signing
 
@@ -290,5 +261,9 @@ extends:
             clientId: $(clientId)
             OwnersEmail: ${{ parameters.esrpOwnersEmail }}
             ApproversEmail: ${{ parameters.esrpApproversEmail }}
-          crateOrder: ${{ parameters.crateOrder }}
+          # crateOrder is deliberately NOT passed and NOT a pipeline parameter.
+          # It is a dependency-derived topological order, not an operator
+          # choice, so it lives in Publish.CratesIo.Job.yml where the Run
+          # dialog cannot render it.  Regenerate it with
+          # `python3 .azure-pipelines/scripts/crates_release.py order`.
           dryRun: ${{ parameters.dryRun }}

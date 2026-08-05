@@ -390,6 +390,80 @@ def cmd_stage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _derive_order(metadata: dict) -> list[str]:
+    """Topologically sort the publishable workspace closure, leaf-first.
+
+    The order is a property of the dependency graph, not a human choice, so it
+    is derived from `cargo metadata` rather than maintained by hand.  Ties are
+    broken alphabetically so the output is stable across runs and diffs stay
+    readable.
+    """
+    packages = {package["name"]: package for package in metadata["packages"]}
+    wanted = set(CRATES)
+
+    edges: dict[str, set[str]] = {}
+    for name in wanted:
+        package = packages.get(name)
+        if package is None:
+            raise RuntimeError(f"{name}: not found in workspace metadata")
+        edges[name] = {
+            dependency["name"]
+            for dependency in package["dependencies"]
+            if dependency.get("path") and dependency["name"] in wanted
+        }
+
+    ordered: list[str] = []
+    placed: set[str] = set()
+    while len(ordered) < len(wanted):
+        ready = sorted(
+            name
+            for name in wanted - placed
+            if edges[name] <= placed
+        )
+        if not ready:
+            remaining = ", ".join(sorted(wanted - placed))
+            raise RuntimeError(
+                "dependency cycle among publishable crates: " + remaining
+            )
+        ordered.extend(ready)
+        placed.update(ready)
+    return ordered
+
+
+def cmd_order(args: argparse.Namespace) -> int:
+    metadata = _cargo_metadata(args.manifest_path)
+
+    if args.derive:
+        # A freshly computed order, for when a crate is ADDED and CRATES needs
+        # a new entry.  Deliberately NOT the default: any valid topological
+        # order differs from any other, and `verify-order` requires the
+        # template's crateOrder to be an ordered SUBSET of the packaged order
+        # (which comes from CRATES).  Pasting a derived order into the template
+        # without also updating CRATES fails the run.  Update both together.
+        for crate in _derive_order(metadata):
+            print(_format_crate(crate, args.format))
+        return 0
+
+    # Default and --check both validate CRATES against the real dependency
+    # graph: every local dependency present, ordered earlier, publishable.
+    _validate_release_graph(metadata)
+    if args.check:
+        print(f"OK: CRATES is a valid leaf-first order ({len(CRATES)} crates)")
+        return 0
+
+    for crate in CRATES:
+        print(_format_crate(crate, args.format))
+    return 0
+
+
+def _format_crate(crate: str, style: str) -> str:
+    if style == "yaml":
+        return f"    - {crate}"
+    if style == "python":
+        return f'    "{crate}",'
+    return crate
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -424,6 +498,33 @@ def main() -> int:
     stage.add_argument("--crate", required=True)
     stage.add_argument("--out-dir", required=True)
     stage.set_defaults(func=cmd_stage)
+
+    order = sub.add_parser(
+        "order",
+        help="print or validate the leaf-first publish order",
+    )
+    order.add_argument("--manifest-path", default="src/Cargo.toml")
+    order.add_argument(
+        "--format",
+        choices=["plain", "yaml", "python"],
+        default="plain",
+        help="yaml emits lines ready to paste into Publish.CratesIo.Job.yml",
+    )
+    order.add_argument(
+        "--check",
+        action="store_true",
+        help="validate CRATES against cargo metadata and print nothing else",
+    )
+    order.add_argument(
+        "--derive",
+        action="store_true",
+        help=(
+            "compute a fresh order from the dependency graph instead of "
+            "printing CRATES; use when adding a crate, and update CRATES and "
+            "the template's crateOrder together"
+        ),
+    )
+    order.set_defaults(func=cmd_order)
 
     args = parser.parse_args()
     return args.func(args)
