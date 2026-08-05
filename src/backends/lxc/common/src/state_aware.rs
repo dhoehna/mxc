@@ -66,13 +66,20 @@ fn extract_container_name(sandbox_id: &str) -> Result<&str, MxcError> {
 /// Maximum LXC sandbox container-name length.
 ///
 /// Bounds a sandbox container name to a sane length and character set so the
-/// name is well-formed for LXC and for the derived iptables chain name. Chain
-/// uniqueness itself no longer depends on this bound: `NetworkIptablesManager`
-/// folds a deterministic hash of the full container name into the chain name,
-/// so two distinct names can never collide onto the same firewall chain even if
-/// their sanitized prefixes are identical. The length and character rules
-/// remain as input hygiene (a collision would otherwise let one container's
-/// stop/deprovision tear down another container's rules).
+/// name is well-formed for LXC and for the derived iptables chain name. The
+/// bound is input hygiene, and on the state-aware path it is also the only
+/// thing narrowing the set of names that reach chain derivation.
+///
+/// It does not make chain names unique. `NetworkIptablesManager` folds a
+/// deterministic hash of the full container name into the chain name, which
+/// breaks the systematic collapse of shared prefixes, but that derivation is
+/// non-cryptographic and not injective — distinct names can still map to one
+/// chain, and a caller that chooses `containerId` can construct such a pair.
+/// See `NetworkIptablesManager::chain_name_for` for the work factor. A
+/// collision lets one container's stop/deprovision tear down another
+/// container's rules, leaving the incumbent running with no firewall. The
+/// durable fix is persisted chain ownership verified before any flush or
+/// delete, not a wider hash; tracked in AB#62953349.
 const MAX_CONTAINER_NAME_LEN: usize = 20;
 
 /// Returns whether `name` is a valid LXC sandbox container name: non-empty, at
