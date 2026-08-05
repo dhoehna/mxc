@@ -67,6 +67,26 @@ jobs:
       # causes unpublished workspace siblings to be looked up in this feed.
       - template: Cargo.Setup.Private.yml@self
 
+      # The same drift check CI runs, repeated here because CI cannot cover
+      # this.  Build.yml runs check-template on pull requests into main, but a
+      # release ref can be pushed straight to the remote without ever opening
+      # one, so a release built from an unchecked commit would otherwise reach
+      # the publish stage with a stale crateOrder.  verify-order does not catch
+      # it either: it accepts an ordered subset by design, so a template missing
+      # a newly-added crate passes and the crate is silently never published.
+      #
+      # It runs before packaging so the run stops before producing artifacts.
+      # A deliberate resume declares a RESUME-SUBSET marker in the template,
+      # which this accepts after proving the short list is still in valid
+      # dependency order.
+      - script: |
+          set -euo pipefail
+          python3 .azure-pipelines/scripts/crates_release.py check-template \
+            --manifest-path src/Cargo.toml \
+            --template-path .azure-pipelines/templates/Publish.CratesIo.Job.yml
+        displayName: Verify crate order matches the workspace
+        workingDirectory: $(Build.SourcesDirectory)
+
       - script: |
           set -euo pipefail
           python3 .azure-pipelines/scripts/crates_release.py package \

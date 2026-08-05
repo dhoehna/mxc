@@ -92,8 +92,10 @@ list that fails halfway through a release.
 To add a crate, put the package name anywhere in the `CRATES` list in
 `.azure-pipelines/scripts/crates_release.py` — that list is an unordered *set*
 of what to publish, not an ordering — then run the command above and paste the
-result over `crateOrder`. Both steps are required; doing only the first is
-what `verify-order` exists to catch.
+result over `crateOrder`. Both steps are required, and `check-template` is what
+catches doing only the first. `verify-order` does **not**: it accepts an ordered
+subset by design, so a stale `crateOrder` passes it and the new crate is simply
+never published.
 
 ## How versions are determined
 
@@ -278,24 +280,55 @@ To resume:
    regenerates the full closure and would put the already-published crates
    back, which crates.io then rejects. Do not bump the crate version; the
    remaining crates still need to publish at the version that failed.
+
+   Add a `RESUME-SUBSET` marker line directly above `default:`, naming the run
+   this is resuming:
+
+   ```yaml
+     - name: crateOrder
+       type: object
+       # RESUME-SUBSET: run 4821 failed after appcontainer_common
+       default:
+         - bwrap_common
+         - windows_sandbox_lifecycle
+   ```
+
+   The marker is **required**. Without it the packaging job fails the run,
+   because a short `crateOrder` with nothing declaring intent is
+   indistinguishable from one somebody forgot to regenerate. With it, the run
+   still verifies the remaining crates are in valid dependency order and logs
+   every crate it is assuming is already published.
 4. Push that branch to `microsoft/mxc` and run the pipeline against it. The ref
    supplies the pipeline definition as well as the source, so the edited
    `crateOrder` only takes effect once it is on the release branch.
 5. Merge the `crateOrder` edit to `main` separately, or revert it there once
    the release completes — `main` should end up carrying the full list again,
-   so the next release publishes the whole closure.
+   with the `RESUME-SUBSET` marker removed, so the next release publishes the
+   whole closure. A pull request into `main` that still carries the marker or
+   the short list fails `check-template`, which is the intended backstop.
 
 The `verify-order` guard accepts a subset of the original order as long as it
 is still in correct leaf-first sequence. It logs a warning naming every
 dependency it assumes is already live.
 
-The `check-template` gate does **not** block this. It runs from `Build.yml`,
-which triggers only on `main`, `feature/*`, and `user/*` — a `release/*` branch
-is in none of those lists, so the deliberately-trimmed `crateOrder` on a resume
-branch is never checked against the full closure. That is why step 5 exists:
-`main` must carry the full list, and it is `main` that the gate protects. If
-the trigger list in `Build.yml` ever grows to include `release/*`, this resume
-procedure breaks and needs a path exclusion.
+The `check-template` gate runs in two places, and a resume has to satisfy both.
+CI runs it on pull requests into `main`; the release pipeline runs it again in
+the packaging job, before any artifact is produced, because a release ref can
+be pushed straight to `microsoft/mxc` without ever opening a pull request — so
+CI alone would leave the irreversible path unguarded.
+
+That is why step 3 requires the `RESUME-SUBSET` marker. Without it the release
+pipeline refuses to publish a short list at all, which is the point: a trimmed
+`crateOrder` is either a deliberate resume or a forgotten regeneration, and
+nothing in the file distinguishes them unless the operator says so. With the
+marker, the pipeline still proves the remaining crates are in valid dependency
+order and prints exactly which crates it is assuming are already live.
+
+Note that GitHub's `pull_request: branches:` filter matches the **base** branch,
+not the source branch, so a pull request *from* a `release/*` branch *into*
+`main` does run `check-template` — and should, since `main` must carry the full
+list. Only a direct push to `release/*` skips the CI run, which is precisely
+the case the release pipeline's own copy of the check covers.
 
 There is no automated resume. The operator asserts what landed by editing
 `crateOrder`.
@@ -357,7 +390,7 @@ These must be resolved before the first real (non-dry-run) publish:
 | `.azure-pipelines/1ES.Release.Crates.yml` | Top-level release pipeline (parameters, release-ref gate, stage wiring) |
 | `.azure-pipelines/templates/Package.Crates.Job.yml` | Packaging job — runs `cargo package`, produces artifact |
 | `.azure-pipelines/templates/Publish.CratesIo.Job.yml` | ESRP publish job — `verify-order`, stage, publish loop |
-| `.azure-pipelines/scripts/crates_release.py` | Helper script (`package`, `verify-order`, `stage` subcommands) |
+| `.azure-pipelines/scripts/crates_release.py` | Helper script (`package`, `order`, `verify-order`, `check-template`, `stage` subcommands) |
 | `src/Cargo.toml` | Workspace version (single source of truth for all crate versions) |
 
 ## Comparison with the npm release
