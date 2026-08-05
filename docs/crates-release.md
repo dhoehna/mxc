@@ -136,7 +136,7 @@ means cutting a new release ref.
 
    | Parameter | Value |
    |---|---|
-   | **Dry run** (`cratesDryRun`) | Set to `true` for this first run. |
+   | **Dry run** (`DryRun`) | Leave at `true` — this is the default. |
    | **ESRP release owners email** (`esrpOwnersEmail`) | Defaults to `Darren.Hoehna@microsoft.com`; see [ESRP identity](#esrp-identity) below. |
    | **ESRP release approvers email** (`esrpApproversEmail`) | Defaults to `Darren.Hoehna@microsoft.com`; see [ESRP identity](#esrp-identity) below. |
 
@@ -180,9 +180,18 @@ otherwise submit an ESRP release with no owner or no approver.
 
 ### 2. Real release
 
-Same steps as above, but leave **Dry run** at `false` (the default). Each
-crate publishes sequentially via ESRP. If any crate fails, later crates are
-skipped (the job fails).
+Same steps as above, but **set `DryRun` to `false`**. It defaults to `true`,
+so publishing is always an explicit choice — there is no way to reach
+crates.io without deliberately clearing that box. Each crate publishes
+sequentially via ESRP. If any crate fails, later crates are skipped (the job
+fails).
+
+**This step is irreversible.** crates.io does not allow a name to be deleted
+or reused once a version exists, and the pipeline has no atomic publish and no
+rollback: a failure partway through leaves everything already sent to
+crates.io public. Do not clear `DryRun` until crate naming is settled and ESRP
+`Rust` content type is enabled — see
+[Prerequisites / known blockers](#prerequisites--known-blockers).
 
 ## Resuming a failed release
 

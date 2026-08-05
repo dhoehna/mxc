@@ -42,9 +42,16 @@
 #   branch (`refs/heads/main`), not the SHA, so the gate below rejects it.
 #
 # Dry-run:
-#   Set `cratesDryRun` to true to package and verify ordering without
-#   actually publishing to crates.io. Useful for validating a release tag
-#   before committing.
+#   `DryRun` defaults to TRUE.  A default run packages the crate closure and
+#   verifies publish ordering without sending anything to crates.io.  Set it
+#   to false only for a deliberate real publish.
+#
+#   The default is deliberately safe because publishing is IRREVERSIBLE:
+#   crates.io does not allow a name to be deleted or reused once a version
+#   exists, and this pipeline has no atomic publish or rollback -- a failure
+#   partway through leaves the crates already sent to crates.io public, and
+#   yanking them is a manual process.  Until crate naming and ESRP `Rust`
+#   enablement are settled, an accidental run must not publish.
 #
 # Network / credentials:
 #   This pipeline needs NO crates.io network access. The 1ES pool's CFSClean
@@ -90,10 +97,13 @@ resources:
     ref: refs/tags/release
 
 parameters:
-  - name: cratesDryRun
+  # Defaults to TRUE so an accidental or exploratory run cannot publish.
+  # Publishing to crates.io is irreversible and this pipeline cannot roll back,
+  # so a real publish must be an explicit, deliberate choice in the Run dialog.
+  - name: DryRun
     displayName: 'Dry run — package and verify order but skip ESRP publish'
     type: boolean
-    default: false
+    default: true
 
   # ESRP Release needs an owner email and an approver email, but the
   # MXC-ESRP-Signing variable group does not carry them: inspected through the
@@ -281,4 +291,4 @@ extends:
             OwnersEmail: ${{ parameters.esrpOwnersEmail }}
             ApproversEmail: ${{ parameters.esrpApproversEmail }}
           crateOrder: ${{ parameters.crateOrder }}
-          cratesDryRun: ${{ parameters.cratesDryRun }}
+          DryRun: ${{ parameters.DryRun }}
