@@ -40,16 +40,38 @@ parameters:
   # as an editable field in the Run dialog, and no human should be hand-editing
   # a dependency order at queue time).
   #
-  # Regenerate with:
-  #   python3 .azure-pipelines/scripts/crates_release.py order
+  # ADDING A CRATE -- do not work the order out by hand, cargo already knows it:
   #
-  # That command derives the order from `cargo metadata`, so it is always
-  # correct by construction.  MUST remain a correctly-ordered subset of the
-  # CRATES list in scripts/crates_release.py; `verify-order` enforces that at
-  # run time, and `_validate_release_graph` proves CRATES itself is a valid
-  # topological order at package time.
+  #   1. Add the new package name anywhere in the CRATES list in
+  #      scripts/crates_release.py.  Position does not matter yet; step 2
+  #      sorts it.  This step is required first because `--derive` orders the
+  #      crates named in CRATES, so a package missing from CRATES is invisible
+  #      to it.
   #
-  # Drop already-published crates from this list to resume a failed release.
+  #   2. Compute a correct order and replace CRATES with the output:
+  #        python3 .azure-pipelines/scripts/crates_release.py order \
+  #            --derive --format python
+  #
+  #   3. Mirror it here, replacing every line below:
+  #        python3 .azure-pipelines/scripts/crates_release.py order \
+  #            --format yaml
+  #
+  #   4. Confirm the graph agrees:
+  #        python3 .azure-pipelines/scripts/crates_release.py order --check
+  #
+  # Steps 2 and 3 must be done together.  `--derive` computes a fresh
+  # topological order and `--format yaml` mirrors CRATES; a graph admits many
+  # valid orders, and `verify-order` requires this list to be an ordered SUBSET
+  # of the packaged order (which comes from CRATES).  Pasting a derived order
+  # here while CRATES still holds a different one fails the run.
+  #
+  # Forgetting step 1 is caught, not silent: `_validate_release_graph` fails
+  # packaging with "local dependency is missing from CRATES" as soon as any
+  # published crate depends on the new one.
+  #
+  # Drop already-published crates from this list to resume a failed release --
+  # keep the survivors in their existing relative order rather than
+  # regenerating, for the subset reason above.
   - name: crateOrder
     type: object
     default:

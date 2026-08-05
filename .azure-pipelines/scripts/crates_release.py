@@ -57,6 +57,35 @@ import sys
 # provisional until the public naming scheme is approved; the crates.io release
 # pipeline (.azure-pipelines/1ES.Release.Crates.yml) is manual-trigger only and
 # offers a dry-run mode, so nothing reaches crates.io until that is settled.
+#
+# ADDING A CRATE -- do not work the order out by hand.  It is a topological
+# sort of the workspace dependency graph, and `cargo metadata` already knows
+# the graph:
+#
+#   1. Add the package name anywhere in CRATES below.  Position does not
+#      matter yet.  It must go in first because `--derive` orders the crates
+#      named here, so a package missing from CRATES is invisible to it.
+#
+#   2. Replace CRATES with a correctly sorted version of itself:
+#        python3 .azure-pipelines/scripts/crates_release.py order \
+#            --derive --format python
+#
+#   3. Mirror the result into the `crateOrder` default in
+#      .azure-pipelines/templates/Publish.CratesIo.Job.yml:
+#        python3 .azure-pipelines/scripts/crates_release.py order \
+#            --format yaml
+#
+#   4. Confirm:
+#        python3 .azure-pipelines/scripts/crates_release.py order --check
+#
+# Steps 2 and 3 go together.  A dependency graph admits many valid topological
+# orders; `verify-order` requires the template's crateOrder to be an ordered
+# SUBSET of the packaged order, which comes from this list.  Updating one
+# without the other fails the run.
+#
+# The pipeline cannot use `cargo publish --workspace` (which would order the
+# publish itself) because ESRP performs the upload, one .crate file at a time,
+# so the order has to exist as data rather than as cargo's internal plan.
 CRATES: list[str] = [
     "nanvix_common",
     "mxc_telemetry",
