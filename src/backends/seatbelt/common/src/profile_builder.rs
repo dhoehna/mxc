@@ -200,12 +200,12 @@ fn write_filesystem_allow(out: &mut String, paths: &ResolvedPaths) {
 
     // Emit shallow-to-deep, one rule per path, using the same ordering the
     // Linux backends apply (`wxc_common::filesystem_resolve`). Seatbelt is
-    // last-match-wins, so ordering by depth makes the *deepest* intent win at
-    // every path — a `readonlyPaths` entry nested inside a broader
-    // `readwritePaths` subtree stays read-only rather than inheriting the
-    // parent's write grant. `deniedPaths` is deliberately not part of this
-    // plan: it is emitted after the network rules so it also overrides the
-    // unfiltered `(allow network-outbound)`, which makes it win outright.
+    // last-match-wins between rules that carry a filter, so ordering by depth
+    // makes the *deepest* intent win at every path — a `readonlyPaths` entry
+    // nested inside a broader `readwritePaths` subtree stays read-only rather
+    // than inheriting the parent's write grant. `deniedPaths` is deliberately
+    // not part of this plan: it is emitted last so it outranks these filtered
+    // allows regardless of depth.
     out.push_str(";; --- policy.readonlyPaths / policy.readwritePaths (shallow-to-deep) ---\n");
     for mount in resolve_path_plan(&paths.readwrite, &paths.readonly, &[]) {
         let subpath = [mount.path.clone()];
@@ -224,9 +224,16 @@ fn write_filesystem_allow(out: &mut String, paths: &ResolvedPaths) {
             }
             FsIntent::ReadOnly => {
                 write_path_rule(out, "allow file-read*", &subpath);
-                // The read allow alone cannot take write or socket authority
-                // back from a shallower read-write rule — an `allow` never
-                // denies — so the removal has to be explicit.
+                // The read allow names only `file-read*`, so it says nothing
+                // about write or socket ops and cannot displace a shallower
+                // read-write grant — the removal has to be explicit.
+                //
+                // This deny survives the unfiltered `(allow network-outbound)`
+                // that `write_network_rules` emits below under
+                // `defaultPolicy: "allow"`: last-match-wins applies between
+                // rules that carry a filter, and an unfiltered rule does not
+                // override a path-filtered one. Pinned by
+                // `readonly_socket_strip_survives_a_default_allow_outbound`.
                 write_path_rule(
                     out,
                     "deny file-write* network-bind network-outbound",
@@ -863,8 +870,9 @@ mod tests {
 
     #[test]
     fn allow_local_network_emits_inbound_rule() {
-        // server.listen() on macOS needs `network-inbound` in addition to
-        // `network-bind` — the kernel rejects listen() with EPERM otherwise.
+        // server.listen() on macOS is governed by `network-inbound`, not
+        // `network-bind` — with only `network-bind (local ip)` the bind()
+        // succeeds and the kernel then rejects listen() with EPERM.
         let mut r = req();
         r.policy.default_network_policy = NetworkPolicy::Allow;
         r.policy.allow_local_network = true;
@@ -998,19 +1006,22 @@ mod tests {
     }
 
     #[test]
-    fn denied_paths_deny_outbound_after_unfiltered_allow() {
-        // `defaultPolicy: allow` emits a bare `(allow network-outbound)`; the
-        // deny must come after it or a denied subtree's UNIX sockets stay
-        // connectable.
+    fn denied_paths_deny_outbound_under_default_allow() {
+        // `defaultPolicy: allow` emits a bare `(allow network-outbound)`, which
+        // on its own grants AF_UNIX `connect()`. A denied subtree must still
+        // deny it. Position relative to that unfiltered allow is deliberately
+        // not asserted: an unfiltered rule cannot override a path-filtered one
+        // in either direction, so pinning the order would encode a constraint
+        // that does not exist. The orderings that *do* matter — deny after the
+        // filtered read-write allows — are covered by
+        // `denied_paths_appear_after_allows_to_override` and
+        // `denied_paths_deny_unix_socket_ops_after_allows`.
         let mut r = req();
         r.policy.default_network_policy = NetworkPolicy::Allow;
         r.policy.denied_paths = vec!["/tmp/secret".into()];
         let p = build_profile(&r).unwrap();
-        let allow_idx = p
-            .find("(allow network-outbound)")
-            .expect("unfiltered outbound allow");
         let deny_idx = p.find(DENY_RULE).expect("deny must cover network-outbound");
-        assert!(deny_idx > allow_idx);
+        assert!(p[deny_idx..].contains("(subpath \"/private/tmp/secret\")"));
     }
 
     #[test]
@@ -1096,9 +1107,10 @@ mod tests {
     #[test]
     fn nested_readonly_keeps_write_away_from_broader_readwrite() {
         // `/tmp` resolves to `/private/tmp`, which is an ancestor of the
-        // read-only entry. An `allow` cannot take authority back, so the
-        // read-only path must emit an explicit removal *after* the broader
-        // read-write allow.
+        // read-only entry. The read-only `allow` names only `file-read*`, so
+        // it says nothing about write or socket ops and cannot displace the
+        // broader grant on its own — hence the explicit removal, emitted
+        // *after* the read-write allow.
         let mut r = req();
         r.policy.readwrite_paths = vec!["/tmp".into()];
         r.policy.readonly_paths = vec!["/private/tmp/secret".into()];
@@ -1134,12 +1146,15 @@ mod tests {
     #[test]
     fn readonly_socket_strip_survives_a_default_allow_outbound() {
         // `defaultPolicy: "allow"` emits an unfiltered `(allow
-        // network-outbound)` *after* the filesystem section. Seatbelt does not
-        // let an unfiltered rule override a path-filtered one, so the
-        // read-only strip still governs AF_UNIX `connect()` under that
-        // subtree. Verified against `sandbox-exec`: with both rules present in
-        // this order, connecting to a pre-existing socket there is EPERM,
-        // while the same profile without the strip connects fine.
+        // network-outbound)`. The read-only strip still governs AF_UNIX
+        // `connect()` under that subtree, because an unfiltered rule does not
+        // override a path-filtered one. Verified end-to-end against
+        // `mxc-exec-mac` with a listener created outside the sandbox: this
+        // policy denies `connect()` with EPERM, while the same policy with the
+        // path moved to `readwrite_paths` connects.
+        //
+        // Emission order relative to the unfiltered allow is deliberately not
+        // asserted — it has no bearing on the outcome.
         let mut r = req();
         r.policy.default_network_policy = NetworkPolicy::Allow;
         r.policy.readonly_paths = vec!["/tmp/ro".into()];
@@ -1147,10 +1162,6 @@ mod tests {
 
         let strip_idx = p.find(RO_STRIP).expect("read-only strip");
         assert!(p[strip_idx..].contains("(subpath \"/private/tmp/ro\")"));
-        assert!(
-            p.find("(allow network-outbound)\n").expect("default allow") > strip_idx,
-            "this test is only meaningful while the unfiltered allow comes last, profile:\n{p}"
-        );
     }
 
     #[test]
