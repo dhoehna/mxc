@@ -46,7 +46,7 @@ parameters:
   # the pipeline plumbing without publishing anything.  Defaults to TRUE so a
   # caller that omits it cannot publish by accident; crates.io publication is
   # irreversible and this job has no rollback.
-  - name: DryRun
+  - name: dryRun
     type: boolean
     default: true
 
@@ -87,7 +87,7 @@ jobs:
               python3 "$(script)" stage --order-file "$(orderFile)" --crate "${{ crate }}" --out-dir "$(esrpDir)"
             displayName: "Stage ${{ crate }} for ESRP"
 
-          - ${{ if parameters.DryRun }}:
+          - ${{ if parameters.dryRun }}:
             - script: |
                 echo "##vso[task.logissue type=warning]DRY RUN: skipping ESRP publish for ${{ crate }} (staged .crate only)."
               displayName: "DRY RUN: skip publish ${{ crate }}"

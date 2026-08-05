@@ -42,7 +42,7 @@
 #   branch (`refs/heads/main`), not the SHA, so the gate below rejects it.
 #
 # Dry-run:
-#   `DryRun` defaults to TRUE.  A default run packages the crate closure and
+#   `dryRun` defaults to TRUE.  A default run packages the crate closure and
 #   verifies publish ordering without sending anything to crates.io.  Set it
 #   to false only for a deliberate real publish.
 #
@@ -100,7 +100,7 @@ parameters:
   # Defaults to TRUE so an accidental or exploratory run cannot publish.
   # Publishing to crates.io is irreversible and this pipeline cannot roll back,
   # so a real publish must be an explicit, deliberate choice in the Run dialog.
-  - name: DryRun
+  - name: dryRun
     displayName: 'Dry run — package and verify order but skip ESRP publish'
     type: boolean
     default: true
@@ -291,4 +291,4 @@ extends:
             OwnersEmail: ${{ parameters.esrpOwnersEmail }}
             ApproversEmail: ${{ parameters.esrpApproversEmail }}
           crateOrder: ${{ parameters.crateOrder }}
-          DryRun: ${{ parameters.DryRun }}
+          dryRun: ${{ parameters.dryRun }}
