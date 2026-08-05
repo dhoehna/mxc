@@ -93,10 +93,13 @@ parameters:
   - name: cratesArtifactName
     type: string
     default: mxc-crates-package
-  # When true, run stage + verify-order but SKIP ESRP publication -- exercises
-  # the pipeline plumbing without publishing anything.  Defaults to TRUE so a
-  # caller that omits it cannot publish by accident; crates.io publication is
-  # irreversible and this job has no rollback.
+  # Compile-time backstop, not the primary gate.  The stage `condition:` in
+  # 1ES.Release.Crates.yml skips this entire job on a dry run, so the steps
+  # below do not normally execute at all.  This guard is kept so that deleting
+  # that condition still cannot publish: when true the ESRP task is never
+  # emitted, only dry-run echo steps are.  Defaults to TRUE so a caller that
+  # omits it cannot publish by accident; crates.io publication is irreversible
+  # and this job has no rollback.
   - name: dryRun
     type: boolean
     default: true

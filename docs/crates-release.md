@@ -193,8 +193,12 @@ means cutting a new release ref.
    template — see [Resuming a failed release](#resuming-a-failed-release).
 
 5. Click **Run**.
-6. Confirm the package stage succeeds, `verify-order` passes, and each crate
-   logs `DRY RUN: skipping ESRP publish for <crate> (staged .crate only).`
+6. Confirm the package stage succeeds and its `check-template` step passes.
+   The **Publish Crates.io Packages** stage stays visible and is reported as
+   **Skipped** — on a dry run that is the expected result, not a failure. A
+   dry run deliberately does not execute the publish job, so there are no
+   per-crate `DRY RUN:` lines to look for; the publish order is checked in the
+   package stage instead, against `cargo metadata`.
 
 ### ESRP identity
 

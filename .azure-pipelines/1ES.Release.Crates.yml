@@ -43,8 +43,9 @@
 #
 # Dry-run:
 #   `dryRun` defaults to TRUE.  A default run packages the crate closure and
-#   verifies publish ordering without sending anything to crates.io.  Set it
-#   to false only for a deliberate real publish.
+#   checks the publish order against `cargo metadata`, then skips the publish
+#   stage entirely -- the stage stays visible in the run and is reported as
+#   `Skipped`.  Set it to false only for a deliberate real publish.
 #
 #   The default is deliberately safe because publishing is IRREVERSIBLE:
 #   crates.io does not allow a name to be deleted or reused once a version
@@ -101,7 +102,7 @@ parameters:
   # Publishing to crates.io is irreversible and this pipeline cannot roll back,
   # so a real publish must be an explicit, deliberate choice in the Run dialog.
   - name: dryRun
-    displayName: 'Dry run — package and verify order but skip ESRP publish'
+    displayName: 'Dry run — package and check order; publish stage is skipped'
     type: boolean
     default: true
 
@@ -259,6 +260,14 @@ extends:
     - stage: Publish_to_CratesIo
       displayName: 'Publish Crates.io Packages'
       dependsOn: Package_Crates_For_Release
+      # A dry run skips this stage outright rather than running a no-op copy of
+      # it, so the run UI reports it as `Skipped` instead of green.  `${{ }}` is
+      # evaluated at template expansion, so this compiles to a boolean literal
+      # -- `and(succeeded(), False)` or `and(succeeded(), True)` -- with no
+      # string comparison at runtime.  `succeeded()` must stay: naming any
+      # custom condition replaces the implicit default, and without it the
+      # stage would publish even after packaging failed.
+      condition: and(succeeded(), ${{ eq(parameters.dryRun, false) }})
       jobs:
       - template: .azure-pipelines/templates/Publish.CratesIo.Job.yml@self
         parameters:
