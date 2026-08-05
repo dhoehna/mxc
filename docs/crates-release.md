@@ -61,13 +61,22 @@ steps.
 `crateOrder` has to be static YAML: `${{ each }}` expands at compile time,
 before any script has run, so the ESRP steps cannot be generated from an order
 computed during the run. It is therefore a **pasted copy** of the command's
-output, kept in step by hand — the two sequences come from the same algorithm,
-but nothing stops someone editing `CRATES` and forgetting to regenerate.
-`verify-order` is what catches that, at run time, before anything is published.
+output rather than a live call.
 
-`verify-order` accepts an ordered subset of the packaged closure, so a
-`crateOrder` that omits crates will pass — that is what makes a partial resume
-possible, and it is why the list must be edited deliberately.
+Nothing about pasting is trusted, though. The `Versioning Checks` workflow runs
+`crates_release.py check-template` on every pull request, which recomputes the
+order and fails the build if the template does not match it exactly — same
+crates, same sequence. Editing `CRATES` and forgetting to regenerate is a red
+build, not a bad release.
+
+That check exists because the run-time check cannot catch this case.
+`verify-order` accepts an ordered *subset* of the packaged closure — that is
+deliberate, and it is what makes a partial resume possible — so a `crateOrder`
+missing a newly-added crate **passes** it, and the crate is silently never
+published. Nothing fails; the only trace is a `PARTIAL RELEASE` warning in a
+log read after the fact. A missed publish is also not repairable by re-running,
+since the crates that did land cannot be republished. So the drift has to be
+caught before the release, at PR time, which is what `check-template` does.
 
 **You do not work the order out by hand.** One command produces it:
 
@@ -165,17 +174,18 @@ means cutting a new release ref.
 2. Click **Run pipeline**.
 3. In the ref selector at the top of the dialog, pick the release branch
    (for example `release/v0.8.0`).
-4. Fill in the parameters:
+4. Set the one parameter:
 
    | Parameter | Value |
    |---|---|
    | **Dry run** (`dryRun`) | Leave at `true` — this is the default. |
-   | **ESRP release owners email** (`esrpOwnersEmail`) | Defaults to `Darren.Hoehna@microsoft.com`; see [ESRP identity](#esrp-identity) below. |
-   | **ESRP release approvers email** (`esrpApproversEmail`) | Defaults to `Darren.Hoehna@microsoft.com`; see [ESRP identity](#esrp-identity) below. |
 
-   The Run dialog shows exactly these three fields. `crateOrder` is
-   deliberately **not** a pipeline parameter — it is a dependency-derived
-   topological order, not an operator choice, so it lives in
+   The Run dialog shows exactly this one field, because a release is defined
+   by *which ref you picked*, not by what you type. Everything else is derived
+   or fixed. The ESRP owner and approver are not fields — they are fixed to
+   the identity that queued the run; see [ESRP identity](#esrp-identity).
+   `crateOrder` is not a field either — it is a dependency-derived topological
+   order, not an operator choice, so it lives in
    `.azure-pipelines/templates/Publish.CratesIo.Job.yml` where the dialog
    cannot render it. To change it (to resume a partial release), edit that
    template — see [Resuming a failed release](#resuming-a-failed-release).
@@ -194,23 +204,35 @@ for code signing. The pipeline must be granted access to that group in ADO.
 ESRP Release additionally needs owner and approver emails. The
 `MXC-ESRP-Signing` group was inspected through the ADO REST API and contains
 exactly the six signing keys above — it does **not** contain `OwnersEmail` or
-`ApproversEmail`.  They are therefore exposed as the string parameters
-`esrpOwnersEmail` and `esrpApproversEmail`, both defaulting to the predefined
-variable `$(Build.RequestedForEmail)` — the email of whoever queued the run —
-so a normal release is one click, with no address typed and no individual
-hardcoded in the repository.  The default is a macro token, not a literal
-address: the `${{ }}` template substitutions preserve the literal string
-`$(Build.RequestedForEmail)`, which Azure DevOps expands at runtime in the
-`EsrpRelease` task's `owners` and `approvers` inputs, since macro syntax is
-expanded in task inputs after template expansion.  An operator may override
-either value in the Run dialog.  For a manually queued run,
-`Build.RequestedForEmail` is the queuer's email; it can be empty for a run
-started by a service identity or a schedule, so if this pipeline is ever
-automated rather than queued by a person, pass an explicit owner and approver
-instead.  If either value is cleared to an empty or space-only string, the
-`Validate_Release_Ref` stage fails the run immediately, naming the empty
-parameter, before anything is checked out or packaged — an empty value would
-otherwise submit an ESRP release with no owner or no approver.
+`ApproversEmail`.  Both are therefore fixed in `1ES.Release.Crates.yml` to the
+predefined variable `$(Build.RequestedForEmail)` — the email of whoever queued
+the run — so the person releasing owns and approves their own release, with no
+address typed and no individual hardcoded in the repository.
+
+They are deliberately **not** pipeline parameters.  Anything declared under
+`parameters:` renders as an editable field in the Run dialog, and an email
+address is not a decision the person clicking Run should be asked to make:
+there is no right answer for them to know, and a typo submits a release to the
+wrong owner.
+
+The value is a macro token, not a literal address: the `${{ }}` template
+substitutions preserve the literal string `$(Build.RequestedForEmail)`, which
+Azure DevOps expands at runtime in the `EsrpRelease` task's `owners` and
+`approvers` inputs, since macro syntax is expanded in task inputs after
+template expansion.
+
+To release under a different owner or approver, change the value in
+`1ES.Release.Crates.yml` and cut a new release ref.  That is intentional: the
+ref supplies the pipeline definition as well as the source, which is what makes
+a release reproducible from its ref alone.
+
+`Build.RequestedForEmail` is the queuer's email for a manually queued run, but
+it can resolve empty for a run started by a service identity or a schedule.
+The `Validate_Release_Ref` stage therefore checks it at runtime and fails the
+run immediately if it is empty or space-only, before anything is checked out or
+packaged — an empty value would otherwise submit an ESRP release with no owner
+or no approver.  If this pipeline is ever automated rather than queued by a
+person, set an explicit address in the YAML.
 
 ### 2. Real release
 
@@ -266,6 +288,14 @@ To resume:
 The `verify-order` guard accepts a subset of the original order as long as it
 is still in correct leaf-first sequence. It logs a warning naming every
 dependency it assumes is already live.
+
+The `check-template` gate does **not** block this. It runs from `Build.yml`,
+which triggers only on `main`, `feature/*`, and `user/*` — a `release/*` branch
+is in none of those lists, so the deliberately-trimmed `crateOrder` on a resume
+branch is never checked against the full closure. That is why step 5 exists:
+`main` must carry the full list, and it is `main` that the gate protects. If
+the trigger list in `Build.yml` ever grows to include `release/*`, this resume
+procedure breaks and needs a path exclusion.
 
 There is no automated resume. The operator asserts what landed by editing
 `crateOrder`.

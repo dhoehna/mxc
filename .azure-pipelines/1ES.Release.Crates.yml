@@ -107,26 +107,29 @@ parameters:
 
   # ESRP Release needs an owner email and an approver email, but the
   # MXC-ESRP-Signing variable group does not carry them: inspected through the
-  # ADO variable-groups API, it holds exactly six code-signing fields —
+  # ADO variable-groups API, it holds exactly six code-signing fields --
   # serviceName, tenantId, azureKeyVaultName, authCertName, signCertName, and
-  # clientId.  They are therefore exposed as string parameters.  Both default
-  # to $(Build.RequestedForEmail), the predefined variable holding the email
-  # of whoever queued the run, so a manual release is one click: no address is
-  # typed and no individual is hardcoded in the repo.  The default is a macro
-  # token, not a literal address -- the ${{ }} template substitutions here and
-  # in the ESRPInfo object preserve the literal string "$(Build.RequestedForEmail)",
-  # which Azure DevOps expands at runtime in the EsrpRelease task inputs, since
-  # macro syntax is expanded in task inputs after template expansion.  An
-  # operator can still override either value in the Run dialog.
-  - name: esrpOwnersEmail
-    displayName: 'ESRP release owners email'
-    type: string
-    default: '$(Build.RequestedForEmail)'
-
-  - name: esrpApproversEmail
-    displayName: 'ESRP release approvers email'
-    type: string
-    default: '$(Build.RequestedForEmail)'
+  # clientId.
+  #
+  # They are NOT pipeline parameters.  Anything declared under `parameters:`
+  # renders as an editable field in the Run dialog, and an email address is not
+  # a decision the person clicking Run should be asked to make -- there is no
+  # right answer for them to know, and a typo submits a release to the wrong
+  # owner.  Both values are therefore fixed below to $(Build.RequestedForEmail),
+  # the predefined variable holding the email of whoever queued the run, so the
+  # person releasing owns and approves their own release with nothing typed.
+  #
+  # This is the value a default run already used; removing the fields removes
+  # the prompt, not the behavior.  To release under a different owner or
+  # approver, change it here and cut a new release ref -- the ref supplies the
+  # pipeline definition as well as the source, which is what keeps a release
+  # reproducible from its ref alone.
+  #
+  # $(Build.RequestedForEmail) survives template expansion as a literal macro
+  # token and is expanded by Azure DevOps at runtime in the EsrpRelease task
+  # inputs, since macro syntax is expanded in task inputs after template
+  # expansion.  A runtime guard in the gate stage fails the run if it resolves
+  # empty.
 
 variables:
   - group: MXC-ESRP-Signing
@@ -192,25 +195,32 @@ extends:
         # unvalidated into EsrpRelease's `owners` and `approvers` (via
         # Publish.CratesIo.Job.yml), and an empty value submits a release with
         # no owner or no approver -- something the pipeline would otherwise not
-        # catch until packaging has already run.  Both parameters default to
-        # the $(Build.RequestedForEmail) macro, which is a non-empty token at
-        # compile time, so these compile-time ${{ }} guards fire only when an
-        # operator explicitly clears or space-fills a value in the Run dialog;
-        # a normal run compiles without them and consumes no extra work.  The
-        # `replace(..., ' ', '')` strips spaces first so a space-only value is
-        # rejected too.  The check lives in this stage because every other
-        # stage depends on it, so a missing value stops the run before any
-        # crate is checked out or packaged.
-        - ${{ if eq(replace(parameters.esrpOwnersEmail, ' ', ''), '') }}:
-          - script: |
-              echo "##vso[task.logissue type=error]The 'ESRP release owners email' (esrpOwnersEmail) parameter is empty.  Supply a valid owner email in the Run pipeline dialog before releasing."
+        # catch until packaging has already run.
+        #
+        # Both are fixed to $(Build.RequestedForEmail) rather than being Run
+        # dialog fields, so the failure this guards is no longer an operator
+        # clearing a box: it is the predefined variable resolving empty, which
+        # can happen when a run is queued by something other than a signed-in
+        # user.  That is a runtime condition, so this is a runtime check --
+        # a compile-time ${{ if }} would only ever see the unexpanded macro
+        # token and could never fire.  It lives in this stage because every
+        # other stage depends on it, so a missing value stops the run before
+        # any crate is checked out or packaged.
+        - script: |
+            set -euo pipefail
+            if [ -z "${OWNERS// /}" ]; then
+              echo "##vso[task.logissue type=error]ESRP owners email resolved empty. \$(Build.RequestedForEmail) is set from the identity that queued the run; queue this pipeline as a signed-in user, or set an explicit address in 1ES.Release.Crates.yml and cut a new release ref."
               exit 1
-            displayName: 'Require esrpOwnersEmail'
-        - ${{ if eq(replace(parameters.esrpApproversEmail, ' ', ''), '') }}:
-          - script: |
-              echo "##vso[task.logissue type=error]The 'ESRP release approvers email' (esrpApproversEmail) parameter is empty.  Supply a valid approver email in the Run pipeline dialog before releasing."
+            fi
+            if [ -z "${APPROVERS// /}" ]; then
+              echo "##vso[task.logissue type=error]ESRP approvers email resolved empty. \$(Build.RequestedForEmail) is set from the identity that queued the run; queue this pipeline as a signed-in user, or set an explicit address in 1ES.Release.Crates.yml and cut a new release ref."
               exit 1
-            displayName: 'Require esrpApproversEmail'
+            fi
+            echo "ESRP owner and approver resolved to: $OWNERS / $APPROVERS"
+          displayName: 'Require ESRP owner and approver'
+          env:
+            OWNERS: $(Build.RequestedForEmail)
+            APPROVERS: $(Build.RequestedForEmail)
         - script: |
             set -euo pipefail
             echo "Run was queued against: $SOURCE_REF"
@@ -259,8 +269,8 @@ extends:
             authCertName: $(authCertName)
             signCertName: $(signCertName)
             clientId: $(clientId)
-            OwnersEmail: ${{ parameters.esrpOwnersEmail }}
-            ApproversEmail: ${{ parameters.esrpApproversEmail }}
+            OwnersEmail: $(Build.RequestedForEmail)
+            ApproversEmail: $(Build.RequestedForEmail)
           # crateOrder is deliberately NOT passed and NOT a pipeline parameter.
           # It is a dependency-derived topological order, not an operator
           # choice, so it lives in Publish.CratesIo.Job.yml where the Run
