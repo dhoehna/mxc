@@ -200,6 +200,14 @@ means cutting a new release ref.
    per-crate `DRY RUN:` lines to look for; the publish order is checked in the
    package stage instead, against `cargo metadata`.
 
+   **What a dry run does not cover.** Because the publish job does not run at
+   all, a dry run proves the crates build, package, and are ordered correctly —
+   and nothing beyond that. It does *not* exercise the pipeline artifact
+   round-trip, `verify-order` against the packaged `release-order.json`, the
+   per-crate SHA-256 check in `stage`, the ESRP staging directory, or ESRP
+   itself. Those first execute during a real release. A green dry run is
+   evidence about the crates, not about the publish path.
+
 ### ESRP identity
 
 The six ESRP signing fields (`serviceName`, `tenantId`, `azureKeyVaultName`,
@@ -242,11 +250,18 @@ person, set an explicit address in the YAML.
 
 ### 2. Real release
 
-Same steps as above, but **set `dryRun` to `false`**. It defaults to `true`,
-so publishing is always an explicit choice — there is no way to reach
-crates.io without deliberately clearing that box. Each crate publishes
-sequentially via ESRP. If any crate fails, later crates are skipped (the job
-fails).
+Same pipeline and ref selection as above, but **set `dryRun` to `false`**. It
+defaults to `true`, so publishing is always an explicit choice — there is no
+way to reach crates.io without deliberately clearing that box.
+
+Step 6 above does **not** apply to a real release, and the difference is the
+check that tells you whether you actually published: the **Publish Crates.io
+Packages** stage must *run* this time. If it still reports **Skipped**, then
+`dryRun` was not cleared and **nothing was published** — the run is a dry run
+that succeeded, not a release.
+
+Each crate publishes sequentially via ESRP. If any crate fails, later crates
+are skipped (the job fails).
 
 **This step is irreversible.** crates.io does not allow a name to be deleted
 or reused once a version exists, and the pipeline has no atomic publish and no
