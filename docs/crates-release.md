@@ -19,60 +19,66 @@ in a single pipeline run:
 No `CARGO_REGISTRY_TOKEN` exists in this repository. ESRP holds the publishing
 credentials and publishes under the `microsoft-oss-releases` account.
 
-## Crate list (leaf-first order)
+## Crate list
 
-Defined in `.azure-pipelines/scripts/crates_release.py`:
+The set of packages to publish is the `CRATES` list in
+`.azure-pipelines/scripts/crates_release.py`. Listed alphabetically here — the
+publish order is *not* a property of this list, see below.
 
-| # | Crate |
-|---|-------|
-| 1 | `nanvix_common` |
-| 2 | `mxc_telemetry` |
-| 3 | `wxc_common` |
-| 4 | `nanvix_runner` |
-| 5 | `hyperlight_common` |
-| 6 | `mxc_pty` |
-| 7 | `lxc_common` |
-| 8 | `bwrap_common` |
-| 9 | `seatbelt_common` |
-| 10 | `sandbox_spec` |
-| 11 | `learning_mode_core` |
-| 12 | `learning_mode_windows` |
-| 13 | `appcontainer_common` |
-| 14 | `isolation_session_bindings` |
-| 15 | `isolation_session_common` |
-| 16 | `windows_sandbox_common` |
-| 17 | `windows_sandbox_lifecycle` |
-| 18 | `wslc_common` |
-| 19 | `mxc_engine` |
-| 20 | `mxc-sdk` |
+- `appcontainer_common`
+- `bwrap_common`
+- `hyperlight_common`
+- `isolation_session_bindings`
+- `isolation_session_common`
+- `learning_mode_core`
+- `learning_mode_windows`
+- `lxc_common`
+- `mxc-sdk`
+- `mxc_engine`
+- `mxc_pty`
+- `mxc_telemetry`
+- `nanvix_common`
+- `nanvix_runner`
+- `sandbox_spec`
+- `seatbelt_common`
+- `windows_sandbox_common`
+- `windows_sandbox_lifecycle`
+- `wslc_common`
+- `wxc_common`
 
-These names are provisional until the public naming scheme is approved. The
-same sequence is mirrored as the `crateOrder` default in
-`.azure-pipelines/templates/Publish.CratesIo.Job.yml`, and `verify-order` fails
-the run if the two disagree. It accepts an ordered subset of the packaged
-closure, so a `crateOrder` that omits crates will pass — that is what makes a
-partial resume possible, and it is why the list must be edited deliberately.
+These names are provisional until the public naming scheme is approved.
 
-**You do not work the order out by hand.** It is a topological sort of the
-workspace dependency graph, derived from `cargo metadata`:
+## Publish order
+
+Leaf-first, because each crate must already be on crates.io before anything
+that depends on it can publish. The order is a topological sort of the
+workspace dependency graph, computed from `cargo metadata` — nobody maintains
+it by hand and there is no second copy to keep in step. `package` orders the
+`.crate` files it builds by that sort, and the same sort produces the
+`crateOrder` default in `.azure-pipelines/templates/Publish.CratesIo.Job.yml`,
+which drives the ESRP steps.
+
+`verify-order` fails the run if the two disagree. It accepts an ordered subset
+of the packaged closure, so a `crateOrder` that omits crates will pass — that
+is what makes a partial resume possible, and it is why the list must be edited
+deliberately.
+
+**You do not work the order out by hand.** One command produces it:
 
 ```bash
-# validate the current order against the real dependency graph
-python3 .azure-pipelines/scripts/crates_release.py order --check
-
-# emit the list ready to paste into Publish.CratesIo.Job.yml
-python3 .azure-pipelines/scripts/crates_release.py order --format yaml
-
-# compute a FRESH order after adding a crate (see caveat below)
-python3 .azure-pipelines/scripts/crates_release.py order --derive
+python3 .azure-pipelines/scripts/crates_release.py order
 ```
 
-`--derive` computes a new order from the graph; `--format yaml` mirrors the
-existing `CRATES` list. They differ deliberately. Any dependency graph admits
-several valid topological orders, and `verify-order` requires the template's
-`crateOrder` to be an ordered subset of the *packaged* order — which comes from
-`CRATES`. So a derived order pasted into the template alone will fail the run.
-**When adding a crate, update `CRATES` and the template together.**
+That prints the list ready to paste over the `crateOrder` default in
+`.azure-pipelines/templates/Publish.CratesIo.Job.yml`. It validates the graph
+before printing, so a broken workspace produces a named error rather than a
+list that fails halfway through a release.
+
+To add a crate, put the package name anywhere in the `CRATES` list in
+`.azure-pipelines/scripts/crates_release.py` — that list is an unordered *set*
+of what to publish, not an ordering — then run the command above and paste the
+result. The packaged order and the template list come from the same
+computation, so they cannot drift apart.
 
 ## How versions are determined
 
@@ -228,9 +234,9 @@ To resume:
 2. Edit the `crateOrder` default in
    `.azure-pipelines/templates/Publish.CratesIo.Job.yml`, removing the
    already-published crates, and merge that change to `main`. Keep the
-   remaining entries in their existing relative order — do not regenerate the
-   list with `order --derive`, which produces a different (though equally
-   valid) sequence that `verify-order` will reject as not a subset.
+   remaining entries in their existing relative order, and **do not** rerun
+   `crates_release.py order` — that regenerates the full closure and would put
+   the already-published crates back, which crates.io then rejects.
 3. Cut a **new** release branch containing that edit (for example
    `release/v0.8.0-resume1`) and run the pipeline against it. The ref supplies
    the pipeline definition as well as the source, so the edited `crateOrder`

@@ -53,35 +53,30 @@ import shutil
 import subprocess
 import sys
 
-# Current Cargo package names in leaf-first order. These names remain
+# Cargo package names in the crates.io release closure. These names remain
 # provisional until the public naming scheme is approved; the crates.io release
 # pipeline (.azure-pipelines/1ES.Release.Crates.yml) is manual-trigger only and
-# offers a dry-run mode, so nothing reaches crates.io until that is settled.
+# defaults to a dry run, so nothing reaches crates.io until that is settled.
 #
-# ADDING A CRATE -- do not work the order out by hand.  It is a topological
-# sort of the workspace dependency graph, and `cargo metadata` already knows
-# the graph:
+# ORDER HERE IS NOT MEANINGFUL.  This is the SET of packages to publish.  The
+# publish order is a topological sort of the dependency graph computed by
+# _release_order() from `cargo metadata`, so no one maintains a leaf-first
+# ordering by hand.  The list is kept in dependency order below purely because
+# it reads well next to the pipeline logs.
 #
-#   1. Add the package name anywhere in CRATES below.  Position does not
-#      matter yet.  It must go in first because `--derive` orders the crates
-#      named here, so a package missing from CRATES is invisible to it.
+# ADDING A CRATE:
 #
-#   2. Replace CRATES with a correctly sorted version of itself:
-#        python3 .azure-pipelines/scripts/crates_release.py order \
-#            --derive --format python
+#   1. Add the package name to this list.  Anywhere.
+#   2. Regenerate the template's crateOrder and paste the output over it:
+#        python3 .azure-pipelines/scripts/crates_release.py order
+#      (writes YAML lines for the `crateOrder` default in
+#      .azure-pipelines/templates/Publish.CratesIo.Job.yml)
 #
-#   3. Mirror the result into the `crateOrder` default in
-#      .azure-pipelines/templates/Publish.CratesIo.Job.yml:
-#        python3 .azure-pipelines/scripts/crates_release.py order \
-#            --format yaml
-#
-#   4. Confirm:
-#        python3 .azure-pipelines/scripts/crates_release.py order --check
-#
-# Steps 2 and 3 go together.  A dependency graph admits many valid topological
-# orders; `verify-order` requires the template's crateOrder to be an ordered
-# SUBSET of the packaged order, which comes from this list.  Updating one
-# without the other fails the run.
+# That is the whole procedure.  `order` validates the graph before printing,
+# so a bad edit produces a named error rather than a list that fails mid
+# release.  Forgetting step 1 is caught too: _validate_release_graph fails
+# packaging with "local dependency is missing from CRATES" as soon as any
+# published crate depends on the new one.
 #
 # The pipeline cannot use `cargo publish --workspace` (which would order the
 # publish itself) because ESRP performs the upload, one .crate file at a time,
@@ -164,14 +159,53 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _release_order(metadata: dict) -> list[str]:
+    """Return the publish order: a leaf-first topological sort of CRATES.
+
+    This is the single source of truth for ordering.  CRATES itself carries no
+    ordering meaning -- it is the SET of packages to publish -- so nobody has to
+    maintain a topological sort by hand.  Ties are broken alphabetically, which
+    makes the output stable across runs and keeps diffs readable.
+
+    Names absent from the workspace metadata are dropped here and reported by
+    _validate_release_graph, so a typo surfaces as a clear validation error
+    rather than a confusing cycle.
+    """
+    packages = {package["name"]: package for package in metadata["packages"]}
+    wanted = {crate for crate in CRATES if crate in packages}
+
+    edges: dict[str, set[str]] = {
+        name: {
+            dependency["name"]
+            for dependency in packages[name]["dependencies"]
+            if dependency.get("path") and dependency["name"] in wanted
+        }
+        for name in wanted
+    }
+
+    ordered: list[str] = []
+    placed: set[str] = set()
+    while len(ordered) < len(wanted):
+        ready = sorted(name for name in wanted - placed if edges[name] <= placed)
+        if not ready:
+            remaining = ", ".join(sorted(wanted - placed))
+            raise RuntimeError(
+                "dependency cycle among publishable crates: " + remaining
+            )
+        ordered.extend(ready)
+        placed.update(ready)
+    return ordered
+
+
 def _validate_release_graph(metadata: dict) -> dict[str, list[str]]:
     """Validate the full local dependency closure and return its edges."""
     packages = {package["name"]: package for package in metadata["packages"]}
-    positions = {crate: index for index, crate in enumerate(CRATES)}
+    order = _release_order(metadata)
+    positions = {crate: index for index, crate in enumerate(order)}
     dependencies: dict[str, list[str]] = {}
     errors: list[str] = []
 
-    if len(positions) != len(CRATES):
+    if len(set(CRATES)) != len(CRATES):
         errors.append("CRATES contains duplicate package names")
 
     for crate in CRATES:
@@ -207,10 +241,13 @@ def _validate_release_graph(metadata: dict) -> dict[str, list[str]]:
                     "from CRATES"
                 )
                 continue
+            # Guaranteed by the topological sort, so a failure here is a bug in
+            # _release_order rather than bad input.  Cheap to assert, and it
+            # would otherwise surface as a mid-release crates.io rejection.
             if positions[dependency_name] >= positions[crate]:
                 errors.append(
-                    f"{crate} -> {dependency_name}: dependency must appear "
-                    "earlier in CRATES"
+                    f"{crate} -> {dependency_name}: computed order places a "
+                    "dependency after its dependent"
                 )
             local_dependencies.append(dependency_name)
 
@@ -226,6 +263,7 @@ def _validate_release_graph(metadata: dict) -> dict[str, list[str]]:
     return dependencies
 
 
+
 def cmd_package(args: argparse.Namespace) -> int:
     metadata = _cargo_metadata(args.manifest_path)
     versions = {
@@ -238,13 +276,17 @@ def cmd_package(args: argparse.Namespace) -> int:
         print(f"FAIL  {error}")
         return 1
 
+    # The packaged order is the derived order, never CRATES' literal order --
+    # that is what lets CRATES stay an unordered set of names.
+    order = _release_order(metadata)
+
     target_dir = metadata["target_directory"]
     package_dir = os.path.join(target_dir, "package")
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    print(f"=== cargo package: {len(CRATES)} crates (leaf-first) ===")
-    for crate in CRATES:
+    print(f"=== cargo package: {len(order)} crates (leaf-first) ===")
+    for crate in order:
         print(f"  {crate} {versions[crate]}")
     print(flush=True)
 
@@ -264,7 +306,7 @@ def cmd_package(args: argparse.Namespace) -> int:
         "--manifest-path",
         manifest,
     ]
-    for crate in CRATES:
+    for crate in order:
         package_args += ["-p", crate]
     rc = _run(package_args)
     if rc != 0:
@@ -272,7 +314,7 @@ def cmd_package(args: argparse.Namespace) -> int:
         return 1
 
     ordered: list[dict] = []
-    for crate in CRATES:
+    for crate in order:
         version = versions[crate]
         crate_file = f"{crate}-{version}.crate"
         source = os.path.join(package_dir, crate_file)
@@ -419,78 +461,17 @@ def cmd_stage(args: argparse.Namespace) -> int:
     return 0
 
 
-def _derive_order(metadata: dict) -> list[str]:
-    """Topologically sort the publishable workspace closure, leaf-first.
-
-    The order is a property of the dependency graph, not a human choice, so it
-    is derived from `cargo metadata` rather than maintained by hand.  Ties are
-    broken alphabetically so the output is stable across runs and diffs stay
-    readable.
-    """
-    packages = {package["name"]: package for package in metadata["packages"]}
-    wanted = set(CRATES)
-
-    edges: dict[str, set[str]] = {}
-    for name in wanted:
-        package = packages.get(name)
-        if package is None:
-            raise RuntimeError(f"{name}: not found in workspace metadata")
-        edges[name] = {
-            dependency["name"]
-            for dependency in package["dependencies"]
-            if dependency.get("path") and dependency["name"] in wanted
-        }
-
-    ordered: list[str] = []
-    placed: set[str] = set()
-    while len(ordered) < len(wanted):
-        ready = sorted(
-            name
-            for name in wanted - placed
-            if edges[name] <= placed
-        )
-        if not ready:
-            remaining = ", ".join(sorted(wanted - placed))
-            raise RuntimeError(
-                "dependency cycle among publishable crates: " + remaining
-            )
-        ordered.extend(ready)
-        placed.update(ready)
-    return ordered
 
 
 def cmd_order(args: argparse.Namespace) -> int:
     metadata = _cargo_metadata(args.manifest_path)
-
-    if args.derive:
-        # A freshly computed order, for when a crate is ADDED and CRATES needs
-        # a new entry.  Deliberately NOT the default: any valid topological
-        # order differs from any other, and `verify-order` requires the
-        # template's crateOrder to be an ordered SUBSET of the packaged order
-        # (which comes from CRATES).  Pasting a derived order into the template
-        # without also updating CRATES fails the run.  Update both together.
-        for crate in _derive_order(metadata):
-            print(_format_crate(crate, args.format))
-        return 0
-
-    # Default and --check both validate CRATES against the real dependency
-    # graph: every local dependency present, ordered earlier, publishable.
+    # Validate before printing.  Emitting an order derived from a broken graph
+    # would hand the developer a list that fails the release instead of an
+    # error naming what is wrong.
     _validate_release_graph(metadata)
-    if args.check:
-        print(f"OK: CRATES is a valid leaf-first order ({len(CRATES)} crates)")
-        return 0
-
-    for crate in CRATES:
-        print(_format_crate(crate, args.format))
+    for crate in _release_order(metadata):
+        print(f"    - {crate}" if args.format == "yaml" else crate)
     return 0
-
-
-def _format_crate(crate: str, style: str) -> str:
-    if style == "yaml":
-        return f"    - {crate}"
-    if style == "python":
-        return f'    "{crate}",'
-    return crate
 
 
 def main() -> int:
@@ -530,28 +511,14 @@ def main() -> int:
 
     order = sub.add_parser(
         "order",
-        help="print or validate the leaf-first publish order",
+        help="print the leaf-first publish order for pasting into the template",
     )
     order.add_argument("--manifest-path", default="src/Cargo.toml")
     order.add_argument(
         "--format",
-        choices=["plain", "yaml", "python"],
-        default="plain",
-        help="yaml emits lines ready to paste into Publish.CratesIo.Job.yml",
-    )
-    order.add_argument(
-        "--check",
-        action="store_true",
-        help="validate CRATES against cargo metadata and print nothing else",
-    )
-    order.add_argument(
-        "--derive",
-        action="store_true",
-        help=(
-            "compute a fresh order from the dependency graph instead of "
-            "printing CRATES; use when adding a crate, and update CRATES and "
-            "the template's crateOrder together"
-        ),
+        choices=["yaml", "plain"],
+        default="yaml",
+        help="yaml (default) emits lines ready to paste into crateOrder",
     )
     order.set_defaults(func=cmd_order)
 

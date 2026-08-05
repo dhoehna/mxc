@@ -40,59 +40,48 @@ parameters:
   # as an editable field in the Run dialog, and no human should be hand-editing
   # a dependency order at queue time).
   #
-  # ADDING A CRATE -- do not work the order out by hand, cargo already knows it:
+  # GENERATED.  Do not hand-edit or hand-sort.  Regenerate with:
   #
-  #   1. Add the new package name anywhere in the CRATES list in
-  #      scripts/crates_release.py.  Position does not matter yet; step 2
-  #      sorts it.  This step is required first because `--derive` orders the
-  #      crates named in CRATES, so a package missing from CRATES is invisible
-  #      to it.
+  #   python3 .azure-pipelines/scripts/crates_release.py order
   #
-  #   2. Compute a correct order and replace CRATES with the output:
-  #        python3 .azure-pipelines/scripts/crates_release.py order \
-  #            --derive --format python
+  # and paste the output over every line below.  That command computes the
+  # order from `cargo metadata` and validates the graph before printing, so a
+  # bad edit produces a named error rather than a list that fails mid release.
   #
-  #   3. Mirror it here, replacing every line below:
-  #        python3 .azure-pipelines/scripts/crates_release.py order \
-  #            --format yaml
+  # ADDING A CRATE: add the package name anywhere in the CRATES list in
+  # scripts/crates_release.py, then run the command above.  CRATES is an
+  # unordered set of names; this list is the ordering, and both the packaged
+  # order and this list come from the same computation, so they cannot drift.
   #
-  #   4. Confirm the graph agrees:
-  #        python3 .azure-pipelines/scripts/crates_release.py order --check
-  #
-  # Steps 2 and 3 must be done together.  `--derive` computes a fresh
-  # topological order and `--format yaml` mirrors CRATES; a graph admits many
-  # valid orders, and `verify-order` requires this list to be an ordered SUBSET
-  # of the packaged order (which comes from CRATES).  Pasting a derived order
-  # here while CRATES still holds a different one fails the run.
-  #
-  # Forgetting step 1 is caught, not silent: `_validate_release_graph` fails
-  # packaging with "local dependency is missing from CRATES" as soon as any
-  # published crate depends on the new one.
+  # Forgetting to add it to CRATES is caught, not silent:
+  # `_validate_release_graph` fails packaging with "local dependency is missing
+  # from CRATES" as soon as any published crate depends on the new one.
   #
   # Drop already-published crates from this list to resume a failed release --
   # keep the survivors in their existing relative order rather than
-  # regenerating, for the subset reason above.
+  # regenerating, because `verify-order` accepts only an ordered SUBSET of what
+  # was packaged.
   - name: crateOrder
     type: object
     default:
-    - nanvix_common
-    - mxc_telemetry
-    - wxc_common
-    - nanvix_runner
-    - hyperlight_common
-    - mxc_pty
-    - lxc_common
-    - bwrap_common
-    - seatbelt_common
-    - sandbox_spec
-    - learning_mode_core
-    - learning_mode_windows
-    - appcontainer_common
     - isolation_session_bindings
+    - learning_mode_core
+    - mxc_pty
+    - mxc_telemetry
+    - nanvix_common
+    - sandbox_spec
+    - wxc_common
+    - hyperlight_common
     - isolation_session_common
+    - learning_mode_windows
+    - lxc_common
+    - nanvix_runner
+    - seatbelt_common
     - windows_sandbox_common
-    - windows_sandbox_lifecycle
     - wslc_common
+    - appcontainer_common
+    - bwrap_common
+    - windows_sandbox_lifecycle
     - mxc_engine
     - mxc-sdk
   - name: cratesArtifactName
