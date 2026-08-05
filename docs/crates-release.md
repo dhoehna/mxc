@@ -52,16 +52,22 @@ These names are provisional until the public naming scheme is approved.
 
 Leaf-first, because each crate must already be on crates.io before anything
 that depends on it can publish. The order is a topological sort of the
-workspace dependency graph, computed from `cargo metadata` — nobody maintains
-it by hand and there is no second copy to keep in step. `package` orders the
-`.crate` files it builds by that sort, and the same sort produces the
-`crateOrder` default in `.azure-pipelines/templates/Publish.CratesIo.Job.yml`,
-which drives the ESRP steps.
+workspace dependency graph, computed from `cargo metadata` — nobody works it
+out by hand. `package` orders the `.crate` files it builds by that sort, and
+the same sort generates the `crateOrder` default in
+`.azure-pipelines/templates/Publish.CratesIo.Job.yml`, which drives the ESRP
+steps.
 
-`verify-order` fails the run if the two disagree. It accepts an ordered subset
-of the packaged closure, so a `crateOrder` that omits crates will pass — that
-is what makes a partial resume possible, and it is why the list must be edited
-deliberately.
+`crateOrder` has to be static YAML: `${{ each }}` expands at compile time,
+before any script has run, so the ESRP steps cannot be generated from an order
+computed during the run. It is therefore a **pasted copy** of the command's
+output, kept in step by hand — the two sequences come from the same algorithm,
+but nothing stops someone editing `CRATES` and forgetting to regenerate.
+`verify-order` is what catches that, at run time, before anything is published.
+
+`verify-order` accepts an ordered subset of the packaged closure, so a
+`crateOrder` that omits crates will pass — that is what makes a partial resume
+possible, and it is why the list must be edited deliberately.
 
 **You do not work the order out by hand.** One command produces it:
 
@@ -77,8 +83,8 @@ list that fails halfway through a release.
 To add a crate, put the package name anywhere in the `CRATES` list in
 `.azure-pipelines/scripts/crates_release.py` — that list is an unordered *set*
 of what to publish, not an ordering — then run the command above and paste the
-result. The packaged order and the template list come from the same
-computation, so they cannot drift apart.
+result over `crateOrder`. Both steps are required; doing only the first is
+what `verify-order` exists to catch.
 
 ## How versions are determined
 
@@ -231,21 +237,35 @@ To resume:
 
 1. Identify which crates were already published (check the pipeline logs — each
    successful `EsrpRelease@12` task confirms its crate).
-2. Edit the `crateOrder` default in
+2. Branch from **the exact commit the failed run used**, not from `main`:
+
+   ```bash
+   git switch --detach <sha-of-failed-release-ref>
+   git switch -c release/v0.8.0-resume1
+   ```
+
+   The already-published crates were built from that commit. Cutting the resume
+   branch from `main` instead would package whatever `main` has become since,
+   so the second half of the release would be built from different source than
+   the first — and if the workspace version has moved, `cargo package` produces
+   versions that no longer match what is on crates.io.
+3. On that branch, edit the `crateOrder` default in
    `.azure-pipelines/templates/Publish.CratesIo.Job.yml`, removing the
-   already-published crates, and merge that change to `main`. Keep the
-   remaining entries in their existing relative order, and **do not** rerun
-   `crates_release.py order` — that regenerates the full closure and would put
-   the already-published crates back, which crates.io then rejects.
-3. Cut a **new** release branch containing that edit (for example
-   `release/v0.8.0-resume1`) and run the pipeline against it. The ref supplies
-   the pipeline definition as well as the source, so the edited `crateOrder`
-   only takes effect once it is on the release branch. Do not bump the crate
-   version — the remaining crates still need to publish at the version that
-   failed.
-4. The `verify-order` guard accepts a subset of the original order as long as
-   it is still in correct leaf-first sequence. It logs a warning naming every
-   dependency it assumes is already live.
+   already-published crates. Keep the remaining entries in their existing
+   relative order, and **do not** rerun `crates_release.py order` — that
+   regenerates the full closure and would put the already-published crates
+   back, which crates.io then rejects. Do not bump the crate version; the
+   remaining crates still need to publish at the version that failed.
+4. Push that branch to `microsoft/mxc` and run the pipeline against it. The ref
+   supplies the pipeline definition as well as the source, so the edited
+   `crateOrder` only takes effect once it is on the release branch.
+5. Merge the `crateOrder` edit to `main` separately, or revert it there once
+   the release completes — `main` should end up carrying the full list again,
+   so the next release publishes the whole closure.
+
+The `verify-order` guard accepts a subset of the original order as long as it
+is still in correct leaf-first sequence. It logs a warning naming every
+dependency it assumes is already live.
 
 There is no automated resume. The operator asserts what landed by editing
 `crateOrder`.

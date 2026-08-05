@@ -48,10 +48,16 @@ parameters:
   # order from `cargo metadata` and validates the graph before printing, so a
   # bad edit produces a named error rather than a list that fails mid release.
   #
+  # This list has to be static YAML because ${{ each }} expands at compile
+  # time, before any script has run, so it is a pasted copy rather than a
+  # computed one.  `package` derives its order from the same function, but
+  # nothing prevents this copy going stale -- `verify-order` is what catches
+  # that, at run time, before anything is published.
+  #
   # ADDING A CRATE: add the package name anywhere in the CRATES list in
-  # scripts/crates_release.py, then run the command above.  CRATES is an
-  # unordered set of names; this list is the ordering, and both the packaged
-  # order and this list come from the same computation, so they cannot drift.
+  # scripts/crates_release.py, then run the command above and paste the result
+  # here.  CRATES is an unordered set of names; this list is the ordering.
+  # Both steps are required.
   #
   # Forgetting to add it to CRATES is caught, not silent:
   # `_validate_release_graph` fails packaging with "local dependency is missing
