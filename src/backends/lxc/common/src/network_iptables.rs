@@ -777,39 +777,67 @@ impl NetworkIptablesManager {
                 self.rules_applied = true;
                 Ok(true)
             }
-            Err(e) => {
-                // The inner call has already rolled back exactly what it
-                // created, so nothing is torn down that this attempt did not
-                // install. Report and propagate.
-                logger.log_line(&format!(
-                    "Firewall setup failed: {}. Partial iptables state rolled back.",
-                    e
-                ));
+            Err((e, residual)) => {
+                // The inner call rolled back exactly what it created, but a
+                // removal command can itself fail. Whatever survived is still
+                // ours, so adopt it rather than reporting a clean failure:
+                // otherwise `remove_firewall_rules` and `Drop` are both gated
+                // off and the leaked chain is never retried.
+                if self.adopt_failed_apply_residual(residual) {
+                    logger.log_line(&format!(
+                        "Firewall setup failed: {}. Rollback left iptables state behind; \
+                         retained ownership so teardown retries it.",
+                        e
+                    ));
+                } else {
+                    logger.log_line(&format!(
+                        "Firewall setup failed: {}. Partial iptables state rolled back.",
+                        e
+                    ));
+                }
                 Err(e)
             }
         }
+    }
+
+    /// Take ownership of whatever a failed apply's rollback could not remove,
+    /// so the ordinary teardown paths retry it.
+    ///
+    /// Returns whether anything was retained. `rules_applied` is the gate on
+    /// both [`Self::remove_firewall_rules`] and `Drop`, so leaving it false
+    /// after a rollback that only partly succeeded strands the survivors: no
+    /// later path would know they were ours to remove.
+    fn adopt_failed_apply_residual(&mut self, residual: CreatedResources) -> bool {
+        self.created = residual;
+        self.rules_applied = !residual.is_empty();
+        self.rules_applied
     }
 
     /// Fallible body of [`Self::apply_firewall_rules`]. Tracks the chains and
     /// hooks it creates, rolls back exactly those on the error path, and
     /// returns the created set on success so the manager can tear down only
     /// what it installed.
+    ///
+    /// On failure it returns the error alongside the **residual** set: the
+    /// resources whose rollback command itself failed and which therefore may
+    /// still exist. A failed rollback is not a clean failure, so the caller
+    /// must adopt the residual instead of discarding it.
     fn apply_firewall_rules_inner(
         &self,
         policy: &ContainerPolicy,
         logger: &mut Logger,
-    ) -> Result<CreatedResources, String> {
+    ) -> Result<CreatedResources, (String, CreatedResources)> {
         let mut created = CreatedResources::default();
         match self.install_firewall_rules(policy, logger, &mut created) {
             Ok(()) => Ok(created),
             Err(e) => {
-                let _ = Self::teardown_created(
+                let residual = Self::teardown_created(
                     &self.chain_name,
                     self.veth_interface.as_deref(),
                     &created,
                     logger,
                 );
-                Err(e)
+                Err((e, residual))
             }
         }
     }
@@ -1132,6 +1160,49 @@ mod tests {
             noisy.get_buffer().contains("MXC-racer-that-won"),
             "a published resource must be torn down, got: {:?}",
             noisy.get_buffer()
+        );
+    }
+
+    #[test]
+    fn a_rollback_that_could_not_finish_keeps_ownership_of_what_survived() {
+        // A failed apply is not automatically a clean failure: teardown_created
+        // reports a residual when its own removal commands fail, and those
+        // survivors are still this manager's to remove. rules_applied gates
+        // both remove_firewall_rules and Drop, so dropping the residual on the
+        // floor strands the chain -- nothing afterward knows it was ours.
+        //
+        // Asserting rules_applied directly would only restate the assignment.
+        // This drives the downstream path instead and uses the log as the
+        // observable, because remove_firewall_rules announces the chain by name
+        // before touching anything and returns early when the gate is closed.
+        let mut manager = NetworkIptablesManager::new("survivor");
+        let retained = manager
+            .adopt_failed_apply_residual(CreatedResources::for_test(true, false, false, false));
+        assert!(retained, "a non-empty residual must be retained");
+
+        let mut after_partial = Logger::new(Mode::Buffer);
+        let _ = manager.remove_firewall_rules(&mut after_partial);
+        assert!(
+            after_partial.get_buffer().contains("MXC-survivor"),
+            "a chain that survived rollback must still be torn down later, got: {:?}",
+            after_partial.get_buffer()
+        );
+
+        // Negative control: a rollback that removed everything leaves nothing
+        // owned, so teardown must not run at all. Without this the assertion
+        // above would pass even if ownership were retained unconditionally,
+        // which would resurrect the collision the ownership record exists to
+        // prevent.
+        let mut clean = NetworkIptablesManager::new("fully-rolled-back");
+        let retained_clean = clean.adopt_failed_apply_residual(CreatedResources::default());
+        assert!(!retained_clean, "an empty residual must not be retained");
+
+        let mut after_clean = Logger::new(Mode::Buffer);
+        let _ = clean.remove_firewall_rules(&mut after_clean);
+        assert_eq!(
+            after_clean.get_buffer(),
+            "",
+            "a fully rolled-back apply must not begin a teardown"
         );
     }
 
