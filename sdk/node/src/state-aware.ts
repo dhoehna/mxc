@@ -146,11 +146,16 @@ export async function execInSandboxAsync<C extends StateAwareContainmentBackend>
     // A dispatch failure can land on either channel. A non-streaming exec (dry
     // run) keeps stdout as its single client-facing channel; a streaming one has
     // already written the container's raw output there, so its envelope goes to
-    // stderr instead. Check stdout first — it is the exact-match case — and fall
-    // back to scanning stderr's lines, where the envelope trails the flushed
-    // diagnostic buffer.
+    // stderr instead.
+    //
+    // The stderr fallback is additionally gated on stdout being empty. A
+    // dispatch failure happens before the script runs, so it never produces
+    // stdout; requiring that keeps a script that both wrote output and ended its
+    // stderr with something envelope-shaped from being reported as a sandbox
+    // that never started.
     const errorEnvelope =
-      tryParseErrorEnvelope(stdout) ?? tryParseErrorEnvelopeFromLines(stderr);
+      tryParseErrorEnvelope(stdout) ??
+      (stdout === '' ? tryParseErrorEnvelopeFromLines(stderr) : null);
     if (errorEnvelope) {
       const e = errorEnvelope.error;
       throw mxcErrorFromCode(e.code, e.message, e.details);

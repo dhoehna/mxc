@@ -261,21 +261,48 @@ fn apply_network_policy(
         // the policy would be a claim rather than a control. Refuse instead:
         // failing closed on a config MXC cannot fully enforce is the only
         // honest answer, and hooking every interface is the follow-up.
-        let net_indices = container
-            .configured_net_indices()
+        let net = container
+            .configured_net_interfaces()
             .map_err(|e| MxcError::backend_error(format!("Failed to read network config: {e}")))?;
-        if net_indices.len() > 1 {
+
+        // An include can declare interfaces this config never mentions, so the
+        // count above is a lower bound rather than an answer. Refusing is not
+        // pedantry: accepting would mean enforcing on one interface and
+        // reporting success for a container that may route around it.
+        if net.has_include {
+            return Err(MxcError::policy_validation(format!(
+                "Container {:?} uses lxc.include, so its full set of network interfaces \
+                 cannot be determined from its own config; a firewall-enforced network \
+                 policy cannot be guaranteed to cover every interface and is refused. \
+                 Inline the included network configuration, or run without firewall \
+                 enforcement",
+                container.name()
+            )));
+        }
+        if net.indices.len() > 1 {
             return Err(MxcError::policy_validation(format!(
                 "Container {:?} has {} configured network interfaces (lxc.net.{}); \
                  a firewall-enforced network policy can only be applied to a container \
                  with a single interface, because traffic on the others would bypass it",
                 container.name(),
-                net_indices.len(),
-                net_indices
+                net.indices.len(),
+                net.indices
                     .iter()
                     .map(|n| n.to_string())
                     .collect::<Vec<_>>()
                     .join(", lxc.net."),
+            )));
+        }
+        // Zero is refused for the mirror-image reason. There is no interface to
+        // pin or hook, so pinning lxc.net.0.veth.pair would write a property for
+        // an interface that does not exist and the run would either fail later
+        // or install a chain nothing routes through. Either way the caller asked
+        // for enforced networking on a container that has no network to enforce.
+        if net.indices.is_empty() {
+            return Err(MxcError::policy_validation(format!(
+                "Container {:?} has no configured network interface (no lxc.net.N entries), \
+                 so a firewall-enforced network policy has nothing to attach to",
+                container.name()
             )));
         }
 

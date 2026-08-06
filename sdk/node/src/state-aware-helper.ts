@@ -154,27 +154,28 @@ export function tryParseErrorEnvelope(stdout: string): WireErrorEnvelope | null 
 }
 
 /**
- * Attempts to find an `{error}` envelope among the lines of `stderr`.
+ * Attempts to find an `{error}` envelope at the end of `stderr`.
  *
  * A streaming exec cannot put its error envelope on stdout, because stdout is
  * carrying the container's raw output by then, so the executor writes it to
  * stderr instead. Whole-string parsing is no use there: stderr also carries the
  * flushed diagnostic buffer, so the envelope is one line among several rather
- * than the entire stream. Scanning from the end finds it first, since the
- * executor emits the buffer before the envelope and then exits.
+ * than the entire stream.
  *
- * Only a well-formed envelope is accepted, so an ordinary diagnostic line that
- * happens to be JSON is ignored.
+ * Only the last non-empty line is considered, and only when it is a well-formed
+ * envelope. That narrowness is the point. Some backends relay the guest's own
+ * stderr onto this same stream, so a script is entitled to print something
+ * envelope-shaped; scanning the whole stream would turn that script's ordinary
+ * non-zero exit into a thrown dispatch error and hide its real result. A genuine
+ * dispatch failure always ends the stream with its envelope, because the
+ * executor emits the diagnostic buffer, then the envelope, then exits.
  */
 export function tryParseErrorEnvelopeFromLines(stderr: string): WireErrorEnvelope | null {
   const lines = stderr.split('\n');
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     const trimmed = lines[i].trim();
-    if (!trimmed.startsWith('{')) continue;
-    const envelope = tryParseErrorEnvelope(trimmed);
-    if (envelope) {
-      return envelope;
-    }
+    if (trimmed === '') continue;
+    return tryParseErrorEnvelope(trimmed);
   }
   return null;
 }

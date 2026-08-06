@@ -274,8 +274,15 @@ impl NetworkIptablesManager {
         // it down. If `-N` itself fails the chain belongs to someone else — a
         // concurrent start of the same sandbox, or state leaked by a crashed
         // run — and this instance must not touch it.
+        //
+        // The signal watchdog is told at the same moment and for the same
+        // reason. The chain is host state from this instruction onward, so a
+        // fatal signal must be able to remove it; and a process that never got
+        // here must never remove it, because the chain it would find belongs to
+        // whoever won the race.
         Self::run_iptables(&["-N", &self.chain_name], logger)?;
         self.chain_created = true;
+        crate::signal_cleanup::set_active_chain_created();
 
         // Always allow loopback and established connections
         Self::run_iptables(

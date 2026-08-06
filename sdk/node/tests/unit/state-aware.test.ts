@@ -424,13 +424,14 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
     );
   });
 
-  it('does not mistake a script that merely logged JSON to stderr for a dispatch failure', async () => {
-    // A script is free to write JSON to stderr. Only a well-formed error
-    // envelope may be promoted to a thrown MxcError; anything else is the
-    // script's own output and must come back as an ExecResult.
+  it('does not mistake a script that ended its stderr with an error envelope for a dispatch failure', async () => {
+    // Some backends relay the guest's own stderr onto this stream, so a script
+    // may legitimately print something envelope-shaped. A dispatch failure
+    // happens before the script runs and so produces no stdout; this one did,
+    // and must come back as an ExecResult carrying its real exit code.
     const fake = fakeSpawn({
       stdout: 'partial output\n',
-      stderr: '{"level":"warn","message":"something happened"}\n',
+      stderr: '{"error":{"code":"not_started","message":"printed by the script"}}\n',
       exitCode: 3,
     });
     _setSpawnImpl(fake.spawn);
@@ -441,6 +442,28 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
       testOptions(),
     );
     assert.strictEqual(result.exitCode, 3);
+  });
+
+  it('does not treat an envelope buried mid-stderr as a dispatch failure', async () => {
+    // A genuine dispatch failure ends the stream with its envelope, because the
+    // executor writes the diagnostic buffer, then the envelope, then exits.
+    // Anything still writing afterwards is the guest, so the envelope was the
+    // guest's too.
+    const fake = fakeSpawn({
+      stdout: '',
+      stderr:
+        '{"error":{"code":"not_started","message":"printed by the script"}}\n' +
+        'script kept going after printing that\n',
+      exitCode: 4,
+    });
+    _setSpawnImpl(fake.spawn);
+    const id = 'iso:abc' as SandboxId<'isolation_session'>;
+    const result = await execInSandboxAsync(
+      id,
+      { process: { commandLine: 'noisy' } },
+      testOptions(),
+    );
+    assert.strictEqual(result.exitCode, 4);
   });
 
   it('closes the child stdin so a stdin-reading command sees EOF instead of hanging', async () => {

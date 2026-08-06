@@ -59,6 +59,17 @@ struct ActiveSandbox {
     /// Read only by the Linux watchdog, but written on every target.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     rollback: SignalRollback,
+    /// Whether this process created the firewall chain for `name`.
+    ///
+    /// The chain name is derived from the container name, so two processes
+    /// starting the same sandbox target the same chain and only one of them
+    /// creates it. Without this the watchdog would tear the chain down on a
+    /// signal no matter which process it interrupted, and interrupting the
+    /// loser would strip the firewall off the winner's running container. The
+    /// bit is set by the manager the moment its `iptables -N` succeeds, so the
+    /// whole window in which the chain exists is covered and no wider.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    chain_created: bool,
 }
 
 static ACTIVE_CONTAINER: OnceLock<Mutex<ActiveSandbox>> = OnceLock::new();
@@ -81,6 +92,7 @@ pub fn set_active(name: &str) {
     slot.name = Some(name.to_owned());
     slot.veth = None;
     slot.rollback = SignalRollback::DestroyContainer;
+    slot.chain_created = false;
 }
 
 /// Records `name` as the currently active container for the *state-aware*
@@ -102,6 +114,25 @@ pub fn set_active_network_only(name: &str) {
     slot.name = Some(name.to_owned());
     slot.veth = None;
     slot.rollback = SignalRollback::NetworkOnly;
+    slot.chain_created = false;
+}
+
+/// Records that this process created the firewall chain for the active
+/// container, so the watchdog may remove it on a fatal signal.
+///
+/// Called by [`crate::network_iptables::NetworkIptablesManager`] the moment its
+/// `iptables -N` succeeds — the instant the chain starts existing, and not
+/// before. Registering a name is deliberately not enough on its own: a process
+/// whose `-N` lost the race to a concurrent start of the same sandbox owns
+/// nothing, and a signal must not make it delete the winner's chain and leave
+/// the winner's container running unfiltered.
+///
+/// No-op if no container is currently registered.
+pub fn set_active_chain_created() {
+    let mut slot = lock_slot();
+    if slot.name.is_some() {
+        slot.chain_created = true;
+    }
 }
 
 /// Unregisters the active sandbox, so a later signal rolls nothing back.
@@ -187,8 +218,19 @@ fn run_watchdog(mask: SigSet) -> ! {
             // dangling reference. Best-effort with a buffered logger so
             // signal-time output doesn't interleave with whatever else
             // might still be writing to the host's stdio.
+            //
+            // Only what this process created, though. force_cleanup itself is
+            // ownership-blind — it rebuilds the chain name and removes whatever
+            // is there — so gating the call is what keeps a process that lost
+            // the chain-creation race from deleting the winner's firewall.
             let mut buf_logger = Logger::new(Mode::Buffer);
-            NetworkIptablesManager::force_cleanup(&name, active.veth.as_deref(), &mut buf_logger);
+            if active.chain_created {
+                NetworkIptablesManager::force_cleanup(
+                    &name,
+                    active.veth.as_deref(),
+                    &mut buf_logger,
+                );
+            }
             if active.rollback == SignalRollback::DestroyContainer {
                 let _ = LxcContainer::new(&name, None).destroy();
             }
@@ -226,6 +268,25 @@ mod tests {
         set_active_veth("mxcv-abc");
         assert_eq!(lock_slot().veth.as_deref(), Some("mxcv-abc"));
 
+        // Registering a name is not by itself a claim on the firewall chain.
+        // The watchdog gates its ownership-blind force_cleanup on this bit, so
+        // a process whose `iptables -N` lost the race to a concurrent start
+        // must not be holding it — otherwise a signal would make the loser
+        // delete the winner's chain and leave the winner unfiltered.
+        assert!(!lock_slot().chain_created);
+
+        // The manager sets it the moment its own `-N` succeeds.
+        set_active_chain_created();
+        assert!(lock_slot().chain_created);
+
+        // Re-registering a different container drops the claim with it.
+        set_active_network_only("yet-another-box");
+        assert!(!lock_slot().chain_created);
+        set_active_chain_created();
+        assert!(lock_slot().chain_created);
+        set_active("one-shot-box");
+        assert!(!lock_slot().chain_created);
+
         // Clearing leaves nothing to roll back. Without this, a signal after a
         // successful start would strip the firewall off a running container.
         clear_active();
@@ -233,11 +294,17 @@ mod tests {
             let slot = lock_slot();
             assert!(slot.name.is_none());
             assert!(slot.veth.is_none());
+            assert!(!slot.chain_created);
         }
 
-        // A no-op veth registration must not resurrect a cleared slot.
+        // Neither late registration may resurrect a cleared slot.
         set_active_veth("mxcv-def");
-        assert!(lock_slot().veth.is_none());
+        set_active_chain_created();
+        {
+            let slot = lock_slot();
+            assert!(slot.veth.is_none());
+            assert!(!slot.chain_created);
+        }
 
         // Re-registering resets the veth, since the new container has not had
         // one discovered yet.

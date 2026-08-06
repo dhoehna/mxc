@@ -122,8 +122,22 @@ fn build_attach_args(env: &[String], working_directory: &str, command: &str) -> 
     args
 }
 
-/// Extract the `N` of every `lxc.net.N.*` key in an LXC config file, sorted and
-/// deduplicated.
+/// What an LXC config file says about the container's network interfaces.
+///
+/// Carries the `lxc.include` answer alongside the indices because a caller that
+/// filters egress cannot act on the indices without it: an include can add
+/// interfaces this file never mentions, so a count taken from this file alone
+/// would understate the container and let a policy claim to be enforced when it
+/// is not.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NetInterfaceConfig {
+    /// The `N` of every `lxc.net.N.*` key in this file, sorted and deduplicated.
+    pub indices: Vec<u32>,
+    /// Whether this file pulls in another config with `lxc.include`.
+    pub has_include: bool,
+}
+
+/// Extract the network-interface picture from an LXC config file.
 ///
 /// Split out of [`LxcContainer::configured_net_indices`] so the parse is
 /// testable without a container on disk. A key matches only when the segment
@@ -132,22 +146,42 @@ fn build_attach_args(env: &[String], working_directory: &str, command: &str) -> 
 /// sub-key are both ignored — neither declares an interface liblxc will bring
 /// up under the modern schema. Comment lines are skipped, since `#` prefixes a
 /// comment in this format and a commented-out interface is not configured.
-fn parse_net_indices(config_contents: &str) -> Vec<u32> {
-    let mut indices: Vec<u32> = config_contents
-        .lines()
-        .filter_map(|line| {
-            let key = line.split_once('=')?.0.trim();
-            if key.starts_with('#') {
-                return None;
+///
+/// `lxc.include` is reported rather than followed. Following it correctly means
+/// resolving relative paths and directory globs the way liblxc does, and
+/// getting that subtly wrong would produce exactly the false confidence this
+/// function exists to prevent. A caller that needs certainty refuses instead.
+fn parse_net_interface_config(config_contents: &str) -> NetInterfaceConfig {
+    let mut indices: Vec<u32> = Vec::new();
+    let mut has_include = false;
+
+    for line in config_contents.lines() {
+        let Some((lhs, _)) = line.split_once('=') else {
+            continue;
+        };
+        let key = lhs.trim();
+        if key.starts_with('#') {
+            continue;
+        }
+        if key == "lxc.include" {
+            has_include = true;
+            continue;
+        }
+        if let Some(rest) = key.strip_prefix("lxc.net.") {
+            if let Some((index, _)) = rest.split_once('.') {
+                if let Ok(n) = index.parse::<u32>() {
+                    indices.push(n);
+                }
             }
-            let rest = key.strip_prefix("lxc.net.")?;
-            let (index, _) = rest.split_once('.')?;
-            index.parse::<u32>().ok()
-        })
-        .collect();
+        }
+    }
+
     indices.sort_unstable();
     indices.dedup();
-    indices
+    NetInterfaceConfig {
+        indices,
+        has_include,
+    }
 }
 
 /// Safe wrapper around an LXC container.
@@ -550,21 +584,22 @@ impl LxcContainer {
         format!("{}/{}/config", self.lxc_path, self.name)
     }
 
-    /// The `N` of every `lxc.net.N.*` key configured for this container, sorted
-    /// and deduplicated.
+    /// What this container's config says about its network interfaces.
     ///
     /// Provision adopts an existing container as readily as it creates one, and
     /// an adopted container can carry more network interfaces than the single
     /// `lxc.net.0` MXC configures for itself. A caller that filters egress needs
     /// to know that before it claims to have filtered anything. A missing config
-    /// file reports no interfaces (`Ok(vec![])`), consistent with
+    /// file reports nothing configured, consistent with
     /// [`clear_config_item`](Self::clear_config_item) treating it as
     /// already-clear.
-    pub fn configured_net_indices(&self) -> Result<Vec<u32>, String> {
+    pub fn configured_net_interfaces(&self) -> Result<NetInterfaceConfig, String> {
         let config_path = self.config_file_path();
         let contents = match std::fs::read_to_string(&config_path) {
             Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(NetInterfaceConfig::default())
+            }
             Err(e) => {
                 return Err(format!(
                     "Failed to read config to enumerate network interfaces: {} (config file: {})",
@@ -572,7 +607,7 @@ impl LxcContainer {
                 ))
             }
         };
-        Ok(parse_net_indices(&contents))
+        Ok(parse_net_interface_config(&contents))
     }
 
     /// Get the current system architecture string for LXC templates.
@@ -735,7 +770,9 @@ mod tests {
                       lxc.net.0.type = veth\n\
                       lxc.net.0.link = lxcbr0\n\
                       lxc.net.0.flags = up\n";
-        assert_eq!(parse_net_indices(config), vec![0]);
+        let net = parse_net_interface_config(config);
+        assert_eq!(net.indices, vec![0]);
+        assert!(!net.has_include);
     }
 
     #[test]
@@ -744,13 +781,30 @@ mod tests {
                       lxc.net.1.type = veth\n\
                       lxc.net.1.link = br1\n\
                       lxc.net.4.type = macvlan\n";
-        assert_eq!(parse_net_indices(config), vec![0, 1, 4]);
+        assert_eq!(parse_net_interface_config(config).indices, vec![0, 1, 4]);
+    }
+
+    #[test]
+    fn an_include_is_reported_because_it_can_declare_interfaces_this_file_never_names() {
+        // The visible count here is 1, which would otherwise look enforceable.
+        // The include can add an interface that routes around the single hook,
+        // so the caller has to know the count is only a lower bound.
+        let config = "lxc.net.0.type = veth\nlxc.include = /usr/share/lxc/config/common.conf\n";
+        let net = parse_net_interface_config(config);
+        assert_eq!(net.indices, vec![0]);
+        assert!(net.has_include);
+    }
+
+    #[test]
+    fn a_commented_out_include_does_not_count_as_an_include() {
+        let config = "lxc.net.0.type = veth\n# lxc.include = /some/file.conf\n";
+        assert!(!parse_net_interface_config(config).has_include);
     }
 
     #[test]
     fn a_config_with_no_network_keys_reports_no_interfaces() {
         let config = "lxc.uts.name = box\nlxc.rootfs.path = /var/lib/lxc/box/rootfs\n";
-        assert!(parse_net_indices(config).is_empty());
+        assert!(parse_net_interface_config(config).indices.is_empty());
     }
 
     #[test]
@@ -758,13 +812,13 @@ mod tests {
         // liblxc ignores the line, so counting it would make MXC refuse a
         // container it can in fact fully filter.
         let config = "lxc.net.0.type = veth\n# lxc.net.1.type = veth\n";
-        assert_eq!(parse_net_indices(config), vec![0]);
+        assert_eq!(parse_net_interface_config(config).indices, vec![0]);
     }
 
     #[test]
     fn the_legacy_lxc_network_spelling_is_not_mistaken_for_a_modern_interface() {
         let config = "lxc.net.0.type = veth\nlxc.network.1.type = veth\n";
-        assert_eq!(parse_net_indices(config), vec![0]);
+        assert_eq!(parse_net_interface_config(config).indices, vec![0]);
     }
 
     #[test]
@@ -775,13 +829,16 @@ mod tests {
         let config = "lxc.net.0.type = veth\n\
                       lxc.net.0.veth.pair = mxcv-aaaa\n\
                       lxc.net.0.veth.pair = mxcv-bbbb\n";
-        assert_eq!(parse_net_indices(config), vec![0]);
+        assert_eq!(parse_net_interface_config(config).indices, vec![0]);
     }
 
     #[test]
-    fn a_missing_config_file_reports_no_interfaces_rather_than_an_error() {
+    fn a_missing_config_file_reports_nothing_configured_rather_than_an_error() {
         let c = LxcContainer::new("definitely-not-provisioned", Some("/nonexistent-lxcpath"));
-        assert_eq!(c.configured_net_indices(), Ok(Vec::new()));
+        assert_eq!(
+            c.configured_net_interfaces(),
+            Ok(NetInterfaceConfig::default())
+        );
     }
 
     #[test]

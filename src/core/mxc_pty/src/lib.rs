@@ -356,6 +356,7 @@ pub fn run_with_pty(mut command: Command, options: PtyOptions) -> Result<PtyOutc
     };
 
     // Drain remaining output before returning.
+    const DRAIN_GRACE: Duration = Duration::from_secs(2);
     match outcome {
         PtyOutcome::Exited(_) => {
             // Normally the child's exit closes its secondary fds, primary_reader
@@ -367,12 +368,23 @@ pub fn run_with_pty(mut command: Command, options: PtyOptions) -> Result<PtyOutc
             // secondary open, and then this join blocks forever. That defeats a
             // requested timeout exactly as the killed-child case does, just via
             // a different outcome. So whenever a deadline was asked for, bound
-            // the drain; only an explicitly untimed run waits indefinitely.
-            const DRAIN_GRACE: Duration = Duration::from_secs(2);
-            if deadline.is_some() {
-                let _ = join_with_timeout(output_thread, DRAIN_GRACE);
-            } else {
-                let _ = output_thread.join();
+            // the drain.
+            //
+            // The bound is the caller's remaining budget plus the same grace the
+            // timeout path uses, not a flat grace. A child that exits quickly
+            // with a lot of buffered output is the common case and it has done
+            // nothing wrong; charging it two seconds to drain would truncate
+            // output this function promises to forward. Waiting out the deadline
+            // it was already allowed to consume costs nothing that was not
+            // already budgeted, and still terminates.
+            match deadline {
+                Some(d) => {
+                    let remaining = d.saturating_duration_since(Instant::now());
+                    let _ = join_with_timeout(output_thread, remaining + DRAIN_GRACE);
+                }
+                None => {
+                    let _ = output_thread.join();
+                }
             }
         }
         PtyOutcome::TimedOut => {
@@ -384,7 +396,6 @@ pub fn run_with_pty(mut command: Command, options: PtyOptions) -> Result<PtyOutc
             // short grace to flush buffered output, then abandon the reader.
             // The executor process exits right after a (state-aware) exec, so
             // the OS reaps the detached thread.
-            const DRAIN_GRACE: Duration = Duration::from_secs(2);
             let _ = join_with_timeout(output_thread, DRAIN_GRACE);
         }
     }
