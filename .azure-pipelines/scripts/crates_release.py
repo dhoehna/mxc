@@ -110,11 +110,15 @@ CRATES: list[str] = [
     "mxc-sdk",
 ]
 
-# Target triples verified by `cargo package`.  All three are passed to a
-# single cargo invocation per crate, which verifies them in parallel on the
-# Windows agent that owns packaging.  The Windows triple comes with the
+# Target triples verified by `cargo package`.  All three are passed to one
+# cargo invocation covering the whole closure, which verifies them in parallel
+# on the Windows agent that owns packaging.  The Windows triple comes with the
 # toolchain; Package.Crates.Job.yml installs the Linux and macOS triples, and
 # _verify_targets fails the run if any of the three is absent.
+#
+# A crate that is platform-specific must gate itself with cfg so it still
+# compiles (possibly to an empty library) on the other two triples; that is a
+# published-API decision and is documented per crate, not worked around here.
 #
 # lib-only crates require no linker for cross-compilation, so no cross-linker
 # toolchain or Apple SDK is needed -- `rustup target add` alone is sufficient.

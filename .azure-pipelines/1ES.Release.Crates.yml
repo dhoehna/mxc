@@ -224,14 +224,17 @@ extends:
             $ErrorActionPreference = 'Stop'
             $ref = $env:SOURCE_REF
             Write-Host "Run was queued against: $ref"
-            # -like uses the same wildcard semantics as the shell `case` globs
-            # this replaced: ? is exactly one character, * is any run.  The ?*
-            # suffix therefore still requires a non-empty branch or tag name.
-            if ($ref -like 'refs/heads/release/?*')
+            # -clike, not -like: ? is exactly one character and * is any run in
+            # both, but -like is case-INSENSITIVE and would widen this gate to
+            # accept refs/heads/Release/x and refs/tags/V1.  Git refs are
+            # case-sensitive, so those are different refs from the ones the
+            # release/* ruleset freezes, and a publish is irreversible.  The ?*
+            # suffix requires a non-empty branch or tag name.
+            if ($ref -clike 'refs/heads/release/?*')
             {
               Write-Host "OK: releasing from branch $($ref.Substring('refs/heads/'.Length))"
             }
-            elseif ($ref -like 'refs/tags/v?*')
+            elseif ($ref -clike 'refs/tags/v?*')
             {
               Write-Host "OK: releasing from tag $($ref.Substring('refs/tags/'.Length))"
             }

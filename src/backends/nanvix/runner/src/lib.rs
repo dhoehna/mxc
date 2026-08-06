@@ -1,9 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// NanVix runs on Windows and Linux only.  On any other platform this crate
-// compiles to an empty library, so the published package graph stays valid
-// without shipping code that cannot work there.
+// NanVix runs on Windows and Linux only.  This predicate deliberately mirrors
+// the pre-existing gate on `wxc_common::microvm_staging`
+// (`src/core/wxc_common/src/lib.rs`), which this crate's core logic depends on
+// and which does not exist on other platforms -- so this propagates an
+// existing platform constraint rather than introducing a new one.  On any
+// other platform the crate compiles to an empty library, which keeps the
+// published package graph valid without shipping code that cannot work there.
 #![cfg(any(target_os = "windows", target_os = "linux"))]
 
 //! `NanVixScriptRunner` -- executes code inside a NanVix micro-VM.
