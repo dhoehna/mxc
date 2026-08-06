@@ -28,8 +28,13 @@ struct ProxyEndpoint {
 /// owned by a *different, live* container, and leave its hooks pointing at an
 /// empty chain. Recording what this call created keeps the rollback to its own
 /// resources.
+///
+/// Visible to the crate (with private fields) purely so `signal_cleanup` can
+/// carry the value from the runner thread to the watchdog thread. The watchdog
+/// never inspects it; it only hands it back to
+/// [`NetworkIptablesManager::force_cleanup`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct CreatedFirewallState {
+pub(crate) struct CreatedFirewallState {
     v4_chain: bool,
     v6_chain: bool,
     v4_hooks: bool,
@@ -51,6 +56,24 @@ impl CreatedFirewallState {
             v4_dhcp: true,
             v6_dhcp: true,
         }
+    }
+
+    /// Whether nothing was created, in which case the signal path must not run
+    /// a single iptables command: anything answering to this chain name then
+    /// belongs to a *different* live container (names truncate to 20 chars and
+    /// can collide), and tearing it down would silently fail that container
+    /// open.
+    ///
+    /// Only reachable from the signal path, which is Linux-only; kept compiled
+    /// on every target so Windows and macOS CI still type-check it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn is_empty(&self) -> bool {
+        !self.v4_chain
+            && !self.v6_chain
+            && !self.v4_hooks
+            && !self.v6_hooks
+            && !self.v4_dhcp
+            && !self.v6_dhcp
     }
 }
 
@@ -385,6 +408,48 @@ impl NetworkIptablesManager {
         resolved
     }
 
+    /// Resolve `blockedHosts` to IPv4 addresses, failing setup when an entry
+    /// resolves to nothing and `fail_on_unresolved` is set.
+    ///
+    /// An unresolved *blocked* host is not the same as an unresolved *allowed*
+    /// host. A blocked host that produces no DROP rule under a default-allow
+    /// policy silently falls through to the ACCEPT default, so the host the
+    /// operator explicitly named as blocked stays reachable while setup reports
+    /// success — a fail-open. The only fail-closed outcome is to refuse setup.
+    /// The caller passes `fail_on_unresolved` only under default-allow; under
+    /// default-block the closing DROP already covers the host, so a resolution
+    /// failure is logged and skipped rather than fatal.
+    fn resolve_blocked_hosts(
+        hosts: &[String],
+        fail_on_unresolved: bool,
+        logger: &mut Logger,
+    ) -> Result<Vec<String>, String> {
+        let mut resolved = Vec::new();
+
+        for host in hosts {
+            let ips = Self::resolve_host(host);
+            if ips.is_empty() {
+                if fail_on_unresolved {
+                    return Err(format!(
+                        "blockedHosts entry '{}' resolved to no address, so it would get no \
+                         DROP rule and fall through to the default-allow policy — leaving a \
+                         host the policy names as blocked reachable. Refusing to start with \
+                         a network policy that cannot enforce one of its own blocks.",
+                        host
+                    ));
+                }
+                logger.log_line(&format!("Warning: could not resolve host '{}'", host));
+                continue;
+            }
+            for ip in ips {
+                logger.log_line(&format!("Blocking host: {} ({})", host, ip));
+                resolved.push(ip);
+            }
+        }
+
+        Ok(resolved)
+    }
+
     /// Whether `host` is already an IP literal (v4 or v6) and therefore needs
     /// no DNS resolution to reach. Accepts bracketed IPv6 literals (e.g.
     /// `[::1]`) as stored by the proxy URL parser.
@@ -691,9 +756,11 @@ impl NetworkIptablesManager {
         // not make.
         Self::run_iptables(&["-N", &self.chain_name], logger)?;
         created.v4_chain = true;
+        Self::publish_created(created);
         if ipv6_enabled {
             Self::run_ip6tables(&["-N", &self.chain_name], logger)?;
             created.v6_chain = true;
+            Self::publish_created(created);
         }
 
         let (blocked_ips, allowed_ips) = if proxy_enabled {
@@ -703,8 +770,16 @@ impl NetworkIptablesManager {
             );
             (Vec::new(), Vec::new())
         } else {
+            // A blockedHosts entry that resolves to nothing is only a
+            // fail-open under a default-allow policy: there the chain falls
+            // through to ACCEPT, so a host with no DROP rule stays reachable
+            // even though the operator named it as blocked. Refuse setup in
+            // that case. Under default-block the same host is already
+            // unreachable by the closing DROP, so a resolution failure is not a
+            // security gap and stays a logged skip.
+            let block_default = matches!(policy.default_network_policy, NetworkPolicy::Allow);
             (
-                Self::resolve_policy_hosts(&policy.blocked_hosts, "Blocking", logger),
+                Self::resolve_blocked_hosts(&policy.blocked_hosts, block_default, logger)?,
                 Self::resolve_policy_hosts(&policy.allowed_hosts, "Allowing", logger),
             )
         };
@@ -775,6 +850,7 @@ impl NetworkIptablesManager {
             // can hit another container, so those are only set once `-N` has
             // succeeded.)
             created.v4_hooks = true;
+            Self::publish_created(created);
             for hook in ["FORWARD", "INPUT"] {
                 Self::run_iptables(&["-I", hook, "-i", iface, "-j", &self.chain_name], logger)?;
             }
@@ -797,9 +873,11 @@ impl NetworkIptablesManager {
                 logger,
             )?;
             created.v4_dhcp = true;
+            Self::publish_created(created);
 
             if ipv6_enabled {
                 created.v6_hooks = true;
+                Self::publish_created(created);
                 for hook in ["FORWARD", "INPUT"] {
                     Self::run_ip6tables(
                         &["-I", hook, "-i", iface, "-j", &self.chain_name],
@@ -817,6 +895,7 @@ impl NetworkIptablesManager {
                     logger,
                 )?;
                 created.v6_dhcp = true;
+                Self::publish_created(created);
             }
         } else {
             logger.log_line(
@@ -827,6 +906,23 @@ impl NetworkIptablesManager {
         }
 
         Ok(())
+    }
+
+    /// Publish the resources created so far to the signal-cleanup registry, so
+    /// a fatal signal tears down exactly what this process installed.
+    ///
+    /// Called after **each** individual resource is marked created, not once at
+    /// the end of a successful apply: a signal arriving mid-apply would then see
+    /// an empty set, remove nothing, and leak the partially created chain. The
+    /// hook flags are published before their inserts run (matching how they are
+    /// marked), which is safe because a signal-time `-D` for a hook that was
+    /// never inserted is a harmless no-op scoped to this container's own veth.
+    ///
+    /// A no-op for backends that never registered a container (Bubblewrap
+    /// builds the same manager but installs no watchdog), so it cannot make the
+    /// watchdog act on a lifecycle it does not manage.
+    fn publish_created(created: &CreatedFirewallState) {
+        crate::signal_cleanup::set_active_created(*created);
     }
 
     /// Best-effort removal of every hook and chain this manager could have
@@ -912,11 +1008,35 @@ impl NetworkIptablesManager {
     /// Best-effort cleanup of any iptables state the runner may have
     /// installed for a container, used when the original
     /// `NetworkIptablesManager` instance isn't reachable (e.g. signal-time
-    /// cleanup from the watchdog thread). Builds a fresh manager pointed at
-    /// the same chain name so `remove_firewall_rules` does its work
-    /// regardless of whether rules were actually installed; iptables itself
-    /// is the source of truth.
-    pub fn force_cleanup(container_name: &str, veth_interface: Option<&str>, logger: &mut Logger) {
+    /// cleanup from the watchdog thread).
+    ///
+    /// `created` is the ownership record the runner published as it installed
+    /// each resource, carried across the thread boundary by `signal_cleanup`.
+    /// Using it — rather than assuming every chain and hook exists — is what
+    /// keeps this path from flushing a *different* container's live chain:
+    /// chain names sanitize and truncate to 20 characters, so a name collision
+    /// would otherwise let a signal delivered to container A empty container
+    /// B's chain, silently failing B open. Once this process owns anything
+    /// under the name (its `-N` succeeded, so it holds the name exclusively),
+    /// tearing down the full set only touches its own resources.
+    ///
+    /// The sole caller (`signal_cleanup::run_watchdog`) is Linux-only, so this
+    /// is dead code elsewhere. It stays compiled on every target rather than
+    /// being `cfg`-gated so Windows and macOS CI still type-check it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn force_cleanup(
+        container_name: &str,
+        veth_interface: Option<&str>,
+        created: CreatedFirewallState,
+        logger: &mut Logger,
+    ) {
+        // This process created nothing, so there is nothing of ours to remove.
+        // Anything answering to this chain name belongs to a different, live
+        // container, and tearing it down would silently fail that container
+        // open.
+        if created.is_empty() {
+            return;
+        }
         let mut mgr = Self::new(container_name);
         if let Some(v) = veth_interface {
             mgr.set_veth_interface(v);
@@ -1300,5 +1420,100 @@ mod tests {
         assert!(all.v6_hooks);
         assert!(all.v4_dhcp);
         assert!(all.v6_dhcp);
+    }
+
+    #[test]
+    fn a_signal_before_anything_was_created_tears_down_nothing() {
+        // force_cleanup is ownership-blind once it starts: it rebuilds the
+        // chain name and removes whatever answers to it. The empty-record guard
+        // is the only thing between a process that created nothing and the
+        // chain of a concurrent start that did — chain names truncate to 20
+        // characters and can collide. Asserting `is_empty()` in isolation would
+        // not catch the guard's deletion, so this drives force_cleanup itself
+        // and uses the log as the observable: remove_firewall_rules announces
+        // the chain by name before it touches anything.
+        let mut quiet = test_logger();
+        NetworkIptablesManager::force_cleanup(
+            "racer-that-lost",
+            Some("mxcv-loser"),
+            CreatedFirewallState::default(),
+            &mut quiet,
+        );
+        assert_eq!(
+            quiet.get_buffer(),
+            "",
+            "a process holding no ownership must not begin a teardown at all"
+        );
+
+        // Positive control: the same call with one resource published does
+        // reach the teardown, so the assertion above discriminates between the
+        // two cases rather than watching a permanently silent function.
+        let mut noisy = test_logger();
+        NetworkIptablesManager::force_cleanup(
+            "racer-that-won",
+            Some("mxcv-winner"),
+            CreatedFirewallState {
+                v4_chain: true,
+                ..CreatedFirewallState::default()
+            },
+            &mut noisy,
+        );
+        assert!(
+            noisy.get_buffer().contains("MXC-racer-that-won"),
+            "a published resource must be torn down, got: {:?}",
+            noisy.get_buffer()
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_blocked_host_fails_setup_under_default_allow() {
+        // Under default-allow, a blocked host that resolves to nothing gets no
+        // DROP rule and falls through to ACCEPT, so the host the policy names
+        // as blocked stays reachable. That is a fail-open, so setup must fail
+        // rather than silently skip the entry.
+        let hosts = vec!["blocked.invalid".to_string()];
+        let mut logger = test_logger();
+        let result = NetworkIptablesManager::resolve_blocked_hosts(&hosts, true, &mut logger);
+        assert!(
+            result.is_err(),
+            "an unresolvable blocked host under default-allow must fail setup, got {:?}",
+            result
+        );
+        assert!(
+            result.unwrap_err().contains("blocked.invalid"),
+            "the failure must name the offending host"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_blocked_host_is_skipped_under_default_block() {
+        // Under default-block the closing DROP already covers the host, so a
+        // resolution failure is not a security gap. It stays a logged skip so a
+        // legitimate config whose blocklist names a temporarily-down host is
+        // not made to fail.
+        let hosts = vec!["blocked.invalid".to_string()];
+        let mut logger = test_logger();
+        let result = NetworkIptablesManager::resolve_blocked_hosts(&hosts, false, &mut logger);
+        assert_eq!(
+            result,
+            Ok(Vec::new()),
+            "an unresolvable blocked host under default-block must be skipped, not fatal"
+        );
+        assert!(
+            logger
+                .get_buffer()
+                .contains("could not resolve host 'blocked.invalid'"),
+            "the skipped host must still be logged"
+        );
+    }
+
+    #[test]
+    fn a_resolvable_blocked_host_passes_through_even_when_failing_is_armed() {
+        // The fail-closed behavior must not regress the happy path: a blocked
+        // host that resolves still yields its DROP address under default-allow.
+        let hosts = vec!["10.0.0.5".to_string()];
+        let mut logger = test_logger();
+        let result = NetworkIptablesManager::resolve_blocked_hosts(&hosts, true, &mut logger);
+        assert_eq!(result, Ok(vec!["10.0.0.5".to_string()]));
     }
 }
