@@ -10,7 +10,9 @@ use std::net::ToSocketAddrs;
 use std::process::Command;
 
 use wxc_common::logger::Logger;
-use wxc_common::models::{ContainerPolicy, NetworkEnforcementMode, NetworkPolicy, ProxyConfig};
+use wxc_common::models::{
+    ContainerPolicy, NetworkEnforcementMode, NetworkPolicy, ProxyAddress, ProxyConfig,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProxyEndpoint {
@@ -422,6 +424,37 @@ impl NetworkIptablesManager {
         )
     }
 
+    /// Whether the proxy is addressed with a TLS scheme, meaning the client
+    /// opens a TLS connection *to the proxy itself* rather than tunneling
+    /// through a plaintext one.
+    ///
+    /// This matters only when the host is about to be rewritten: replacing a
+    /// hostname with a bare IP means the client presents no SNI for that name
+    /// and validates the proxy's certificate against an IP, which fails unless
+    /// the certificate carries a matching IP SAN.
+    fn proxy_url_uses_tls(address: &ProxyAddress) -> bool {
+        address
+            .original_url
+            .as_deref()
+            .and_then(|raw| raw.split_once("://"))
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+    }
+
+    /// The error returned when pinning would rewrite a TLS proxy's hostname to
+    /// an IP and thereby break certificate validation.
+    fn tls_proxy_pinning_unsupported(host: &str) -> String {
+        format!(
+            "A TLS-addressed network proxy ('https://{}') cannot be pinned to a resolved \
+             address: deny-all-except-proxy rewrites the proxy host to the IP the host \
+             resolved so the firewall rule and the injected HTTP(S)_PROXY name the same \
+             endpoint, but that leaves the client validating the proxy certificate against \
+             an IP with no SNI, which fails unless the certificate carries a matching IP \
+             SAN. Address the proxy by IP in the config, or use an http:// proxy URL \
+             (CONNECT tunneling still reaches https destinations).",
+            host
+        )
+    }
+
     /// Pin an enabled, hostname-addressed proxy to a single host-resolved IPv4
     /// address.
     ///
@@ -434,9 +467,11 @@ impl NetworkIptablesManager {
     ///
     /// Returns the config unchanged when the proxy is disabled, has no address
     /// (built-in test server), or is already an IPv4 literal. An IPv6 literal is
-    /// rejected explicitly (the rule set is IPv4-only). Multi-A-record hostnames
-    /// collapse to the first resolved address, which is the point: both sides
-    /// then agree on one IP instead of racing DNS.
+    /// rejected explicitly (the rule set is IPv4-only), as is a hostname behind
+    /// an `https://` scheme (rewriting its host to an IP would break the
+    /// proxy's own certificate validation). Multi-A-record hostnames collapse to
+    /// the first resolved address, which is the point: both sides then agree on
+    /// one IP instead of racing DNS.
     pub fn pin_proxy_to_resolved_ip(
         proxy: &ProxyConfig,
         logger: &mut Logger,
@@ -458,6 +493,13 @@ impl NetworkIptablesManager {
 
         if Self::host_is_ip_literal(address.host()) {
             return Ok(proxy.clone());
+        }
+
+        // Checked only on the rewrite path. An address already given as an IP
+        // literal is left untouched, so whatever the operator provisioned for it
+        // keeps working.
+        if Self::proxy_url_uses_tls(address) {
+            return Err(Self::tls_proxy_pinning_unsupported(address.host()));
         }
 
         let ips = Self::resolve_host(address.host());
@@ -996,6 +1038,47 @@ mod tests {
         // The injected HTTP(S)_PROXY must name the same literal the firewall
         // ACCEPT was written for — not the original hostname.
         assert_eq!(address.to_url(), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn pin_proxy_refuses_a_tls_addressed_hostname_rather_than_breaking_its_certificate() {
+        // Pinning rewrites the host to an IP. For an https-scheme proxy that
+        // silently breaks SNI and certificate validation, so the run must be
+        // refused with an explanation instead of failing obscurely at connect
+        // time inside the container.
+        let proxy = proxy_from_url("https://localhost:8443", "localhost", 8443);
+        let mut logger = test_logger();
+
+        let result = NetworkIptablesManager::pin_proxy_to_resolved_ip(&proxy, &mut logger);
+
+        let message = result.expect_err("a TLS-addressed proxy hostname must be refused");
+        assert!(
+            message.contains("localhost"),
+            "the error must name the offending host, got: {message}"
+        );
+        assert!(
+            message.contains("IP SAN"),
+            "the error must explain why pinning breaks TLS, got: {message}"
+        );
+    }
+
+    #[test]
+    fn pin_proxy_allows_a_tls_proxy_that_is_already_an_ip_literal() {
+        // Nothing is rewritten, so whatever certificate the operator
+        // provisioned for that literal keeps working.
+        let proxy = proxy_from_url("https://127.0.0.1:8443", "127.0.0.1", 8443);
+        let mut logger = test_logger();
+
+        let pinned = NetworkIptablesManager::pin_proxy_to_resolved_ip(&proxy, &mut logger)
+            .expect("an IP-literal TLS proxy needs no pinning and must be accepted");
+
+        assert_eq!(
+            pinned
+                .address
+                .expect("pinned proxy keeps an address")
+                .to_url(),
+            "https://127.0.0.1:8443"
+        );
     }
 
     #[test]

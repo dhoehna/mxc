@@ -48,6 +48,25 @@ enum VethReconcile<'a> {
     Refuse,
 }
 
+/// What to do with the container when a setup step fails partway through.
+///
+/// Split out from the action so the policy is assertable without a live
+/// container, in the same way [`VethReconcile`] separates the veth decision
+/// from acting on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupUndo {
+    /// This invocation created the container, or the caller asked for it to be
+    /// destroyed on exit.
+    Destroy,
+    /// The container already existed and this invocation started it. Stopping
+    /// restores what we found without discarding a container the caller asked
+    /// to preserve.
+    Stop,
+    /// The container was already running before this invocation touched it, so
+    /// it is not ours to shut down.
+    Leave,
+}
+
 impl LxcScriptRunner {
     pub fn new(config: &LxcConfig, container_id: &str, lifecycle: &LifecycleConfig) -> Self {
         Self {
@@ -136,6 +155,45 @@ impl LxcScriptRunner {
         }
     }
 
+    /// Decide what a failed setup owes the container. See [`SetupUndo`].
+    ///
+    /// The `container_started` arm is the one that matters: before it existed,
+    /// a reused container that this invocation started was left running with
+    /// the firewall never applied whenever `destroyOnExit` was false, because
+    /// `container_created` is false for a reused container.
+    fn setup_undo_action(
+        destroy_on_exit: bool,
+        container_created: bool,
+        container_started: bool,
+    ) -> SetupUndo {
+        if destroy_on_exit || container_created {
+            SetupUndo::Destroy
+        } else if container_started {
+            SetupUndo::Stop
+        } else {
+            SetupUndo::Leave
+        }
+    }
+
+    /// Undo whatever this invocation did to the container after a setup step
+    /// failed, without undoing what the user asked to keep.
+    fn undo_container_setup(
+        container: &LxcContainer,
+        destroy_on_exit: bool,
+        container_created: bool,
+        container_started: bool,
+    ) {
+        match Self::setup_undo_action(destroy_on_exit, container_created, container_started) {
+            SetupUndo::Destroy => {
+                let _ = container.destroy();
+            }
+            SetupUndo::Stop => {
+                let _ = container.stop();
+            }
+            SetupUndo::Leave => {}
+        }
+    }
+
     /// Core execution logic.
     fn run_internal(&self, request: &ExecutionRequest, logger: &mut Logger) -> ScriptResponse {
         // Object-based FS-policy normalization (D6): tighten aliases of the same
@@ -204,6 +262,13 @@ impl LxcScriptRunner {
         // Create container handle
         let container = LxcContainer::new(&container_name, None);
         let mut container_created = false;
+        // Tracked separately from `container_created`: a container that already
+        // existed but was stopped is started by this invocation, and if a later
+        // setup step fails we are responsible for putting it back. Without this,
+        // `destroyOnExit: false` on a reused container left it running with no
+        // firewall applied, because the destroy predicate is false in exactly
+        // that case.
+        let mut container_started = false;
 
         // Create the container if it doesn't exist
         if !container.is_defined() {
@@ -221,22 +286,59 @@ impl LxcScriptRunner {
         if let Err(e) =
             filesystem_mounts::configure_filesystem_mounts(&container, &request.policy, logger)
         {
-            if self.destroy_on_exit || container_created {
-                let _ = container.destroy();
-            }
+            Self::undo_container_setup(
+                &container,
+                self.destroy_on_exit,
+                container_created,
+                container_started,
+            );
             return ScriptResponse::error(&format!("Failed to configure filesystem: {}", e));
+        }
+
+        // Pin a hostname proxy to the address the host resolved, before the
+        // container is started. This is pure host-side DNS with no dependency
+        // on the container, and doing it first means an unresolvable or
+        // unenforceable proxy is rejected before anything is running — rather
+        // than starting a container, discovering the policy cannot be applied,
+        // and having to tear it down again.
+        //
+        // The firewall ACCEPT and the HTTP(S)_PROXY handed to the container
+        // must name the same endpoint: if the container re-resolved the
+        // hostname itself it could pick a different address under round-robin
+        // or split-horizon DNS and be dropped by its own policy. Pinning also
+        // means the container never needs a resolver, so DNS stays closed under
+        // deny-all-except-proxy.
+        let mut effective_policy = request.policy.clone();
+        match NetworkIptablesManager::pin_proxy_to_resolved_ip(
+            &effective_policy.network_proxy,
+            logger,
+        ) {
+            Ok(pinned) => effective_policy.network_proxy = pinned,
+            Err(e) => {
+                Self::undo_container_setup(
+                    &container,
+                    self.destroy_on_exit,
+                    container_created,
+                    container_started,
+                );
+                return ScriptResponse::error(&format!("Network policy error: {}", e));
+            }
         }
 
         // Ensure the container is running so that the veth interface exists
         if !container.is_running() {
             let _ = writeln!(logger, "Starting LXC container...");
             if let Err(e) = container.start() {
-                if self.destroy_on_exit || container_created {
-                    let _ = container.destroy();
-                }
+                Self::undo_container_setup(
+                    &container,
+                    self.destroy_on_exit,
+                    container_created,
+                    container_started,
+                );
                 return ScriptResponse::error(&format!("Failed to start container: {}", e));
             }
             let _ = writeln!(logger, "Container started successfully.");
+            container_started = true;
         } else {
             let _ = writeln!(logger, "Container already running.");
         }
@@ -256,27 +358,6 @@ impl LxcScriptRunner {
 
         // Configure network rules
         let mut fw_manager = NetworkIptablesManager::new(&container_name);
-
-        // Pin a hostname proxy to the address the host resolved, once, before
-        // anything consumes it. The firewall ACCEPT and the HTTP(S)_PROXY handed
-        // to the container must name the same endpoint: if the container
-        // re-resolved the hostname itself it could pick a different address
-        // under round-robin or split-horizon DNS and be dropped by its own
-        // policy. Pinning also means the container never needs a resolver, so
-        // DNS stays closed under deny-all-except-proxy.
-        let mut effective_policy = request.policy.clone();
-        match NetworkIptablesManager::pin_proxy_to_resolved_ip(
-            &effective_policy.network_proxy,
-            logger,
-        ) {
-            Ok(pinned) => effective_policy.network_proxy = pinned,
-            Err(e) => {
-                if self.destroy_on_exit || container_created {
-                    let _ = container.destroy();
-                }
-                return ScriptResponse::error(&format!("Network policy error: {}", e));
-            }
-        }
 
         // Discover the container's veth interface for scoped rules.
         //
@@ -301,9 +382,12 @@ impl LxcScriptRunner {
                 }
             }
             VethReconcile::Refuse => {
-                if self.destroy_on_exit || container_created {
-                    let _ = container.destroy();
-                }
+                Self::undo_container_setup(
+                    &container,
+                    self.destroy_on_exit,
+                    container_created,
+                    container_started,
+                );
                 return ScriptResponse::error(
                     "LXC: could not discover the container's veth interface; network policy \
                      enforcement is veth-scoped and cannot be applied. Refusing to start with \
@@ -322,15 +406,21 @@ impl LxcScriptRunner {
         match fw_manager.apply_firewall_rules(&effective_policy, logger) {
             Ok(true) => {}
             Ok(false) => {
-                if self.destroy_on_exit || container_created {
-                    let _ = container.destroy();
-                }
+                Self::undo_container_setup(
+                    &container,
+                    self.destroy_on_exit,
+                    container_created,
+                    container_started,
+                );
                 return ScriptResponse::error("Failed to apply network firewall rules.");
             }
             Err(e) => {
-                if self.destroy_on_exit || container_created {
-                    let _ = container.destroy();
-                }
+                Self::undo_container_setup(
+                    &container,
+                    self.destroy_on_exit,
+                    container_created,
+                    container_started,
+                );
                 return ScriptResponse::error(&format!("Network policy error: {}", e));
             }
         }
@@ -431,6 +521,51 @@ mod tests {
         let runner = LxcScriptRunner::new(&config, "", &lifecycle);
         let name = runner.resolve_container_name();
         assert!(name.starts_with("mxc-"));
+    }
+
+    #[test]
+    fn a_container_this_run_started_is_stopped_when_setup_fails_and_it_must_be_preserved() {
+        // The defect: `container_created` is false for a reused container, so
+        // with destroyOnExit false the old predicate did nothing and left a
+        // container this run started running with no firewall applied.
+        assert_eq!(
+            LxcScriptRunner::setup_undo_action(false, false, true),
+            SetupUndo::Stop,
+            "a preserved container that this run started must be stopped, not left running"
+        );
+    }
+
+    #[test]
+    fn a_container_this_run_created_is_destroyed_however_it_was_started() {
+        for started in [false, true] {
+            assert_eq!(
+                LxcScriptRunner::setup_undo_action(false, true, started),
+                SetupUndo::Destroy,
+                "a container this run created is ours to remove (started={started})"
+            );
+        }
+    }
+
+    #[test]
+    fn destroy_on_exit_destroys_regardless_of_who_created_or_started_it() {
+        for created in [false, true] {
+            for started in [false, true] {
+                assert_eq!(
+                    LxcScriptRunner::setup_undo_action(true, created, started),
+                    SetupUndo::Destroy,
+                    "destroyOnExit must win (created={created}, started={started})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_container_that_was_already_running_is_left_alone() {
+        assert_eq!(
+            LxcScriptRunner::setup_undo_action(false, false, false),
+            SetupUndo::Leave,
+            "a container we neither created nor started is not ours to shut down"
+        );
     }
 
     #[test]
