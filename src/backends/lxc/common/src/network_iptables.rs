@@ -771,6 +771,21 @@ impl NetworkIptablesManager {
             return Ok(true);
         }
 
+        // Both arms below replace `self.created` with this attempt's set, so a
+        // second apply on a manager that still owns resources would drop the
+        // earlier record and strand whatever it named. Every caller builds a
+        // manager immediately before its single apply, so refusing here costs
+        // nothing and makes the hazard unreachable rather than leaving it to
+        // callers to avoid.
+        if self.rules_applied {
+            return Err(format!(
+                "Firewall rules are already applied for chain {}; remove them before applying \
+                 again. Re-applying would replace the record of what this process created and \
+                 strand whatever the earlier attempt left behind.",
+                self.chain_name
+            ));
+        }
+
         match self.apply_firewall_rules_inner(policy, logger) {
             Ok(created) => {
                 self.created = created;
@@ -1238,6 +1253,56 @@ mod tests {
             second.get_buffer().contains("MXC-stubborn"),
             "a removal that failed must leave the chain owned so Drop retries it, got: {:?}",
             second.get_buffer()
+        );
+    }
+
+    #[test]
+    fn a_second_apply_is_refused_while_the_first_still_owns_resources() {
+        // Both arms of apply_firewall_rules replace self.created with the new
+        // attempt's set, so a second apply on a manager that still owns
+        // something would drop the earlier record and strand whatever it named.
+        // Refusing makes that unreachable instead of relying on callers to
+        // build a fresh manager each time.
+        let mut manager = NetworkIptablesManager::new("already-owned");
+        manager.retain_residual_ownership(CreatedResources::for_test(true, false, false, false));
+
+        let policy = policy_with_enforcement_mode(NetworkEnforcementMode::Firewall);
+        let mut logger = Logger::new(Mode::Buffer);
+        let result = manager.apply_firewall_rules(&policy, &mut logger);
+
+        assert!(
+            result.is_err(),
+            "applying over live ownership must be refused, got {:?}",
+            result
+        );
+        assert!(
+            result.unwrap_err().contains("already applied"),
+            "the refusal must say why"
+        );
+    }
+
+    #[test]
+    fn a_manager_that_owns_nothing_still_reaches_the_apply_path() {
+        // Negative control for the guard above: it must key on live ownership,
+        // not refuse every apply.  On this host the commands themselves fail,
+        // so the observable is that the attempt was made at all rather than
+        // short-circuited by the guard.
+        let mut manager = NetworkIptablesManager::new("fresh");
+        let policy = policy_with_enforcement_mode(NetworkEnforcementMode::Firewall);
+        let mut logger = Logger::new(Mode::Buffer);
+        let result = manager.apply_firewall_rules(&policy, &mut logger);
+
+        if let Err(e) = &result {
+            assert!(
+                !e.contains("already applied"),
+                "a fresh manager must not hit the ownership guard, got: {}",
+                e
+            );
+        }
+        assert!(
+            logger.get_buffer().contains("MXC-fresh"),
+            "the apply must actually run its commands, got: {:?}",
+            logger.get_buffer()
         );
     }
 
