@@ -409,37 +409,36 @@ impl NetworkIptablesManager {
     }
 
     /// Resolve `blockedHosts` to IPv4 addresses, failing setup when an entry
-    /// resolves to nothing and `fail_on_unresolved` is set.
+    /// resolves to nothing.
     ///
     /// An unresolved *blocked* host is not the same as an unresolved *allowed*
-    /// host. A blocked host that produces no DROP rule under a default-allow
-    /// policy silently falls through to the ACCEPT default, so the host the
-    /// operator explicitly named as blocked stays reachable while setup reports
-    /// success — a fail-open. The only fail-closed outcome is to refuse setup.
-    /// The caller passes `fail_on_unresolved` only under default-allow; under
-    /// default-block the closing DROP already covers the host, so a resolution
-    /// failure is logged and skipped rather than fatal.
-    fn resolve_blocked_hosts(
-        hosts: &[String],
-        fail_on_unresolved: bool,
-        logger: &mut Logger,
-    ) -> Result<Vec<String>, String> {
+    /// host. A blocked host that produces no DROP rule stays reachable while
+    /// setup reports success — a fail-open — so the only fail-closed outcome is
+    /// to refuse setup. An unresolved *allowed* host only ever removes
+    /// reachability, so it stays best-effort.
+    ///
+    /// This is fatal under both default policies. Default-allow is the obvious
+    /// case: the chain falls through to ACCEPT. Default-block is not safe
+    /// either, and the reason is easy to miss — outside proxy mode the chain
+    /// carries an unscoped port-53 ACCEPT (see [`Self::build_chain_rules`])
+    /// emitted *after* the blocked-host DROPs. Without its own DROP, a blocked
+    /// host is still reachable on port 53, which is exactly the DNS-tunnel
+    /// exfil path the deny posture exists to close. The closing DROP covers
+    /// every other port, not that one.
+    fn resolve_blocked_hosts(hosts: &[String], logger: &mut Logger) -> Result<Vec<String>, String> {
         let mut resolved = Vec::new();
 
         for host in hosts {
             let ips = Self::resolve_host(host);
             if ips.is_empty() {
-                if fail_on_unresolved {
-                    return Err(format!(
-                        "blockedHosts entry '{}' resolved to no address, so it would get no \
-                         DROP rule and fall through to the default-allow policy — leaving a \
-                         host the policy names as blocked reachable. Refusing to start with \
-                         a network policy that cannot enforce one of its own blocks.",
-                        host
-                    ));
-                }
-                logger.log_line(&format!("Warning: could not resolve host '{}'", host));
-                continue;
+                return Err(format!(
+                    "blockedHosts entry '{}' resolved to no address, so it would get no DROP \
+                     rule. The host the policy names as blocked would stay reachable — through \
+                     the default-allow policy, or, under default-block, through the port-53 \
+                     accept that follows the block rules. Refusing to start with a network \
+                     policy that cannot enforce one of its own blocks.",
+                    host
+                ));
             }
             for ip in ips {
                 logger.log_line(&format!("Blocking host: {} ({})", host, ip));
@@ -775,16 +774,13 @@ impl NetworkIptablesManager {
             );
             (Vec::new(), Vec::new())
         } else {
-            // A blockedHosts entry that resolves to nothing is only a
-            // fail-open under a default-allow policy: there the chain falls
-            // through to ACCEPT, so a host with no DROP rule stays reachable
-            // even though the operator named it as blocked. Refuse setup in
-            // that case. Under default-block the same host is already
-            // unreachable by the closing DROP, so a resolution failure is not a
-            // security gap and stays a logged skip.
-            let block_default = matches!(policy.default_network_policy, NetworkPolicy::Allow);
+            // A blockedHosts entry that resolves to nothing produces no DROP
+            // rule, so the host the operator named stays reachable and setup
+            // would report success. That is a fail-open under either default
+            // policy — see `resolve_blocked_hosts` for why default-block is not
+            // the safe case it looks like — so refuse setup rather than warn.
             (
-                Self::resolve_blocked_hosts(&policy.blocked_hosts, block_default, logger)?,
+                Self::resolve_blocked_hosts(&policy.blocked_hosts, logger)?,
                 Self::resolve_policy_hosts(&policy.allowed_hosts, "Allowing", logger),
             )
         };
@@ -1549,17 +1545,18 @@ mod tests {
     }
 
     #[test]
-    fn an_unresolvable_blocked_host_fails_setup_under_default_allow() {
-        // Under default-allow, a blocked host that resolves to nothing gets no
-        // DROP rule and falls through to ACCEPT, so the host the policy names
-        // as blocked stays reachable. That is a fail-open, so setup must fail
-        // rather than silently skip the entry.
+    fn an_unresolvable_blocked_host_fails_setup_under_either_default_policy() {
+        // A blocked host that resolves to nothing gets no DROP rule, so the
+        // host the policy names as blocked stays reachable while setup reports
+        // success. Default-allow is the obvious case. Default-block is fatal
+        // too, because the unscoped port-53 accept is emitted after the block
+        // rules — see the chain-order test below.
         let hosts = vec!["blocked.invalid".to_string()];
         let mut logger = test_logger();
-        let result = NetworkIptablesManager::resolve_blocked_hosts(&hosts, true, &mut logger);
+        let result = NetworkIptablesManager::resolve_blocked_hosts(&hosts, &mut logger);
         assert!(
             result.is_err(),
-            "an unresolvable blocked host under default-allow must fail setup, got {:?}",
+            "an unresolvable blocked host must fail setup, got {:?}",
             result
         );
         assert!(
@@ -1569,34 +1566,49 @@ mod tests {
     }
 
     #[test]
-    fn an_unresolvable_blocked_host_is_skipped_under_default_block() {
-        // Under default-block the closing DROP already covers the host, so a
-        // resolution failure is not a security gap. It stays a logged skip so a
-        // legitimate config whose blocklist names a temporarily-down host is
-        // not made to fail.
-        let hosts = vec!["blocked.invalid".to_string()];
+    fn a_resolvable_blocked_host_passes_through() {
+        // Negative control: the fail-closed behavior must not regress the happy
+        // path. A blocked host that resolves still yields its DROP address.
+        let hosts = vec!["10.0.0.5".to_string()];
         let mut logger = test_logger();
-        let result = NetworkIptablesManager::resolve_blocked_hosts(&hosts, false, &mut logger);
-        assert_eq!(
-            result,
-            Ok(Vec::new()),
-            "an unresolvable blocked host under default-block must be skipped, not fatal"
-        );
-        assert!(
-            logger
-                .get_buffer()
-                .contains("could not resolve host 'blocked.invalid'"),
-            "the skipped host must still be logged"
-        );
+        let result = NetworkIptablesManager::resolve_blocked_hosts(&hosts, &mut logger);
+        assert_eq!(result, Ok(vec!["10.0.0.5".to_string()]));
     }
 
     #[test]
-    fn a_resolvable_blocked_host_passes_through_even_when_failing_is_armed() {
-        // The fail-closed behavior must not regress the happy path: a blocked
-        // host that resolves still yields its DROP address under default-allow.
-        let hosts = vec!["10.0.0.5".to_string()];
-        let mut logger = test_logger();
-        let result = NetworkIptablesManager::resolve_blocked_hosts(&hosts, true, &mut logger);
-        assert_eq!(result, Ok(vec!["10.0.0.5".to_string()]));
+    fn the_port_53_accept_follows_the_block_rules_and_names_no_destination() {
+        // This is why an unresolved blocked host is fatal even under
+        // default-block. iptables is first-match-wins, so a blocked host with
+        // no DROP rule of its own reaches the port-53 ACCEPT that sits after
+        // the block rules, and that rule carries no `-d`, so it matches every
+        // destination. The closing DROP covers every other port, not that one.
+        let rules = NetworkIptablesManager::build_chain_rules(
+            "MXC-test",
+            &["10.0.0.5".to_string()],
+            &[],
+            NetworkPolicy::Block,
+            &[],
+        );
+
+        let drop_index = rules
+            .iter()
+            .position(|r| r.contains(&"10.0.0.5".to_string()))
+            .expect("the resolvable blocked host must produce a DROP rule");
+        let dns_index = rules
+            .iter()
+            .position(|r| r.contains(&"53".to_string()))
+            .expect("the chain must carry a port-53 accept outside proxy mode");
+
+        assert!(
+            drop_index < dns_index,
+            "block rules must precede the DNS accept, got {:?}",
+            rules
+        );
+        assert!(
+            !rules[dns_index].contains(&"-d".to_string()),
+            "the port-53 accept names no destination, so it would match a blocked host that \
+             got no DROP rule: {:?}",
+            rules[dns_index]
+        );
     }
 }
