@@ -267,8 +267,8 @@ impl LxcScriptRunner {
         // setup step fails we are responsible for putting it back. Without this,
         // `destroyOnExit: false` on a reused container left it running with no
         // firewall applied, because the destroy predicate is false in exactly
-        // that case.
-        let mut container_started = false;
+        // that case. It is bound where the start happens, so the two failure
+        // paths above it pass `false` literally — nothing has been started yet.
 
         // Create the container if it doesn't exist
         if !container.is_defined() {
@@ -286,12 +286,7 @@ impl LxcScriptRunner {
         if let Err(e) =
             filesystem_mounts::configure_filesystem_mounts(&container, &request.policy, logger)
         {
-            Self::undo_container_setup(
-                &container,
-                self.destroy_on_exit,
-                container_created,
-                container_started,
-            );
+            Self::undo_container_setup(&container, self.destroy_on_exit, container_created, false);
             return ScriptResponse::error(&format!("Failed to configure filesystem: {}", e));
         }
 
@@ -319,29 +314,36 @@ impl LxcScriptRunner {
                     &container,
                     self.destroy_on_exit,
                     container_created,
-                    container_started,
+                    false,
                 );
                 return ScriptResponse::error(&format!("Network policy error: {}", e));
             }
         }
 
-        // Ensure the container is running so that the veth interface exists
-        if !container.is_running() {
+        // Ensure the container is running so that the veth interface exists.
+        //
+        // The ownership bit is the value of this expression rather than an
+        // assignment inside the branch. Dropping an assignment would compile and
+        // pass every test while silently reintroducing the leak this tracking
+        // exists to prevent; dropping an arm of an if-expression will not
+        // compile.
+        let container_started = if !container.is_running() {
             let _ = writeln!(logger, "Starting LXC container...");
             if let Err(e) = container.start() {
                 Self::undo_container_setup(
                     &container,
                     self.destroy_on_exit,
                     container_created,
-                    container_started,
+                    false,
                 );
                 return ScriptResponse::error(&format!("Failed to start container: {}", e));
             }
             let _ = writeln!(logger, "Container started successfully.");
-            container_started = true;
+            true
         } else {
             let _ = writeln!(logger, "Container already running.");
-        }
+            false
+        };
 
         // Wait for network only when the config uses network features
         // (firewall rules, allowed/blocked hosts, or proxy enforcement).
