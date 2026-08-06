@@ -122,6 +122,34 @@ fn build_attach_args(env: &[String], working_directory: &str, command: &str) -> 
     args
 }
 
+/// Extract the `N` of every `lxc.net.N.*` key in an LXC config file, sorted and
+/// deduplicated.
+///
+/// Split out of [`LxcContainer::configured_net_indices`] so the parse is
+/// testable without a container on disk. A key matches only when the segment
+/// after `lxc.net.` parses as an integer and is followed by a `.`, so
+/// `lxc.network.0.type` (the pre-2.1 spelling) and a bare `lxc.net.0` with no
+/// sub-key are both ignored — neither declares an interface liblxc will bring
+/// up under the modern schema. Comment lines are skipped, since `#` prefixes a
+/// comment in this format and a commented-out interface is not configured.
+fn parse_net_indices(config_contents: &str) -> Vec<u32> {
+    let mut indices: Vec<u32> = config_contents
+        .lines()
+        .filter_map(|line| {
+            let key = line.split_once('=')?.0.trim();
+            if key.starts_with('#') {
+                return None;
+            }
+            let rest = key.strip_prefix("lxc.net.")?;
+            let (index, _) = rest.split_once('.')?;
+            index.parse::<u32>().ok()
+        })
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
 /// Safe wrapper around an LXC container.
 pub struct LxcContainer {
     name: String,
@@ -522,6 +550,31 @@ impl LxcContainer {
         format!("{}/{}/config", self.lxc_path, self.name)
     }
 
+    /// The `N` of every `lxc.net.N.*` key configured for this container, sorted
+    /// and deduplicated.
+    ///
+    /// Provision adopts an existing container as readily as it creates one, and
+    /// an adopted container can carry more network interfaces than the single
+    /// `lxc.net.0` MXC configures for itself. A caller that filters egress needs
+    /// to know that before it claims to have filtered anything. A missing config
+    /// file reports no interfaces (`Ok(vec![])`), consistent with
+    /// [`clear_config_item`](Self::clear_config_item) treating it as
+    /// already-clear.
+    pub fn configured_net_indices(&self) -> Result<Vec<u32>, String> {
+        let config_path = self.config_file_path();
+        let contents = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(format!(
+                    "Failed to read config to enumerate network interfaces: {} (config file: {})",
+                    e, config_path
+                ))
+            }
+        };
+        Ok(parse_net_indices(&contents))
+    }
+
     /// Get the current system architecture string for LXC templates.
     fn current_arch() -> &'static str {
         #[cfg(target_arch = "x86_64")]
@@ -674,6 +727,61 @@ mod tests {
         // even when the caller passes None.
         let c = LxcContainer::new("any", None);
         assert!(!c.lxc_path().is_empty());
+    }
+
+    #[test]
+    fn a_single_interface_config_reports_one_network_index() {
+        let config = "lxc.uts.name = box\n\
+                      lxc.net.0.type = veth\n\
+                      lxc.net.0.link = lxcbr0\n\
+                      lxc.net.0.flags = up\n";
+        assert_eq!(parse_net_indices(config), vec![0]);
+    }
+
+    #[test]
+    fn every_configured_interface_is_reported_so_a_caller_can_refuse_to_half_filter() {
+        let config = "lxc.net.0.type = veth\n\
+                      lxc.net.1.type = veth\n\
+                      lxc.net.1.link = br1\n\
+                      lxc.net.4.type = macvlan\n";
+        assert_eq!(parse_net_indices(config), vec![0, 1, 4]);
+    }
+
+    #[test]
+    fn a_config_with_no_network_keys_reports_no_interfaces() {
+        let config = "lxc.uts.name = box\nlxc.rootfs.path = /var/lib/lxc/box/rootfs\n";
+        assert!(parse_net_indices(config).is_empty());
+    }
+
+    #[test]
+    fn a_commented_out_interface_is_not_counted_as_configured() {
+        // liblxc ignores the line, so counting it would make MXC refuse a
+        // container it can in fact fully filter.
+        let config = "lxc.net.0.type = veth\n# lxc.net.1.type = veth\n";
+        assert_eq!(parse_net_indices(config), vec![0]);
+    }
+
+    #[test]
+    fn the_legacy_lxc_network_spelling_is_not_mistaken_for_a_modern_interface() {
+        let config = "lxc.net.0.type = veth\nlxc.network.1.type = veth\n";
+        assert_eq!(parse_net_indices(config), vec![0]);
+    }
+
+    #[test]
+    fn repeated_keys_for_one_interface_still_count_as_one_interface() {
+        // set_config_item appends, so a restart can leave several lines for the
+        // same index. Counting lines instead of indices would refuse a
+        // single-interface container.
+        let config = "lxc.net.0.type = veth\n\
+                      lxc.net.0.veth.pair = mxcv-aaaa\n\
+                      lxc.net.0.veth.pair = mxcv-bbbb\n";
+        assert_eq!(parse_net_indices(config), vec![0]);
+    }
+
+    #[test]
+    fn a_missing_config_file_reports_no_interfaces_rather_than_an_error() {
+        let c = LxcContainer::new("definitely-not-provisioned", Some("/nonexistent-lxcpath"));
+        assert_eq!(c.configured_net_indices(), Ok(Vec::new()));
     }
 
     #[test]

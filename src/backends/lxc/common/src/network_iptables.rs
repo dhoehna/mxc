@@ -18,6 +18,15 @@ pub struct NetworkIptablesManager {
     chain_name: String,
     /// Whether rules have been applied.
     rules_applied: bool,
+    /// Whether *this* manager's `iptables -N` succeeded, i.e. whether the chain
+    /// named by `chain_name` was created by this instance.
+    ///
+    /// Separate from `rules_applied`, which only says the full ruleset landed.
+    /// The chain name is derived from the container name alone, so two
+    /// processes starting the same sandbox target the same chain, and the
+    /// loser's `-N` fails against the winner's chain. Recording who created it
+    /// keeps the loser's error path from tearing down the winner's rules.
+    chain_created: bool,
     /// The container's veth interface name on the host.
     veth_interface: Option<String>,
 }
@@ -28,6 +37,7 @@ impl NetworkIptablesManager {
         Self {
             chain_name: Self::chain_name_for(container_name),
             rules_applied: false,
+            chain_created: false,
             veth_interface: None,
         }
     }
@@ -64,13 +74,19 @@ impl NetworkIptablesManager {
     /// this today by validating container names, but the one-shot LXC path
     /// (`lxc_runner.rs:42-47`) still accepts arbitrary caller-supplied names.
     ///
-    /// The result stays within the netfilter chain-name limit (28 characters):
-    /// `"MXC-"` (4) + up to 12 sanitized characters + `"-"` (1) + 11 base36
-    /// digits. The sanitized allowance is 12 (not 15) so the wider hash fits.
+    /// The result stays within the netfilter chain-name limit, which is 28
+    /// *bytes*: `"MXC-"` (4) + up to 12 sanitized characters + `"-"` (1) + 11
+    /// base36 digits. The sanitized allowance is 12 (not 15) so the wider hash
+    /// fits. The filter is deliberately ASCII-only rather than Unicode-aware:
+    /// `char::is_alphanumeric` admits multi-byte letters, and `take(12)` counts
+    /// characters, so twelve of those would produce a name well past 28 bytes
+    /// and netfilter would reject the chain. Dropping non-ASCII costs nothing,
+    /// because the 11-digit hash is taken over the full original name and still
+    /// distinguishes every input.
     fn chain_name_for(container_name: &str) -> String {
         let sanitized: String = container_name
             .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
             .take(12)
             .collect();
 
@@ -136,6 +152,16 @@ impl NetworkIptablesManager {
     }
 
     /// Whether rules have been applied and need cleanup.
+    /// Whether this manager created the iptables chain it is named for.
+    ///
+    /// `false` after a failed `iptables -N`, which means some other process
+    /// already owns that chain. A caller cleaning up its own failure must
+    /// consult this before removing anything, or it will delete rules it does
+    /// not own and leave the owner running unfiltered.
+    pub fn chain_created(&self) -> bool {
+        self.chain_created
+    }
+
     pub fn rules_applied(&self) -> bool {
         self.rules_applied
     }
@@ -243,8 +269,13 @@ impl NetworkIptablesManager {
 
         logger.log_line(&format!("Creating iptables chain: {}", self.chain_name));
 
-        // Create custom chain
+        // Create custom chain. Record the success before anything else runs:
+        // from here on this instance owns the chain and its error path may tear
+        // it down. If `-N` itself fails the chain belongs to someone else — a
+        // concurrent start of the same sandbox, or state leaked by a crashed
+        // run — and this instance must not touch it.
         Self::run_iptables(&["-N", &self.chain_name], logger)?;
+        self.chain_created = true;
 
         // Always allow loopback and established connections
         Self::run_iptables(
@@ -439,6 +470,7 @@ impl NetworkIptablesManager {
         // Bypass the rules_applied gate; if there's nothing to remove the
         // iptables `-D`/`-F`/`-X` calls just no-op.
         mgr.rules_applied = true;
+        mgr.chain_created = true;
         let _ = mgr.remove_firewall_rules(logger);
     }
 }
@@ -485,6 +517,45 @@ mod tests {
             mgr.chain_name,
             mgr.chain_name.len()
         );
+    }
+
+    #[test]
+    fn a_multibyte_name_still_produces_a_chain_within_the_netfilter_byte_limit() {
+        // The limit netfilter enforces is 28 bytes, not 28 characters. Twelve
+        // multi-byte letters would blow through it while looking short enough
+        // to a character count, and the chain would simply be rejected.
+        for name in [
+            "\u{4f60}\u{597d}\u{4e16}\u{754c}\u{4f60}\u{597d}\u{4e16}\u{754c}\u{4f60}\u{597d}\u{4e16}\u{754c}\u{4f60}\u{597d}",
+            "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+            "\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}",
+        ] {
+            let mgr = NetworkIptablesManager::new(name);
+            assert!(
+                mgr.chain_name.len() <= 28,
+                "chain name too long in bytes: {} ({} bytes)",
+                mgr.chain_name,
+                mgr.chain_name.len()
+            );
+        }
+    }
+
+    #[test]
+    fn names_differing_only_in_dropped_characters_still_get_distinct_chains() {
+        // Dropping non-ASCII from the visible segment must not merge two
+        // containers onto one chain — teardown of one would take the other's
+        // rules with it. The hash is over the full original name, so it does
+        // the distinguishing.
+        let a = NetworkIptablesManager::new("box-\u{e9}");
+        let b = NetworkIptablesManager::new("box-\u{fc}");
+        assert_ne!(a.chain_name, b.chain_name);
+    }
+
+    #[test]
+    fn a_manager_owns_no_chain_until_it_has_created_one() {
+        // The error path keys off this to decide whether it may tear anything
+        // down. A fresh manager has created nothing, so it must claim nothing.
+        let mgr = NetworkIptablesManager::new("box");
+        assert!(!mgr.chain_created());
     }
 
     #[test]

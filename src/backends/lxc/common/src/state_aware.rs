@@ -26,6 +26,7 @@ use wxc_common::state_aware_backend::{
 use crate::filesystem_mounts;
 use crate::lxc_bindings::LxcContainer;
 use crate::network_iptables::NetworkIptablesManager;
+use crate::signal_cleanup;
 
 /// Stateless state-aware LXC runner.
 pub struct LxcStateAwareRunner;
@@ -252,6 +253,32 @@ fn apply_network_policy(
     // name that does not exist yet, so hooking the not-yet-created veth by its
     // pinned name closes that window entirely.
     if uses_firewall_mode(&policy) {
+        // Only lxc.net.0 gets a pinned veth, and apply_firewall_rules hooks
+        // exactly one interface. A container this run created has exactly that
+        // one interface, but provision also adopts containers it did not create,
+        // and an adopted one can carry lxc.net.1 and beyond. Those would keep
+        // routing while start reported that a deny policy had been applied —
+        // the policy would be a claim rather than a control. Refuse instead:
+        // failing closed on a config MXC cannot fully enforce is the only
+        // honest answer, and hooking every interface is the follow-up.
+        let net_indices = container
+            .configured_net_indices()
+            .map_err(|e| MxcError::backend_error(format!("Failed to read network config: {e}")))?;
+        if net_indices.len() > 1 {
+            return Err(MxcError::policy_validation(format!(
+                "Container {:?} has {} configured network interfaces (lxc.net.{}); \
+                 a firewall-enforced network policy can only be applied to a container \
+                 with a single interface, because traffic on the others would bypass it",
+                container.name(),
+                net_indices.len(),
+                net_indices
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", lxc.net."),
+            )));
+        }
+
         let veth = NetworkIptablesManager::deterministic_veth_name(container.name());
 
         // The name is re-derived on every start, so drop any pin from a prior
@@ -281,9 +308,33 @@ fn apply_network_policy(
             // Fail closed: tear down any partially-applied chain so an aborted
             // policy application does not leak iptables state, and let the error
             // propagate so the caller does not start the container unfiltered.
-            cleanup_network(container.name(), None, logger);
+            //
+            // Only when this run created the chain, though. The chain name is
+            // derived from the container name, so a concurrent start of the same
+            // sandbox aims at the same chain and the loser's `iptables -N` fails
+            // against the winner's. Cleaning up unconditionally would have the
+            // loser delete the winner's chain and hooks, and the winner would
+            // then start its container with nothing filtering it — turning a
+            // recoverable collision into a fail-open.
+            if fw_manager.chain_created() {
+                cleanup_network(container.name(), None, logger);
+                return Err(MxcError::policy_validation(format!(
+                    "Network policy error: {e}"
+                )));
+            }
+            // Nothing was created, so nothing is removed. Say so explicitly:
+            // the chain existing without this run creating it means either a
+            // concurrent start holds it or a previous run left it behind, and
+            // the two are indistinguishable from iptables alone until ownership
+            // is persisted (AB#62953349). Both are cleared the same way, so name
+            // the remedy rather than leaving the caller to guess.
             Err(MxcError::policy_validation(format!(
-                "Network policy error: {e}"
+                "Network policy error: could not create the firewall chain for container {:?}, \
+                 so no rules were applied and none were removed. Its chain already exists, \
+                 which means another start of this sandbox is in progress or an earlier run \
+                 left it behind; stop or deprovision the sandbox to clear it, then start again. \
+                 Underlying error: {e}",
+                container.name()
             )))
         }
     }
@@ -368,17 +419,37 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             // container with a deny policy had unrestricted network. A
             // firewall-install failure aborts the start (fail closed) rather
             // than proceeding unfiltered.
-            apply_network_policy(&container, request, &mut logger)?;
+            //
+            // Register a signal rollback across that same window first. The
+            // chain is host state that outlives this process, so a SIGTERM
+            // between installing it and finishing the start would strand it with
+            // nobody to remove it. `set_active_network_only` is deliberately not
+            // the one-shot `set_active`: this container is provisioned and must
+            // survive, so only the firewall is rolled back.
+            signal_cleanup::set_active_network_only(container_name);
+            if let Err(e) = apply_network_policy(&container, request, &mut logger) {
+                // Clear before returning. apply_network_policy already removed
+                // whatever it created, and when it failed because another start
+                // owns the chain it deliberately removed nothing — a signal
+                // arriving now would otherwise delete that owner's chain and
+                // leave its container running unfiltered.
+                signal_cleanup::clear_active();
+                return Err(e);
+            }
             if let Err(e) = container.start() {
                 // The firewall is already installed; tear it down so an aborted
                 // start does not leak iptables state. The veth never came up, so
                 // no interface-scoped discovery is needed — force_cleanup removes
                 // the chain and its FORWARD hooks by chain name.
                 cleanup_network(container_name, None, &mut logger);
+                signal_cleanup::clear_active();
                 return Err(MxcError::backend_error(format!(
                     "Failed to start container: {e}"
                 )));
             }
+            // Past this point the chain and the container are both meant to
+            // persist, so a signal must not roll either back.
+            signal_cleanup::clear_active();
         }
         Ok(StartResult { metadata: None })
     }

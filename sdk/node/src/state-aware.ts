@@ -27,6 +27,7 @@ import {
   nonExecCall,
   spawnAndCollect,
   tryParseErrorEnvelope,
+  tryParseErrorEnvelopeFromLines,
 } from './state-aware-helper.js';
 
 /**
@@ -79,9 +80,10 @@ export async function startSandbox<C extends StateAwareContainmentBackend>(
 /**
  * Streams a script execution inside a started sandbox. Returns an
  * `IPty` for live stdout/stderr/exit handling, mirroring `spawnSandbox`.
- * On dispatch failure the executor emits a single error envelope on stdout;
- * the SDK does not parse it here — callers consuming `IPty.onData` see the
- * raw bytes. Use `execInSandboxAsync` when typed-error throwing is needed.
+ * On dispatch failure the executor emits a single error envelope on stderr,
+ * because stdout is carrying the container's raw output; the SDK does not
+ * parse it here — callers consuming `IPty.onData` see the raw bytes. Use
+ * `execInSandboxAsync` when typed-error throwing is needed.
  */
 export function execInSandbox<C extends StateAwareContainmentBackend>(
   sandboxId: SandboxId<C>,
@@ -121,8 +123,9 @@ export function execInSandbox<C extends StateAwareContainmentBackend>(
 /**
  * Buffered exec convenience. Resolves with `{stdout, stderr, exitCode}`
  * on script completion. Throws an `MxcError` (with the wire-format `code`
- * field set) when the executor reports a dispatch failure (recognised by
- * exit != 0 and stdout being a complete `{error}` envelope).
+ * field set) when the executor reports a dispatch failure, recognised by
+ * exit != 0 together with a complete `{error}` envelope on either stdout
+ * (non-streaming) or stderr (streaming, where stdout holds script output).
  */
 export async function execInSandboxAsync<C extends StateAwareContainmentBackend>(
   sandboxId: SandboxId<C>,
@@ -140,7 +143,14 @@ export async function execInSandboxAsync<C extends StateAwareContainmentBackend>
   const { stdout, stderr, exitCode } = await spawnAndCollect(envelope, options);
 
   if (exitCode !== 0) {
-    const errorEnvelope = tryParseErrorEnvelope(stdout);
+    // A dispatch failure can land on either channel. A non-streaming exec (dry
+    // run) keeps stdout as its single client-facing channel; a streaming one has
+    // already written the container's raw output there, so its envelope goes to
+    // stderr instead. Check stdout first — it is the exact-match case — and fall
+    // back to scanning stderr's lines, where the envelope trails the flushed
+    // diagnostic buffer.
+    const errorEnvelope =
+      tryParseErrorEnvelope(stdout) ?? tryParseErrorEnvelopeFromLines(stderr);
     if (errorEnvelope) {
       const e = errorEnvelope.error;
       throw mxcErrorFromCode(e.code, e.message, e.details);

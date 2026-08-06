@@ -358,10 +358,22 @@ pub fn run_with_pty(mut command: Command, options: PtyOptions) -> Result<PtyOutc
     // Drain remaining output before returning.
     match outcome {
         PtyOutcome::Exited(_) => {
-            // The child exited, so its secondary fds close, primary_reader hits
-            // EOF, and the drain thread finishes on its own. Join unbounded so
-            // every last byte of output is flushed.
-            let _ = output_thread.join();
+            // Normally the child's exit closes its secondary fds, primary_reader
+            // hits EOF, and the drain thread finishes on its own — so join
+            // unbounded and every last byte is flushed.
+            //
+            // But the direct child exiting does not guarantee EOF. A process it
+            // left running that escaped into its own session still holds the pty
+            // secondary open, and then this join blocks forever. That defeats a
+            // requested timeout exactly as the killed-child case does, just via
+            // a different outcome. So whenever a deadline was asked for, bound
+            // the drain; only an explicitly untimed run waits indefinitely.
+            const DRAIN_GRACE: Duration = Duration::from_secs(2);
+            if deadline.is_some() {
+                let _ = join_with_timeout(output_thread, DRAIN_GRACE);
+            } else {
+                let _ = output_thread.join();
+            }
         }
         PtyOutcome::TimedOut => {
             // We killed the child's process group, but a process it left

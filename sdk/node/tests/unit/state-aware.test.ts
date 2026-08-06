@@ -386,6 +386,63 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
     );
   });
 
+  it('throws the typed MxcError when a streaming exec reports its dispatch failure on stderr', async () => {
+    // A streaming exec has already written the container's raw output to
+    // stdout, so the executor puts its error envelope on stderr instead
+    // (src/core/lxc/src/main.rs). Parsing stdout alone turned every such
+    // dispatch failure into an ordinary exit-1 ExecResult, so callers saw a
+    // script that "ran and failed" rather than a sandbox that was never
+    // started.
+    const fake = fakeSpawn({
+      stdout: '',
+      stderr: '{"error":{"code":"not_started","message":"sandbox is not started"}}\n',
+      exitCode: 1,
+    });
+    _setSpawnImpl(fake.spawn);
+    const id = 'wsb:prov-1' as SandboxId<'windows_sandbox'>;
+    await assert.rejects(
+      () => execInSandboxAsync(id, { process: { commandLine: 'echo' } }, testOptions()),
+      (err: unknown) => err instanceof MxcError && err.code === 'not_started',
+    );
+  });
+
+  it('finds the error envelope on stderr even behind the flushed diagnostic buffer', async () => {
+    // The executor flushes its buffered log to stderr before the envelope, so
+    // stderr is several lines and whole-string JSON parsing never matches.
+    const fake = fakeSpawn({
+      stdout: '',
+      stderr:
+        'lxc: preparing container\nlxc: policy validated\n' +
+        '{"error":{"code":"not_started","message":"sandbox is not started"}}\n',
+      exitCode: 1,
+    });
+    _setSpawnImpl(fake.spawn);
+    const id = 'wsb:prov-1' as SandboxId<'windows_sandbox'>;
+    await assert.rejects(
+      () => execInSandboxAsync(id, { process: { commandLine: 'echo' } }, testOptions()),
+      (err: unknown) => err instanceof MxcError && err.code === 'not_started',
+    );
+  });
+
+  it('does not mistake a script that merely logged JSON to stderr for a dispatch failure', async () => {
+    // A script is free to write JSON to stderr. Only a well-formed error
+    // envelope may be promoted to a thrown MxcError; anything else is the
+    // script's own output and must come back as an ExecResult.
+    const fake = fakeSpawn({
+      stdout: 'partial output\n',
+      stderr: '{"level":"warn","message":"something happened"}\n',
+      exitCode: 3,
+    });
+    _setSpawnImpl(fake.spawn);
+    const id = 'iso:abc' as SandboxId<'isolation_session'>;
+    const result = await execInSandboxAsync(
+      id,
+      { process: { commandLine: 'noisy' } },
+      testOptions(),
+    );
+    assert.strictEqual(result.exitCode, 3);
+  });
+
   it('closes the child stdin so a stdin-reading command sees EOF instead of hanging', async () => {
     // Regression for the buffered-exec hang: the Rust state-aware path waits
     // for stdin EOF before closing guest stdin, so spawnAndCollect must end()

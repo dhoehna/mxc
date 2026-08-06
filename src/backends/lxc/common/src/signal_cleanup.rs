@@ -29,6 +29,25 @@ use crate::network_iptables::NetworkIptablesManager;
 #[cfg(target_os = "linux")]
 use wxc_common::logger::{Logger, Mode};
 
+/// How much of the active sandbox a fatal signal should roll back.
+///
+/// The one-shot runner and the state-aware lifecycle both install a firewall
+/// chain, but they own the container very differently, and rolling back the
+/// wrong amount is damaging in both directions. Destroying a provisioned
+/// state-aware container would discard a resource its owner expects to survive
+/// the process; leaving a one-shot container behind would leak it forever.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum SignalRollback {
+    /// One-shot: this process created the container to run a single script, so
+    /// a signal takes the firewall and the container with it.
+    #[default]
+    DestroyContainer,
+    /// State-aware: the container is provisioned and deliberately outlives this
+    /// process, so a signal removes only the firewall this process installed.
+    /// The container is left for a later `stop` or `deprovision` to reclaim.
+    NetworkOnly,
+}
+
 /// What the watchdog needs to roll back on a fatal signal: the container
 /// name (so we can `lxc-destroy` it) plus, when known, the host-side veth
 /// interface (so we can also remove the iptables FORWARD hook the runner
@@ -37,6 +56,9 @@ use wxc_common::logger::{Logger, Mode};
 struct ActiveSandbox {
     name: Option<String>,
     veth: Option<String>,
+    /// Read only by the Linux watchdog, but written on every target.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    rollback: SignalRollback,
 }
 
 static ACTIVE_CONTAINER: OnceLock<Mutex<ActiveSandbox>> = OnceLock::new();
@@ -58,6 +80,37 @@ pub fn set_active(name: &str) {
     let mut slot = lock_slot();
     slot.name = Some(name.to_owned());
     slot.veth = None;
+    slot.rollback = SignalRollback::DestroyContainer;
+}
+
+/// Records `name` as the currently active container for the *state-aware*
+/// lifecycle, where a fatal signal must remove the firewall this process
+/// installed but must not destroy the container.
+///
+/// The state-aware `start` phase installs the chain before the container runs,
+/// so a signal in that window would otherwise leave the chain behind with no
+/// one to remove it — the watchdog only acts on a registered name, and until
+/// now only the one-shot runner ever registered one. Registering with
+/// [`set_active`] instead would be worse than leaking: it would destroy a
+/// container that was provisioned to outlive this process.
+///
+/// Call [`clear_active`] once the start has succeeded. Leaving the
+/// registration in place past that point would let a later signal strip the
+/// firewall off a container that is up and running.
+pub fn set_active_network_only(name: &str) {
+    let mut slot = lock_slot();
+    slot.name = Some(name.to_owned());
+    slot.veth = None;
+    slot.rollback = SignalRollback::NetworkOnly;
+}
+
+/// Unregisters the active sandbox, so a later signal rolls nothing back.
+///
+/// Used at the end of a successful state-aware start: the chain and the
+/// container are both meant to persist from there on, and rolling either back
+/// would be the bug rather than the fix.
+pub fn clear_active() {
+    *lock_slot() = ActiveSandbox::default();
 }
 
 /// Records the host-side veth interface for the active container so the
@@ -136,8 +189,60 @@ fn run_watchdog(mask: SigSet) -> ! {
             // might still be writing to the host's stdio.
             let mut buf_logger = Logger::new(Mode::Buffer);
             NetworkIptablesManager::force_cleanup(&name, active.veth.as_deref(), &mut buf_logger);
-            let _ = LxcContainer::new(&name, None).destroy();
+            if active.rollback == SignalRollback::DestroyContainer {
+                let _ = LxcContainer::new(&name, None).destroy();
+            }
         }
         std::process::exit(128 + sig as i32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registration slot is process-global, so these assertions cannot be
+    /// split across test functions without racing each other.
+    #[test]
+    fn registration_records_who_owns_the_container_not_just_its_name() {
+        // One-shot: this process made the container, so a signal takes it.
+        set_active("box");
+        {
+            let slot = lock_slot();
+            assert_eq!(slot.name.as_deref(), Some("box"));
+            assert_eq!(slot.rollback, SignalRollback::DestroyContainer);
+        }
+
+        // State-aware: the container is provisioned and must survive a signal,
+        // so only the firewall this process installed is rolled back.
+        set_active_network_only("provisioned-box");
+        {
+            let slot = lock_slot();
+            assert_eq!(slot.name.as_deref(), Some("provisioned-box"));
+            assert_eq!(slot.rollback, SignalRollback::NetworkOnly);
+        }
+
+        // A veth discovered later attaches to whichever registration is live.
+        set_active_veth("mxcv-abc");
+        assert_eq!(lock_slot().veth.as_deref(), Some("mxcv-abc"));
+
+        // Clearing leaves nothing to roll back. Without this, a signal after a
+        // successful start would strip the firewall off a running container.
+        clear_active();
+        {
+            let slot = lock_slot();
+            assert!(slot.name.is_none());
+            assert!(slot.veth.is_none());
+        }
+
+        // A no-op veth registration must not resurrect a cleared slot.
+        set_active_veth("mxcv-def");
+        assert!(lock_slot().veth.is_none());
+
+        // Re-registering resets the veth, since the new container has not had
+        // one discovered yet.
+        set_active_network_only("another-box");
+        assert!(lock_slot().veth.is_none());
+        clear_active();
     }
 }

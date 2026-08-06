@@ -153,6 +153,32 @@ export function tryParseErrorEnvelope(stdout: string): WireErrorEnvelope | null 
   return null;
 }
 
+/**
+ * Attempts to find an `{error}` envelope among the lines of `stderr`.
+ *
+ * A streaming exec cannot put its error envelope on stdout, because stdout is
+ * carrying the container's raw output by then, so the executor writes it to
+ * stderr instead. Whole-string parsing is no use there: stderr also carries the
+ * flushed diagnostic buffer, so the envelope is one line among several rather
+ * than the entire stream. Scanning from the end finds it first, since the
+ * executor emits the buffer before the envelope and then exits.
+ *
+ * Only a well-formed envelope is accepted, so an ordinary diagnostic line that
+ * happens to be JSON is ignored.
+ */
+export function tryParseErrorEnvelopeFromLines(stderr: string): WireErrorEnvelope | null {
+  const lines = stderr.split('\n');
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const trimmed = lines[i].trim();
+    if (!trimmed.startsWith('{')) continue;
+    const envelope = tryParseErrorEnvelope(trimmed);
+    if (envelope) {
+      return envelope;
+    }
+  }
+  return null;
+}
+
 // --- Spawn injection (test-only) ---
 
 export type SpawnImpl = (cmd: string, args: string[], opts: unknown) => unknown;
