@@ -692,7 +692,12 @@ impl NetworkIptablesManager {
                     "Firewall setup failed: {}. Cleaning up partial iptables state.",
                     e
                 ));
-                self.teardown_created(created, logger);
+                // A removal command can itself fail, and whatever survived is
+                // still ours. `rules_applied` gates both
+                // `remove_firewall_rules` and `Drop`, so leaving it false after
+                // a rollback that only partly succeeded strands the survivors.
+                let residual = self.teardown_created(created, logger);
+                self.rules_applied = !residual.is_empty();
                 Err(e)
             }
         }
@@ -928,64 +933,99 @@ impl NetworkIptablesManager {
     /// Best-effort removal of every hook and chain this manager could have
     /// created, in both tables. Used by the post-apply teardown paths, where
     /// the manager owns all of it and iptables is the source of truth.
-    fn teardown_chains(&self, logger: &mut Logger) {
-        self.teardown_created(CreatedFirewallState::all(), logger);
+    ///
+    /// Returns the residual so the caller can decide whether ownership must be
+    /// retained for a later retry.
+    fn teardown_chains(&self, logger: &mut Logger) -> CreatedFirewallState {
+        self.teardown_created(CreatedFirewallState::all(), logger)
     }
 
-    /// Remove exactly the objects flagged in `created`.
+    /// Remove exactly the objects flagged in `created`, and republish what
+    /// survived.
     ///
     /// A missing rule/chain only makes the individual `-D`/`-F`/`-X` a no-op,
     /// so this is safe to call on a partially-built state — but the flags still
     /// matter: they keep a rollback from flushing a same-named chain that
     /// belongs to a different container (see [`Self::apply_firewall_rules`]).
-    fn teardown_created(&self, created: CreatedFirewallState, logger: &mut Logger) {
+    ///
+    /// Publishing the residual is what keeps the signal-cleanup registry from
+    /// going stale.  Leaving the pre-teardown record published would let a
+    /// signal arriving after a rollback run `force_cleanup` against objects
+    /// that no longer exist — and because chain names truncate to 20 characters
+    /// and can collide, the name may by then answer for a different container.
+    /// Publishing an unconditional empty record would be the mirror-image bug:
+    /// a removal command that failed would silently lose its owner.  So only
+    /// the removals that actually succeeded clear their flag.
+    fn teardown_created(
+        &self,
+        created: CreatedFirewallState,
+        logger: &mut Logger,
+    ) -> CreatedFirewallState {
+        let mut residual = created;
+
         // Remove the hooks (only if we had a veth interface and installed
         // them). Must match the `-i` direction used at insertion so the delete
         // finds the rule; a `-o` delete would silently leak the hook.
         if let Some(ref iface) = self.veth_interface {
-            if created.v4_dhcp {
-                let _ = Self::run_iptables(
+            if created.v4_dhcp
+                && Self::run_iptables(
                     &[
                         "-D", "INPUT", "-i", iface, "-p", "udp", "--dport", "67", "-j", "ACCEPT",
                     ],
                     logger,
-                );
+                )
+                .is_ok()
+            {
+                residual.v4_dhcp = false;
             }
             if created.v4_hooks {
-                for hook in ["FORWARD", "INPUT"] {
-                    let _ = Self::run_iptables(
-                        &["-D", hook, "-i", iface, "-j", &self.chain_name],
-                        logger,
-                    );
+                let removed = ["FORWARD", "INPUT"].iter().all(|hook| {
+                    Self::run_iptables(&["-D", hook, "-i", iface, "-j", &self.chain_name], logger)
+                        .is_ok()
+                });
+                if removed {
+                    residual.v4_hooks = false;
                 }
             }
-            if created.v6_dhcp {
-                let _ = Self::run_ip6tables(
+            if created.v6_dhcp
+                && Self::run_ip6tables(
                     &[
                         "-D", "INPUT", "-i", iface, "-p", "udp", "--dport", "547", "-j", "ACCEPT",
                     ],
                     logger,
-                );
+                )
+                .is_ok()
+            {
+                residual.v6_dhcp = false;
             }
             if created.v6_hooks {
-                for hook in ["FORWARD", "INPUT"] {
-                    let _ = Self::run_ip6tables(
-                        &["-D", hook, "-i", iface, "-j", &self.chain_name],
-                        logger,
-                    );
+                let removed = ["FORWARD", "INPUT"].iter().all(|hook| {
+                    Self::run_ip6tables(&["-D", hook, "-i", iface, "-j", &self.chain_name], logger)
+                        .is_ok()
+                });
+                if removed {
+                    residual.v6_hooks = false;
                 }
             }
         }
 
-        // Flush and delete the chains.
+        // Flush and delete the chains. `-X` is the command that actually
+        // relinquishes the chain, so ownership is only cleared when it succeeds.
         if created.v4_chain {
             let _ = Self::run_iptables(&["-F", &self.chain_name], logger);
-            let _ = Self::run_iptables(&["-X", &self.chain_name], logger);
+            if Self::run_iptables(&["-X", &self.chain_name], logger).is_ok() {
+                residual.v4_chain = false;
+            }
         }
         if created.v6_chain {
             let _ = Self::run_ip6tables(&["-F", &self.chain_name], logger);
-            let _ = Self::run_ip6tables(&["-X", &self.chain_name], logger);
+            if Self::run_ip6tables(&["-X", &self.chain_name], logger).is_ok() {
+                residual.v6_chain = false;
+            }
         }
+
+        Self::publish_created(&residual);
+        residual
     }
 
     /// Remove all iptables/ip6tables rules created by this manager.
@@ -999,9 +1039,11 @@ impl NetworkIptablesManager {
             self.chain_name
         ));
 
-        self.teardown_chains(logger);
-
-        self.rules_applied = false;
+        // A removal command can fail, and what survived is still ours. Clearing
+        // the gate regardless would strand it: Drop is gated on the same flag,
+        // so it would skip the retry that is the last chance to remove it.
+        let residual = self.teardown_chains(logger);
+        self.rules_applied = !residual.is_empty();
         Ok(())
     }
 
@@ -1420,6 +1462,47 @@ mod tests {
         assert!(all.v6_hooks);
         assert!(all.v4_dhcp);
         assert!(all.v6_dhcp);
+    }
+
+    #[test]
+    fn a_teardown_republishes_what_it_left_behind_rather_than_a_stale_superset() {
+        // The watchdog acts on whatever ownership record was last published.
+        // Before this, teardown published nothing, so after a rollback the
+        // registry still advertised the full pre-teardown set.  A signal
+        // arriving then would run force_cleanup against objects that no longer
+        // exist -- and since chain names truncate to 20 characters and can
+        // collide, the name may by then answer for a different container.
+        //
+        // The observable is the published record itself: it must track the
+        // teardown rather than outlive it.
+        crate::signal_cleanup::set_active("stale-record");
+        crate::signal_cleanup::set_active_created(CreatedFirewallState::all());
+
+        let mut manager = NetworkIptablesManager::new("stale-record");
+        manager.set_veth_interface("mxcv-stale");
+
+        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+        let only_v4_chain = CreatedFirewallState {
+            v4_chain: true,
+            ..CreatedFirewallState::default()
+        };
+        let residual = manager.teardown_created(only_v4_chain, &mut logger);
+
+        let published = crate::signal_cleanup::active_created_for_test();
+        assert_eq!(
+            published, residual,
+            "the registry must advertise exactly what the teardown left behind"
+        );
+        assert_ne!(
+            published,
+            CreatedFirewallState::all(),
+            "the pre-teardown superset must not survive the teardown that replaced it"
+        );
+        assert!(
+            !published.v6_chain && !published.v6_hooks && !published.v4_hooks,
+            "objects this teardown never owned must not stay published, got: {:?}",
+            published
+        );
     }
 
     #[test]

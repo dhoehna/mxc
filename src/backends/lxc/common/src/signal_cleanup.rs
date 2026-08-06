@@ -93,6 +93,17 @@ pub(crate) fn set_active_created(created: CreatedFirewallState) {
     }
 }
 
+/// The ownership record currently published for the active container.
+///
+/// Test-only. The watchdog reads this slot on a signal, and a signal cannot be
+/// delivered on this host, so this is the only way to assert that a teardown
+/// republished what it left behind instead of leaving a stale superset in
+/// place.
+#[cfg(test)]
+pub(crate) fn active_created_for_test() -> CreatedFirewallState {
+    lock_slot().created
+}
+
 /// Block SIGHUP/SIGTERM/SIGINT in the calling thread and spawn a watchdog
 /// that synchronously waits (`sigwait`) for any of them. On delivery the
 /// watchdog destroys the active container, then exits with `128 + signo`.
