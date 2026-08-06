@@ -7,6 +7,7 @@
 //! the WSL Container runner and policy mapping modules.
 
 pub mod policy_mapping;
+#[cfg(target_os = "windows")]
 pub mod wsl_container_runner;
 pub mod wslc_bindings;
 pub mod wslcsdk_sys;

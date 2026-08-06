@@ -186,10 +186,6 @@ extends:
       jobs:
       - job: validate_release_ref
         displayName: 'Require a release ref'
-        pool:
-          name: Azure-Pipelines-1ESPT-ExDShared
-          image: ubuntu-latest
-          os: linux
         steps:
         - checkout: none
         # Fail fast on an empty ESRP owner or approver email.  These flow
@@ -207,38 +203,45 @@ extends:
         # token and could never fire.  It lives in this stage because every
         # other stage depends on it, so a missing value stops the run before
         # any crate is checked out or packaged.
-        - script: |
-            set -euo pipefail
-            if [ -z "${OWNERS// /}" ]; then
-              echo "##vso[task.logissue type=error]ESRP owners email resolved empty. \$(Build.RequestedForEmail) is set from the identity that queued the run; queue this pipeline as a signed-in user, or set an explicit address in 1ES.Release.Crates.yml and cut a new release ref."
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            if ([string]::IsNullOrWhiteSpace($env:OWNERS))
+            {
+              Write-Host "##vso[task.logissue type=error]ESRP owners email resolved empty. The Build.RequestedForEmail predefined variable is set from the identity that queued the run; queue this pipeline as a signed-in user, or set an explicit address in 1ES.Release.Crates.yml and cut a new release ref."
               exit 1
-            fi
-            if [ -z "${APPROVERS// /}" ]; then
-              echo "##vso[task.logissue type=error]ESRP approvers email resolved empty. \$(Build.RequestedForEmail) is set from the identity that queued the run; queue this pipeline as a signed-in user, or set an explicit address in 1ES.Release.Crates.yml and cut a new release ref."
+            }
+            if ([string]::IsNullOrWhiteSpace($env:APPROVERS))
+            {
+              Write-Host "##vso[task.logissue type=error]ESRP approvers email resolved empty. The Build.RequestedForEmail predefined variable is set from the identity that queued the run; queue this pipeline as a signed-in user, or set an explicit address in 1ES.Release.Crates.yml and cut a new release ref."
               exit 1
-            fi
-            echo "ESRP owner and approver resolved to: $OWNERS / $APPROVERS"
+            }
+            Write-Host "ESRP owner and approver resolved to: $env:OWNERS / $env:APPROVERS"
           displayName: 'Require ESRP owner and approver'
           env:
             OWNERS: $(Build.RequestedForEmail)
             APPROVERS: $(Build.RequestedForEmail)
-        - script: |
-            set -euo pipefail
-            echo "Run was queued against: $SOURCE_REF"
-            case "$SOURCE_REF" in
-              refs/heads/release/?*)
-                echo "OK: releasing from branch ${SOURCE_REF#refs/heads/}"
-                ;;
-              refs/tags/v?*)
-                echo "OK: releasing from tag ${SOURCE_REF#refs/tags/}"
-                ;;
-              *)
-                echo "##vso[task.logissue type=error]This pipeline may only run from a release branch (refs/heads/release/*) or a release tag (refs/tags/v*). It was queued against '$SOURCE_REF'."
-                echo "Cut a branch such as 'release/v0.8.0' from the commit you are releasing, confirm the release/* ruleset has frozen it, then pick it in the ref selector of the Run pipeline dialog."
-                echo "Note: selecting a COMMIT does not work -- a commit-queued run still reports its containing branch here, not the SHA."
-                exit 1
-                ;;
-            esac
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            $ref = $env:SOURCE_REF
+            Write-Host "Run was queued against: $ref"
+            # -like uses the same wildcard semantics as the shell `case` globs
+            # this replaced: ? is exactly one character, * is any run.  The ?*
+            # suffix therefore still requires a non-empty branch or tag name.
+            if ($ref -like 'refs/heads/release/?*')
+            {
+              Write-Host "OK: releasing from branch $($ref.Substring('refs/heads/'.Length))"
+            }
+            elseif ($ref -like 'refs/tags/v?*')
+            {
+              Write-Host "OK: releasing from tag $($ref.Substring('refs/tags/'.Length))"
+            }
+            else
+            {
+              Write-Host "##vso[task.logissue type=error]This pipeline may only run from a release branch (refs/heads/release/*) or a release tag (refs/tags/v*). It was queued against '$ref'."
+              Write-Host "Cut a branch such as 'release/v0.8.0' from the commit you are releasing, confirm the release/* ruleset has frozen it, then pick it in the ref selector of the Run pipeline dialog."
+              Write-Host "Note: selecting a COMMIT does not work -- a commit-queued run still reports its containing branch here, not the SHA."
+              exit 1
+            }
           displayName: 'Require refs/heads/release/* or refs/tags/v*'
           env:
             SOURCE_REF: $(Build.SourceBranch)

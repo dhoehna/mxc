@@ -1,6 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+// NanVix runs on Windows and Linux only.  On any other platform this crate
+// compiles to an empty library, so the published package graph stays valid
+// without shipping code that cannot work there.
+#![cfg(any(target_os = "windows", target_os = "linux"))]
+
 //! `NanVixScriptRunner` -- executes code inside a NanVix micro-VM.
 //!
 //! The initial runtime is CPython 3.12 with a trimmed FAT32 stdlib filesystem.

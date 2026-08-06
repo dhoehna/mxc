@@ -109,8 +109,8 @@ jobs:
     displayName: Publish crates to crates.io (ESRP)
     pool:
       name: Azure-Pipelines-1ESPT-ExDShared
-      image: ubuntu-latest
-      os: linux
+      image: windows-2022
+      os: windows
     templateContext:
       type: releaseJob
       isProduction: true
@@ -124,26 +124,48 @@ jobs:
       orderFile: $(Pipeline.Workspace)/crates/release-order.json
       script: $(Pipeline.Workspace)/crates/crates_release.py
     steps:
+      # Resolve the Python interpreter once for this job.  See the matching
+      # comment in Package.Crates.Job.yml: `python3` is frequently absent on
+      # Windows agents, so the name is resolved here and failure is loud.
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          $exe = $null
+          foreach ($candidate in @('python', 'python3'))
+          {
+            $found = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found -and (& $found.Source --version) -match 'Python 3')
+            {
+              $exe = $found.Source
+              break
+            }
+          }
+          if (-not $exe) { throw 'No Python 3 interpreter found on PATH (tried python, python3).' }
+          Write-Host "Using Python interpreter: $exe"
+          Write-Host "##vso[task.setvariable variable=pythonExe]$exe"
+        displayName: Resolve Python interpreter
+
       # Guard: the crates this run will publish must be a correctly
       # ordered subset of what was packaged, or we could publish in the
       # wrong order. A strict subset is allowed (resume); it is reported
       # as a warning naming every dependency assumed already published.
-      - script: |
-          set -euo pipefail
-          python3 "$(script)" verify-order --order-file "$(orderFile)" --expected "$EXPECTED_ORDER"
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          & "$(pythonExe)" "$(script)" verify-order --order-file "$(orderFile)" --expected "$env:EXPECTED_ORDER"
+          if ($LASTEXITCODE -ne 0) { throw "verify-order failed with exit $LASTEXITCODE" }
         displayName: Verify crate order matches package
         env:
           EXPECTED_ORDER: ${{ convertToJson(parameters.crateOrder) }}
 
       - ${{ each crate in parameters.crateOrder }}:
-          - script: |
-              set -euo pipefail
-              python3 "$(script)" stage --order-file "$(orderFile)" --crate "${{ crate }}" --out-dir "$(esrpDir)"
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              & "$(pythonExe)" "$(script)" stage --order-file "$(orderFile)" --crate "${{ crate }}" --out-dir "$(esrpDir)"
+              if ($LASTEXITCODE -ne 0) { throw "stage ${{ crate }} failed with exit $LASTEXITCODE" }
             displayName: "Stage ${{ crate }} for ESRP"
 
           - ${{ if parameters.dryRun }}:
-            - script: |
-                echo "##vso[task.logissue type=warning]DRY RUN: skipping ESRP publish for ${{ crate }} (staged .crate only)."
+            - pwsh: |
+                Write-Host "##vso[task.logissue type=warning]DRY RUN: skipping ESRP publish for ${{ crate }} (staged .crate only)."
               displayName: "DRY RUN: skip publish ${{ crate }}"
           - ${{ else }}:
             - task: EsrpRelease@12
