@@ -7,7 +7,7 @@
 //! and ip6tables rules applied to the container's virtual ethernet (veth)
 //! interface.
 
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv6Addr, ToSocketAddrs};
 use std::process::Command;
 
 use wxc_common::logger::Logger;
@@ -58,12 +58,42 @@ impl FirewallRuleArgs {
 /// installed. Without this, a partial-failure rollback would tear down chains
 /// this attempt never created, and because chain names truncate at 20 chars a
 /// torn-down chain can belong to a different container.
+///
+/// Visible to the crate (with private fields) purely so `signal_cleanup` can
+/// carry the value from the runner thread to the watchdog thread. The watchdog
+/// never inspects it; it only hands it back to [`NetworkIptablesManager::force_cleanup`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct CreatedResources {
+pub(crate) struct CreatedResources {
     v4_chain: bool,
     v6_chain: bool,
     v4_hook: bool,
     v6_hook: bool,
+}
+
+impl CreatedResources {
+    /// Whether nothing was created, in which case there is nothing to tear
+    /// down and teardown must not run a single iptables command.
+    ///
+    /// Only reachable from the signal path, which is Linux-only; kept
+    /// compiled on every target so Windows and macOS CI still type-check it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn is_empty(&self) -> bool {
+        !self.v4_chain && !self.v6_chain && !self.v4_hook && !self.v6_hook
+    }
+
+    /// Test-only constructor so `signal_cleanup`'s tests can build a
+    /// distinguishable, non-default ownership record without widening the
+    /// production API. Production code only ever obtains one of these by
+    /// creating the resources it names.
+    #[cfg(test)]
+    pub(crate) fn for_test(v4_chain: bool, v6_chain: bool, v4_hook: bool, v6_hook: bool) -> Self {
+        Self {
+            v4_chain,
+            v6_chain,
+            v4_hook,
+            v6_hook,
+        }
+    }
 }
 
 /// Three-way classification of whether `ip6tables` can be used on this host.
@@ -200,6 +230,12 @@ impl NetworkIptablesManager {
             return ResolvedDestinations::default();
         }
 
+        // Rewrite IPv4-mapped destinations to their embedded IPv4 form before
+        // the family split, so they are filed under IPv4 and programmed with
+        // `iptables`.
+        let rewritten = Self::ipv4_mapped_destination(host);
+        let host = rewritten.as_deref().unwrap_or(host);
+
         if host.contains('/') {
             return match Self::destination_family(host) {
                 Some(IpFamily::V4) => ResolvedDestinations {
@@ -248,10 +284,54 @@ impl NetworkIptablesManager {
         for ip in addrs {
             match ip {
                 IpAddr::V4(ip) => resolved.ipv4.push(ip.to_string()),
-                IpAddr::V6(ip) => resolved.ipv6.push(ip.to_string()),
+                // A resolver can return a AAAA record in mapped form. It
+                // travels as IPv4 on the wire, so it belongs in the IPv4
+                // bucket — see `ipv4_mapped_destination`.
+                IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+                    Some(v4) => resolved.ipv4.push(v4.to_string()),
+                    None => resolved.ipv6.push(ip.to_string()),
+                },
             }
         }
         resolved
+    }
+
+    /// Rewrite an IPv4-mapped IPv6 destination to its embedded IPv4 form,
+    /// returning `None` when `destination` is not mapped.
+    ///
+    /// Linux puts a genuine IPv4 packet on the wire for a mapped destination,
+    /// so an `ip6tables -d ::ffff:a.b.c.d` rule names traffic that never
+    /// reaches the IPv6 table and therefore never matches. Under a
+    /// `defaultPolicy: allow` policy a mapped `blockedHosts` entry would fail
+    /// open: the operator sees a rule programmed, and the traffic is allowed
+    /// anyway. Rewriting to `a.b.c.d` files the entry under `iptables`, where
+    /// it matches.
+    ///
+    /// Handles CIDRs inside `::ffff:0:0/96` as well. Because the mapped range
+    /// is the final 32 bits of that /96, an IPv6 prefix of `96 + n` is exactly
+    /// an IPv4 prefix of `n`. A prefix shorter than 96 covers addresses
+    /// outside the mapped range and cannot be expressed as one IPv4 CIDR, so
+    /// it is left as IPv6.
+    fn ipv4_mapped_destination(destination: &str) -> Option<String> {
+        let Some((network, prefix)) = destination.split_once('/') else {
+            return destination
+                .parse::<Ipv6Addr>()
+                .ok()?
+                .to_ipv4_mapped()
+                .map(|v4| v4.to_string());
+        };
+
+        // Match `destination_family`'s digits-only rule so this rewrite cannot
+        // launder a malformed prefix (`/+120`) into a well-formed IPv4 CIDR.
+        if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mapped = network.parse::<Ipv6Addr>().ok()?.to_ipv4_mapped()?;
+        let v4_prefix = prefix.parse::<u8>().ok()?.checked_sub(96)?;
+        if v4_prefix > 32 {
+            return None;
+        }
+        Some(format!("{}/{}", mapped, v4_prefix))
     }
 
     fn destination_family(destination: &str) -> Option<IpFamily> {
@@ -482,9 +562,14 @@ impl NetworkIptablesManager {
     ///
     /// Reads `/proc/net/if_inet6` and defers the parse/classify decision to
     /// [`Self::classify_host_ipv6_state`] so the file-content → state mapping
-    /// is unit-testable without a privileged Linux host.
+    /// is unit-testable without a privileged Linux host. Also reports whether
+    /// `/proc/net` exists, which is what separates "the kernel has IPv6 off"
+    /// from "`/proc` is not mounted here".
     fn host_ipv6_state() -> HostIpv6State {
-        Self::classify_host_ipv6_state(std::fs::read_to_string("/proc/net/if_inet6"))
+        Self::classify_host_ipv6_state(
+            std::fs::read_to_string("/proc/net/if_inet6"),
+            std::path::Path::new("/proc/net").is_dir(),
+        )
     }
 
     /// Classify host IPv6 activity from the result of reading
@@ -499,13 +584,22 @@ impl NetworkIptablesManager {
     /// when its device is something other than `lo`.
     ///
     /// The error handling is deliberate:
-    /// - A `NotFound` error means the kernel never created the file (IPv6
-    ///   disabled at boot via `ipv6.disable=1`, or the module is not loaded).
-    ///   That is a genuine, confirmed negative → `Inactive`.
-    /// - Any other read error (permission denied, I/O error, `/proc` not
-    ///   mounted) leaves the state `Unknown` rather than asserting IPv6 is
-    ///   off. Converting such an error into `Inactive` would fail open.
-    fn classify_host_ipv6_state(read_result: std::io::Result<String>) -> HostIpv6State {
+    /// - A `NotFound` error **while `/proc/net` exists** means the kernel
+    ///   never created the file (IPv6 disabled at boot via `ipv6.disable=1`,
+    ///   or the module is not loaded). That is a genuine, confirmed negative
+    ///   → `Inactive`.
+    /// - A `NotFound` error when `/proc/net` is *also* absent says nothing
+    ///   about IPv6: `/proc` is not mounted, so the probe never ran. Both
+    ///   cases surface as the same `ErrorKind`, so without the directory
+    ///   check an unmounted `/proc` would be read as a confirmed "IPv6 is
+    ///   off" → `Unknown`.
+    /// - Any other read error (permission denied, I/O error) likewise leaves
+    ///   the state `Unknown` rather than asserting IPv6 is off. Converting
+    ///   such an error into `Inactive` would fail open.
+    fn classify_host_ipv6_state(
+        read_result: std::io::Result<String>,
+        proc_net_present: bool,
+    ) -> HostIpv6State {
         match read_result {
             Ok(contents) => {
                 let has_egress_capable_interface = contents.lines().any(|line| {
@@ -526,7 +620,18 @@ impl NetworkIptablesManager {
                     HostIpv6State::Inactive
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HostIpv6State::Inactive,
+            // A missing `/proc/net/if_inet6` is only evidence that IPv6 is off
+            // when `/proc/net` itself is there. Both an IPv6-disabled kernel
+            // and an unmounted `/proc` report `NotFound` for the file, and
+            // treating the second as "IPv6 is off" would fail open on a host
+            // whose IPv6 state was never actually read.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if proc_net_present {
+                    HostIpv6State::Inactive
+                } else {
+                    HostIpv6State::Unknown
+                }
+            }
             Err(_) => HostIpv6State::Unknown,
         }
     }
@@ -698,7 +803,7 @@ impl NetworkIptablesManager {
         match self.install_firewall_rules(policy, logger, &mut created) {
             Ok(()) => Ok(created),
             Err(e) => {
-                Self::teardown_created(
+                let _ = Self::teardown_created(
                     &self.chain_name,
                     self.veth_interface.as_deref(),
                     &created,
@@ -743,9 +848,11 @@ impl NetworkIptablesManager {
         // removes only the chains this attempt installed.
         Self::run_iptables(&["-N", &self.chain_name], logger)?;
         created.v4_chain = true;
+        Self::publish_created(created);
         if ipv6_enabled {
             Self::run_ip6tables(&["-N", &self.chain_name], logger)?;
             created.v6_chain = true;
+            Self::publish_created(created);
         }
 
         let base_rules = Self::build_base_chain_rule_args(&self.chain_name);
@@ -793,6 +900,7 @@ impl NetworkIptablesManager {
                 logger,
             )?;
             created.v4_hook = true;
+            Self::publish_created(created);
             logger.log_line(&format!(
                 "FORWARD hook installed on {} for chain {} (iptables).",
                 iface, self.chain_name
@@ -803,6 +911,7 @@ impl NetworkIptablesManager {
                     logger,
                 )?;
                 created.v6_hook = true;
+                Self::publish_created(created);
                 logger.log_line(&format!(
                     "FORWARD hook installed on {} for chain {} (ip6tables).",
                     iface, self.chain_name
@@ -820,6 +929,17 @@ impl NetworkIptablesManager {
         Ok(())
     }
 
+    /// Publish the set of resources created so far to the signal-cleanup
+    /// registry, so a fatal signal tears down exactly what exists.
+    ///
+    /// Called after **each** individual resource is installed rather than once
+    /// at the end of a successful apply. Publishing only on success would mean
+    /// a signal arriving mid-apply sees an empty set, removes nothing, and
+    /// leaks the partially created chain.
+    fn publish_created(created: &CreatedResources) {
+        crate::signal_cleanup::set_active_created(*created);
+    }
+
     /// Best-effort removal of the FORWARD hooks and per-container chains that
     /// `created` records were installed, in both tables. Only resources marked
     /// as created are touched, so a partial-failure rollback never tears down
@@ -827,35 +947,56 @@ impl NetworkIptablesManager {
     /// truncate at 20 characters and can collide across containers. A missing
     /// rule/chain still makes an individual `-D`/`-F`/`-X` call a no-op, so it
     /// doubles as the rollback path for a failed apply.
+    ///
+    /// Returns the **residual** set: the resources whose removal command
+    /// failed and which therefore may still exist. Clearing ownership for a
+    /// deletion that failed would strand the resource, because nothing would
+    /// then know it was ours to remove. The residual is published before
+    /// returning, so signal-time cleanup retries exactly the leftovers.
     fn teardown_created(
         chain_name: &str,
         veth_interface: Option<&str>,
         created: &CreatedResources,
         logger: &mut Logger,
-    ) {
+    ) -> CreatedResources {
+        let mut residual = *created;
+
         // Remove from FORWARD only for families this attempt hooked. Must
         // match the `-i` direction used at insertion so the delete finds the
         // rule; a `-o` delete would leak the FORWARD hook.
         if let Some(iface) = veth_interface {
-            if created.v4_hook {
-                let _ =
-                    Self::run_iptables(&["-D", "FORWARD", "-i", iface, "-j", chain_name], logger);
+            if created.v4_hook
+                && Self::run_iptables(&["-D", "FORWARD", "-i", iface, "-j", chain_name], logger)
+                    .is_ok()
+            {
+                residual.v4_hook = false;
             }
-            if created.v6_hook {
-                let _ =
-                    Self::run_ip6tables(&["-D", "FORWARD", "-i", iface, "-j", chain_name], logger);
+            if created.v6_hook
+                && Self::run_ip6tables(&["-D", "FORWARD", "-i", iface, "-j", chain_name], logger)
+                    .is_ok()
+            {
+                residual.v6_hook = false;
             }
         }
 
-        // Flush and delete only the chains this attempt created.
+        // Flush and delete only the chains this attempt created. `-X` is the
+        // command that actually relinquishes the chain, so ownership is only
+        // cleared when it succeeds.
         if created.v4_chain {
             let _ = Self::run_iptables(&["-F", chain_name], logger);
-            let _ = Self::run_iptables(&["-X", chain_name], logger);
+            if Self::run_iptables(&["-X", chain_name], logger).is_ok() {
+                residual.v4_chain = false;
+            }
         }
         if created.v6_chain {
             let _ = Self::run_ip6tables(&["-F", chain_name], logger);
-            let _ = Self::run_ip6tables(&["-X", chain_name], logger);
+            if Self::run_ip6tables(&["-X", chain_name], logger).is_ok() {
+                residual.v6_chain = false;
+            }
         }
+
+        Self::publish_created(&residual);
+        residual
     }
 
     /// Remove all iptables/ip6tables rules created by this manager.
@@ -869,7 +1010,7 @@ impl NetworkIptablesManager {
             self.chain_name
         ));
 
-        Self::teardown_created(
+        let residual = Self::teardown_created(
             &self.chain_name,
             self.veth_interface.as_deref(),
             &self.created,
@@ -877,33 +1018,45 @@ impl NetworkIptablesManager {
         );
 
         self.rules_applied = false;
-        self.created = CreatedResources::default();
+        self.created = residual;
         Ok(())
     }
 
-    /// Best-effort cleanup of any iptables state the runner may have
-    /// installed for a container, used when the original
-    /// `NetworkIptablesManager` instance isn't reachable (e.g. signal-time
-    /// cleanup from the watchdog thread). Builds a fresh manager pointed at
-    /// the same chain name. Because the created-resource set from the original
-    /// attempt is not reachable here, it assumes every family chain and hook
-    /// may exist and removes them all best-effort; iptables itself is the
-    /// source of truth, so a `-D`/`-F`/`-X` for a nonexistent resource no-ops.
-    pub fn force_cleanup(container_name: &str, veth_interface: Option<&str>, logger: &mut Logger) {
+    /// Best-effort cleanup of any iptables state the runner installed for a
+    /// container, used when the original `NetworkIptablesManager` instance
+    /// isn't reachable (e.g. signal-time cleanup from the watchdog thread).
+    ///
+    /// `created` is the ownership record the runner published as it installed
+    /// each resource, carried across the thread boundary by `signal_cleanup`.
+    /// Using it — rather than assuming every chain and hook exists — is what
+    /// keeps this path from flushing a *different* container's live chain:
+    /// chain names sanitize and truncate to 20 characters, so a name collision
+    /// would otherwise let a signal delivered to container A empty container
+    /// B's chain, silently failing B open.
+    ///
+    /// The sole caller (`signal_cleanup::run_watchdog`) is Linux-only, so this
+    /// is dead code elsewhere. It stays compiled on every target rather than
+    /// being `cfg`-gated so Windows and macOS CI still type-check it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn force_cleanup(
+        container_name: &str,
+        veth_interface: Option<&str>,
+        created: CreatedResources,
+        logger: &mut Logger,
+    ) {
+        // This process created nothing, so there is nothing of ours to remove.
+        // Anything present under this chain name belongs to someone else.
+        if created.is_empty() {
+            return;
+        }
         let mut mgr = Self::new(container_name);
         if let Some(v) = veth_interface {
             mgr.set_veth_interface(v);
         }
-        // Bypass the rules_applied gate and assume all resources may exist; if
-        // there's nothing to remove the iptables `-D`/`-F`/`-X` calls just
-        // no-op.
+        // Bypass the rules_applied gate: the manager that set it is on another
+        // thread and unreachable from here.
         mgr.rules_applied = true;
-        mgr.created = CreatedResources {
-            v4_chain: true,
-            v6_chain: true,
-            v4_hook: veth_interface.is_some(),
-            v6_hook: veth_interface.is_some(),
-        };
+        mgr.created = created;
         let _ = mgr.remove_firewall_rules(logger);
     }
 }
@@ -918,29 +1071,30 @@ impl Drop for NetworkIptablesManager {
 }
 
 #[cfg(test)]
-#[path = "network_iptables_resolution_spec_tests.rs"]
-mod resolution_spec_tests;
-
-#[cfg(test)]
-#[path = "network_iptables_rulegen_spec_tests.rs"]
-mod rulegen_spec_tests;
-
-#[cfg(test)]
-#[path = "network_iptables_lifecycle_spec_tests.rs"]
-mod lifecycle_spec_tests;
-
-#[cfg(test)]
-#[path = "network_iptables_ip6status_spec_tests.rs"]
-mod ip6status_spec_tests;
-
-#[cfg(test)]
-#[path = "network_iptables_ipv6state_spec_tests.rs"]
-mod ipv6state_spec_tests;
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Error, ErrorKind};
+    use wxc_common::logger::{Logger, Mode};
+    use wxc_common::models::{ContainerPolicy, NetworkEnforcementMode};
 
+    #[test]
+    fn an_empty_ownership_record_is_recognized_as_nothing_to_tear_down() {
+        assert!(
+            CreatedResources::default().is_empty(),
+            "a manager that created nothing must report an empty ownership record"
+        );
+        for created in [
+            CreatedResources::for_test(true, false, false, false),
+            CreatedResources::for_test(false, true, false, false),
+            CreatedResources::for_test(false, false, true, false),
+            CreatedResources::for_test(false, false, false, true),
+        ] {
+            assert!(
+                !created.is_empty(),
+                "{created:?} names a real resource and must not be treated as empty"
+            );
+        }
+    }
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
     }
@@ -974,10 +1128,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_host_retains_ipv4_mapped_ipv6_literal() {
+    fn resolve_host_rewrites_ipv4_mapped_ipv6_literal_to_ipv4() {
+        // A mapped destination is emitted as an IPv4 packet, so it must be
+        // programmed with iptables; an ip6tables rule would never match it.
         let ips = NetworkIptablesManager::resolve_host("::ffff:127.0.0.1");
-        assert!(ips.ipv4.is_empty());
-        assert_eq!(ips.ipv6, vec!["::ffff:127.0.0.1"]);
+        assert_eq!(ips.ipv4, vec!["127.0.0.1"]);
+        assert!(ips.ipv6.is_empty());
     }
 
     #[test]
@@ -1148,5 +1304,1115 @@ mod tests {
         for rule in &base {
             assert!(!rule.iter().any(|arg| arg == "icmp"));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Spec-derived tests: resolution
+    // -----------------------------------------------------------------------
+
+    fn assert_resolved_exact(input: &str, expected_ipv4: &[&str], expected_ipv6: &[&str]) {
+        let resolved = NetworkIptablesManager::resolve_host(input);
+        let expected_ipv4: Vec<String> = expected_ipv4
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
+        let expected_ipv6: Vec<String> = expected_ipv6
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
+
+        assert_eq!(
+            resolved.ipv4, expected_ipv4,
+            "unexpected IPv4 destinations for {input:?}"
+        );
+        assert_eq!(
+            resolved.ipv6, expected_ipv6,
+            "unexpected IPv6 destinations for {input:?}"
+        );
+    }
+
+    fn assert_destination_family(input: &str, expected: Option<IpFamily>) {
+        assert_eq!(
+            NetworkIptablesManager::destination_family(input),
+            expected,
+            "unexpected destination family for {input:?}"
+        );
+    }
+
+    #[test]
+    fn bare_ip_literals_are_routed_only_to_their_matching_family() {
+        let cases = [
+            ("192.0.2.1", &["192.0.2.1"][..], &[][..]),
+            ("127.0.0.1", &["127.0.0.1"][..], &[][..]),
+            ("2606:50c0::153", &[][..], &["2606:50c0::153"][..]),
+            (
+                "2606:50c0:0000:0000:0000:0000:0000:0153",
+                &[][..],
+                &["2606:50c0:0000:0000:0000:0000:0000:0153"][..],
+            ),
+            ("::1", &[][..], &["::1"][..]),
+        ];
+
+        for (input, expected_ipv4, expected_ipv6) in cases {
+            assert_resolved_exact(input, expected_ipv4, expected_ipv6);
+        }
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_literal_is_filed_as_ipv4() {
+        // An IPv4-mapped destination travels as an IPv4 packet, so an ip6tables
+        // rule naming it would never match and a blocked entry would fail open
+        // under default-allow. It must be programmed with iptables instead.
+        assert_resolved_exact("::ffff:127.0.0.1", &["127.0.0.1"], &[]);
+    }
+
+    #[test]
+    fn ipv4_mapped_cidr_is_translated_to_its_ipv4_prefix() {
+        // The mapped range is the last 32 bits of ::ffff:0:0/96, so an IPv6
+        // prefix of 96 + n is exactly an IPv4 prefix of n.
+        assert_resolved_exact("::ffff:192.0.2.0/120", &["192.0.2.0/24"], &[]);
+        assert_resolved_exact("::ffff:198.51.100.42/128", &["198.51.100.42/32"], &[]);
+    }
+
+    #[test]
+    fn an_ipv6_prefix_shorter_than_the_mapped_range_stays_ipv6() {
+        // A /95 covers addresses outside ::ffff:0:0/96, so it cannot be expressed
+        // as a single IPv4 CIDR and must not be rewritten.
+        assert_resolved_exact("::ffff:0:0/95", &[], &["::ffff:0:0/95"]);
+    }
+
+    #[test]
+    fn valid_cidrs_are_passed_through_unchanged_in_their_matching_family() {
+        // SPEC_BRIEF §3 requires validated CIDRs to be passed through unchanged.
+        let cases = [
+            ("140.82.112.0/20", &["140.82.112.0/20"][..], &[][..]),
+            ("2606:50c0::/32", &[][..], &["2606:50c0::/32"][..]),
+        ];
+
+        for (input, expected_ipv4, expected_ipv6) in cases {
+            assert_resolved_exact(input, expected_ipv4, expected_ipv6);
+        }
+    }
+
+    #[test]
+    fn v4_cidr_with_host_bits_set_is_passed_through_unchanged() {
+        // SPEC_BRIEF §3 says host bits are not required to be zero because iptables applies the mask.
+        assert_resolved_exact("140.82.112.5/20", &["140.82.112.5/20"], &[]);
+    }
+
+    #[test]
+    fn cidr_prefix_lengths_accept_only_family_specific_bounds() {
+        let cases = [
+            ("0.0.0.0/0", Some(IpFamily::V4), &["0.0.0.0/0"][..], &[][..]),
+            (
+                "192.0.2.1/32",
+                Some(IpFamily::V4),
+                &["192.0.2.1/32"][..],
+                &[][..],
+            ),
+            ("192.0.2.1/33", None, &[][..], &[][..]),
+            ("192.0.2.1/129", None, &[][..], &[][..]),
+            ("::/0", Some(IpFamily::V6), &[][..], &["::/0"][..]),
+            (
+                "2001:db8::1/128",
+                Some(IpFamily::V6),
+                &[][..],
+                &["2001:db8::1/128"][..],
+            ),
+            ("2001:db8::1/129", None, &[][..], &[][..]),
+        ];
+
+        for (input, expected_family, expected_ipv4, expected_ipv6) in cases {
+            assert_resolved_exact(input, expected_ipv4, expected_ipv6);
+            assert_destination_family(input, expected_family);
+        }
+    }
+
+    #[test]
+    fn v6_prefix_length_on_v4_address_is_rejected() {
+        assert_resolved_exact("10.0.0.0/64", &[], &[]);
+        assert_destination_family("10.0.0.0/64", None);
+    }
+
+    #[test]
+    fn malformed_cidr_syntax_and_garbage_resolve_to_nothing() {
+        let cases = [
+            "/24",
+            "10.0.0.0/",
+            "10.0.0.0//24",
+            "10.0.0.0/abc",
+            "10.0.0.0/-1",
+            "10.0.0.0/ 24",
+            "not-a-valid-firewall-destination",
+        ];
+
+        for input in cases {
+            let resolved = NetworkIptablesManager::resolve_host(input);
+            assert!(
+                resolved.is_empty(),
+                "malformed destination {input:?} should resolve to nothing, got {resolved:?}"
+            );
+            assert_destination_family(input, None);
+        }
+    }
+
+    #[test]
+    fn cidr_prefix_with_plus_sign_resolves_to_nothing() {
+        let input = "10.0.0.0/+24";
+        let resolved = NetworkIptablesManager::resolve_host(input);
+        assert!(
+            resolved.is_empty(),
+            "malformed destination {input:?} should resolve to nothing, got {resolved:?}"
+        );
+        assert_destination_family(input, None);
+    }
+
+    // Independent of the leading-`+` rejection above, the family range check must
+    // still reject an out-of-range prefix.
+    #[test]
+    fn leading_plus_does_not_smuggle_an_out_of_range_prefix_past_validation() {
+        let input = "10.0.0.0/+33";
+        let resolved = NetworkIptablesManager::resolve_host(input);
+        assert!(
+            resolved.is_empty(),
+            "a leading `+` must not smuggle an out-of-range prefix past validation, got {resolved:?}"
+        );
+        assert_destination_family(input, None);
+    }
+
+    #[test]
+    fn empty_input_resolves_to_nothing() {
+        let resolved = NetworkIptablesManager::resolve_host("");
+        assert!(
+            resolved.is_empty(),
+            "empty input should resolve to nothing, got {resolved:?}"
+        );
+        assert_destination_family("", None);
+    }
+
+    /// Every string in a bucket must be a destination of that bucket's family.
+    ///
+    /// This is the invariant that keeps an AAAA record from being handed to
+    /// `iptables` (and an A record to `ip6tables`). It is asserted as a property so
+    /// it holds whatever the resolver happens to return.
+    fn assert_buckets_are_family_pure(input: &str, resolved: &ResolvedDestinations) {
+        for destination in &resolved.ipv4 {
+            assert_eq!(
+                NetworkIptablesManager::destination_family(destination),
+                Some(IpFamily::V4),
+                "{input:?}: {destination:?} is in the ipv4 bucket but is not an IPv4 destination"
+            );
+        }
+        for destination in &resolved.ipv6 {
+            assert_eq!(
+                NetworkIptablesManager::destination_family(destination),
+                Some(IpFamily::V6),
+                "{input:?}: {destination:?} is in the ipv6 bucket but is not an IPv6 destination"
+            );
+        }
+    }
+
+    // The dual-stack bypass lived in the DNS family split: an AAAA record must land
+    // in the v6 bucket and must never leak into the v4 bucket. The split is a pure
+    // function (`bucket_resolved_addrs`), so it is exercised here with injected A
+    // and AAAA addresses -- no dependency on the host having live IPv6 DNS -- and
+    // the presence of a v6 destination is asserted **hard**. If the split routed
+    // AAAA records into the v4 bucket, `resolved.ipv6` would be empty (failing the
+    // non-empty assertion) and the v4 bucket would hold a value that does not parse
+    // as IPv4 (failing family purity).
+    #[test]
+    fn aaaa_records_land_in_the_v6_bucket_and_never_in_the_v4_bucket() {
+        let injected: Vec<IpAddr> = [
+            "93.184.216.34",
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "8.8.8.8",
+            "2001:4860:4860::8888",
+        ]
+        .iter()
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .expect("injected test address must parse")
+        })
+        .collect();
+
+        let resolved = NetworkIptablesManager::bucket_resolved_addrs(injected);
+
+        assert_eq!(
+            resolved.ipv4.len(),
+            2,
+            "both injected A records must land in the v4 bucket, got {:?}",
+            resolved.ipv4
+        );
+        assert_eq!(
+            resolved.ipv6.len(),
+            2,
+            "both injected AAAA records must land in the v6 bucket, got {:?}",
+            resolved.ipv6
+        );
+        assert!(
+            !resolved.ipv6.is_empty(),
+            "AAAA records must produce at least one v6 destination; an empty v6 \
+             bucket means the IPv6 arm was dropped or misrouted into the v4 bucket"
+        );
+        assert_buckets_are_family_pure("injected A/AAAA mix", &resolved);
+    }
+
+    // Live characterization: over whatever the host's resolver returns for
+    // well-known dual-stack names, the buckets must stay family-pure. This does not
+    // depend on the host having IPv6 DNS -- the purity invariant holds for any
+    // result -- and it does not paper over a missing v6 arm with a warning that
+    // still passes. The deterministic proof that AAAA records reach the v6 bucket
+    // lives in `aaaa_records_land_in_the_v6_bucket_and_never_in_the_v4_bucket`, and
+    // end-to-end IPv6 rule coverage lives in run_lxc_network_dualstack_test.sh.
+    #[test]
+    fn live_dual_stack_resolution_keeps_buckets_family_pure() {
+        for host in ["dns.google", "one.one.one.one", "localhost"] {
+            let resolved = NetworkIptablesManager::resolve_host(host);
+            assert_buckets_are_family_pure(host, &resolved);
+        }
+    }
+
+    #[test]
+    fn localhost_resolution_populates_available_loopback_families() {
+        let resolved = NetworkIptablesManager::resolve_host("localhost");
+
+        // SPEC_BRIEF §3 requires hostnames to resolve to both A and AAAA. Some
+        // minimal hosts can have a degenerate /etc/hosts, so this accepts whichever
+        // localhost family is configured while checking that no other address leaks in.
+        assert!(
+            !resolved.is_empty(),
+            "localhost should resolve to at least one loopback family"
+        );
+        assert!(
+            resolved
+                .ipv4
+                .iter()
+                .all(|destination| destination == "127.0.0.1"),
+            "localhost IPv4 results should all be 127.0.0.1, got {:?}",
+            resolved.ipv4
+        );
+        assert!(
+            resolved.ipv6.iter().all(|destination| destination == "::1"),
+            "localhost IPv6 results should all be ::1, got {:?}",
+            resolved.ipv6
+        );
+        assert_buckets_are_family_pure("localhost", &resolved);
+    }
+
+    #[test]
+    fn unresolvable_invalid_tld_hostname_resolves_to_nothing() {
+        let input = "mxc-resolution-spec-7f3b2d9c4a1e6f80.invalid";
+        let resolved = NetworkIptablesManager::resolve_host(input);
+
+        assert!(
+            resolved.is_empty(),
+            "reserved .invalid hostname {input:?} should resolve to nothing, got {resolved:?}"
+        );
+        assert_destination_family(input, None);
+    }
+
+    #[test]
+    fn destination_family_agrees_with_every_resolved_destination() {
+        let inputs = [
+            "192.0.2.44",
+            "2606:50c0::153",
+            "140.82.112.5/20",
+            "2606:50c0::/32",
+            "::ffff:127.0.0.1",
+            "localhost",
+        ];
+
+        for input in inputs {
+            let resolved = NetworkIptablesManager::resolve_host(input);
+
+            for destination in &resolved.ipv4 {
+                assert_eq!(
+                    NetworkIptablesManager::destination_family(destination),
+                    Some(IpFamily::V4),
+                    "destination_family disagreed with IPv4 filing for input {input:?}, destination {destination:?}"
+                );
+            }
+
+            for destination in &resolved.ipv6 {
+                assert_eq!(
+                    NetworkIptablesManager::destination_family(destination),
+                    Some(IpFamily::V6),
+                    "destination_family disagreed with IPv6 filing for input {input:?}, destination {destination:?}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Spec-derived tests: rule generation
+    // -----------------------------------------------------------------------
+
+    fn joined(rule: &[String]) -> String {
+        rule.join(" ")
+    }
+
+    fn assert_rule_contains(rule: &[String], expected: &str, input: &str) {
+        assert!(
+            rule.iter().any(|arg| arg == expected),
+            "rule for {input} should contain {expected:?}; actual: {rule:?}"
+        );
+    }
+
+    fn assert_rule_omits(rule: &[String], unexpected: &str, input: &str) {
+        assert!(
+            !rule.iter().any(|arg| arg == unexpected),
+            "rule for {input} should not contain {unexpected:?}; actual: {rule:?}"
+        );
+    }
+
+    fn policy_with_hosts(allowed_hosts: &[&str], blocked_hosts: &[&str]) -> ContainerPolicy {
+        ContainerPolicy {
+            allowed_hosts: strings(allowed_hosts),
+            blocked_hosts: strings(blocked_hosts),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn allow_and_deny_actions_map_to_exact_iptables_jump_targets() {
+        assert_eq!(
+            NetworkIptablesManager::rule_action_arg(&RuleAction::Allow),
+            "ACCEPT",
+            "RuleAction::Allow should map to ACCEPT exactly"
+        );
+        assert_eq!(
+            NetworkIptablesManager::rule_action_arg(&RuleAction::Deny),
+            "DROP",
+            "RuleAction::Deny should map to DROP exactly"
+        );
+    }
+
+    #[test]
+    fn destination_literals_and_cidrs_land_only_in_their_address_family_bucket() {
+        let cases = [
+            ("192.0.2.10", "ipv4 bare literal", true),
+            ("192.0.2.10/24", "ipv4 CIDR", true),
+            ("2001:db8::10", "ipv6 bare literal", false),
+            ("2001:db8::10/64", "ipv6 CIDR", false),
+        ];
+
+        for (destination, label, is_ipv4) in cases {
+            let rules = NetworkIptablesManager::build_host_rule_args(
+                "MXC-family-split",
+                destination,
+                &RuleAction::Allow,
+            );
+
+            if is_ipv4 {
+                assert_eq!(
+                    rules.ipv4.len(),
+                    1,
+                    "{label} {destination} should produce one IPv4 rule; actual: {rules:?}"
+                );
+                assert!(
+                    rules.ipv6.is_empty(),
+                    "{label} {destination} should leave IPv6 rules empty; actual: {rules:?}"
+                );
+                assert_rule_contains(&rules.ipv4[0], destination, destination);
+            } else {
+                assert!(
+                    rules.ipv4.is_empty(),
+                    "{label} {destination} must not leak into IPv4 rules; actual: {rules:?}"
+                );
+                assert_eq!(
+                    rules.ipv6.len(),
+                    1,
+                    "{label} {destination} should produce one IPv6 rule; actual: {rules:?}"
+                );
+                assert_rule_contains(&rules.ipv6[0], destination, destination);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_family_host_list_produces_matching_rule_count_in_each_bucket() {
+        let policy = policy_with_hosts(
+            &[
+                "192.0.2.10",
+                "198.51.100.0/24",
+                "2001:db8::10",
+                "2001:db8:abcd::/48",
+            ],
+            &[],
+        );
+        let rules = NetworkIptablesManager::build_policy_rule_args("MXC-mixed", &policy);
+
+        assert_eq!(
+            rules.ipv4.len(),
+            2,
+            "mixed host list should produce two IPv4 rules; actual: {rules:?}"
+        );
+        assert_eq!(
+            rules.ipv6.len(),
+            2,
+            "mixed host list should produce two IPv6 rules; actual: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn generated_destination_rules_append_to_chain_match_destination_and_jump_target() {
+        let chain_name = "MXC-shape";
+        let destination = "203.0.113.0/24";
+        let rule = NetworkIptablesManager::build_single_rule_args(
+            chain_name,
+            destination,
+            &RuleAction::Deny,
+        );
+
+        assert_eq!(
+            rule.first().map(String::as_str),
+            Some("-A"),
+            "rule for {destination} should append with -A; actual: {rule:?}"
+        );
+        assert_rule_contains(&rule, chain_name, destination);
+        assert_rule_contains(&rule, "-d", destination);
+        assert_rule_contains(&rule, destination, destination);
+        assert_rule_contains(&rule, "-j", destination);
+        assert_rule_contains(&rule, "DROP", destination);
+
+        let rendered = joined(&rule);
+        assert!(
+            rendered.contains("-A MXC-shape"),
+            "rule for {destination} should append to the requested chain; actual: {rendered}"
+        );
+        assert!(
+            rendered.contains("-d 203.0.113.0/24"),
+            "CIDR destination should be passed through unchanged in rule; actual: {rendered}"
+        );
+        assert!(
+            rendered.contains("-j DROP"),
+            "deny rule for {destination} should jump to DROP; actual: {rendered}"
+        );
+    }
+
+    #[test]
+    fn resolved_destinations_are_split_into_ipv4_and_ipv6_rule_args() {
+        let destinations = ResolvedDestinations {
+            ipv4: strings(&["192.0.2.10", "198.51.100.0/24"]),
+            ipv6: strings(&["2001:db8::10", "2001:db8:abcd::/48"]),
+        };
+        let rules = NetworkIptablesManager::build_resolved_destination_rule_args(
+            "MXC-resolved",
+            &destinations,
+            &RuleAction::Allow,
+        );
+
+        assert_eq!(
+            rules.ipv4.len(),
+            2,
+            "resolved destinations should keep both IPv4 rules in IPv4 bucket; actual: {rules:?}"
+        );
+        assert_eq!(
+            rules.ipv6.len(),
+            2,
+            "resolved destinations should keep both IPv6 rules in IPv6 bucket; actual: {rules:?}"
+        );
+        for destination in &destinations.ipv4 {
+            assert!(
+                rules.ipv4.iter().any(|rule| rule.contains(destination)),
+                "IPv4 destination {destination} should appear in IPv4 rules; actual: {rules:?}"
+            );
+            assert!(
+                !rules.ipv6.iter().any(|rule| rule.contains(destination)),
+                "IPv4 destination {destination} should not appear in IPv6 rules; actual: {rules:?}"
+            );
+        }
+        for destination in &destinations.ipv6 {
+            assert!(
+                rules.ipv6.iter().any(|rule| rule.contains(destination)),
+                "IPv6 destination {destination} should appear in IPv6 rules; actual: {rules:?}"
+            );
+            assert!(
+                !rules.ipv4.iter().any(|rule| rule.contains(destination)),
+                "IPv6 destination {destination} must not appear in IPv4 rules; actual: {rules:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_list_rules_are_emitted_before_block_list_rules_for_same_ipv4_destination() {
+        let destination = "203.0.113.44";
+        let policy = policy_with_hosts(&[destination], &[destination]);
+        let rules = NetworkIptablesManager::build_policy_rule_args("MXC-order-v4", &policy);
+        let rendered: Vec<String> = rules.ipv4.iter().map(|rule| joined(rule)).collect();
+
+        let accept_index = rendered
+            .iter()
+            .position(|rule| rule.contains(destination) && rule.contains("-j ACCEPT"))
+            .expect("IPv4 ACCEPT rule for duplicate destination should exist");
+        let drop_index = rendered
+            .iter()
+            .position(|rule| rule.contains(destination) && rule.contains("-j DROP"))
+            .expect("IPv4 DROP rule for duplicate destination should exist");
+
+        // SPEC_BRIEF §3 pins this interim AB#62830341 behavior until deny-precedence lands.
+        assert!(
+            accept_index < drop_index,
+            "IPv4 duplicate {destination} should ACCEPT before DROP; actual order: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn allow_list_rules_are_emitted_before_block_list_rules_for_same_ipv6_destination() {
+        let destination = "2001:db8::44";
+        let policy = policy_with_hosts(&[destination], &[destination]);
+        let rules = NetworkIptablesManager::build_policy_rule_args("MXC-order-v6", &policy);
+        let rendered: Vec<String> = rules.ipv6.iter().map(|rule| joined(rule)).collect();
+
+        let accept_index = rendered
+            .iter()
+            .position(|rule| rule.contains(destination) && rule.contains("-j ACCEPT"))
+            .expect("IPv6 ACCEPT rule for duplicate destination should exist");
+        let drop_index = rendered
+            .iter()
+            .position(|rule| rule.contains(destination) && rule.contains("-j DROP"))
+            .expect("IPv6 DROP rule for duplicate destination should exist");
+
+        // SPEC_BRIEF §3 says allow-before-block ordering applies to both iptables buckets.
+        assert!(
+            accept_index < drop_index,
+            "IPv6 duplicate {destination} should ACCEPT before DROP; actual order: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn base_chain_rules_are_four_family_agnostic_rules_in_documented_order() {
+        let chain_name = "MXC-base";
+        let rules = NetworkIptablesManager::build_base_chain_rule_args(chain_name);
+        let expected = vec![
+            strings(&["-A", chain_name, "-i", "lo", "-j", "ACCEPT"]),
+            strings(&[
+                "-A",
+                chain_name,
+                "-m",
+                "state",
+                "--state",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
+            ]),
+            strings(&[
+                "-A", chain_name, "-p", "udp", "--dport", "53", "-j", "ACCEPT",
+            ]),
+            strings(&[
+                "-A", chain_name, "-p", "tcp", "--dport", "53", "-j", "ACCEPT",
+            ]),
+        ];
+
+        assert_eq!(
+            rules, expected,
+            "base chain rules should be the documented four rules in order"
+        );
+        for (index, rule) in rules.iter().enumerate() {
+            assert_rule_omits(rule, "-d", &format!("base rule {index}"));
+            assert!(
+                !rule.iter().any(|arg| arg == "icmp" || arg == "icmpv6"),
+                "base rule {index} must be family-agnostic; -p icmp is invalid for ip6tables and would make the v6 chain fail: {rule:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_network_policy_maps_to_exact_terminal_rule_vector() {
+        let chain_name = "MXC-default";
+
+        assert_eq!(
+            NetworkIptablesManager::build_default_policy_rule_arg(chain_name, NetworkPolicy::Block),
+            strings(&["-A", chain_name, "-j", "DROP"]),
+            "NetworkPolicy::Block should produce the exact DROP terminal rule"
+        );
+        assert_eq!(
+            NetworkIptablesManager::build_default_policy_rule_arg(chain_name, NetworkPolicy::Allow),
+            strings(&["-A", chain_name, "-j", "ACCEPT"]),
+            "NetworkPolicy::Allow should produce the exact ACCEPT terminal rule"
+        );
+    }
+
+    #[test]
+    fn chain_names_have_mxc_prefix_and_total_length_cap_of_twenty_four() {
+        let short_name = "short";
+        let short_manager = NetworkIptablesManager::new(short_name);
+        assert_eq!(
+            short_manager.chain_name, "MXC-short",
+            "short container name {short_name} should be preserved after MXC- prefix"
+        );
+
+        let long_name = "abcdefghijklmnopqrstuvwxyz";
+        let long_manager = NetworkIptablesManager::new(long_name);
+        let expected = "MXC-abcdefghijklmnopqrst";
+        assert_eq!(
+            long_manager.chain_name, expected,
+            "long container name should be truncated to 20 chars after MXC- prefix"
+        );
+        assert_eq!(
+            long_manager.chain_name.len(),
+            24,
+            "chain name length cap should apply to total length including MXC- prefix"
+        );
+        assert!(
+            long_manager.chain_name.starts_with("MXC-"),
+            "long chain name should keep MXC- prefix; actual: {}",
+            long_manager.chain_name
+        );
+    }
+
+    #[test]
+    fn empty_policy_produces_no_destination_rules_in_either_bucket() {
+        let policy = policy_with_hosts(&[], &[]);
+        let rules = NetworkIptablesManager::build_policy_rule_args("MXC-empty", &policy);
+
+        assert!(
+            rules.ipv4.is_empty(),
+            "empty policy should produce no IPv4 destination rules; actual: {rules:?}"
+        );
+        assert!(
+            rules.ipv6.is_empty(),
+            "empty policy should produce no IPv6 destination rules; actual: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn unresolvable_invalid_hostname_contributes_no_destination_rules() {
+        let host = "definitely-unresolvable-mxc-rulegen-spec.invalid";
+        let rules =
+            NetworkIptablesManager::build_host_rule_args("MXC-invalid", host, &RuleAction::Allow);
+
+        assert!(
+            rules.ipv4.is_empty(),
+            "unresolvable host {host} should produce no IPv4 rules; actual: {rules:?}"
+        );
+        assert!(
+            rules.ipv6.is_empty(),
+            "unresolvable host {host} should produce no IPv6 rules; actual: {rules:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Spec-derived tests: lifecycle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_new_manager_reports_no_rules_applied() {
+        let manager = NetworkIptablesManager::new("fresh");
+
+        assert!(
+            !manager.rules_applied(),
+            "a newly constructed manager must not report firewall state needing cleanup"
+        );
+    }
+
+    #[test]
+    fn a_non_firewall_policy_is_a_successful_no_op() {
+        let mut manager = NetworkIptablesManager::new("skip-noop");
+        manager.set_veth_interface("veth-skip");
+        let policy = policy_with_enforcement_mode(NetworkEnforcementMode::Capabilities);
+        let mut logger = Logger::new(Mode::Buffer);
+
+        let result = manager.apply_firewall_rules(&policy, &mut logger);
+
+        assert_eq!(
+            result,
+            Ok(true),
+            "a policy that does not use firewall enforcement must be reported as a successful no-op"
+        );
+        assert!(
+            !manager.rules_applied(),
+            "a no-op firewall skip must leave no rules marked as applied"
+        );
+    }
+
+    #[test]
+    fn every_enforcement_mode_takes_the_contractual_firewall_gate() {
+        for (mode, uses_firewall) in enforcement_modes_with_firewall_contract() {
+            assert_eq!(
+                NetworkIptablesManager::enforcement_mode_uses_firewall(&mode),
+                uses_firewall,
+                "{mode:?} firewall-gate predicate mismatch"
+            );
+        }
+    }
+
+    fn policy_with_enforcement_mode(
+        network_enforcement_mode: NetworkEnforcementMode,
+    ) -> ContainerPolicy {
+        ContainerPolicy {
+            network_enforcement_mode,
+            ..Default::default()
+        }
+    }
+
+    /// The expected answers are written out as literals rather than derived from
+    /// a second copy of the predicate. A test that recomputes the contract it is
+    /// checking passes even when both copies are wrong in the same way.
+    fn enforcement_modes_with_firewall_contract() -> [(NetworkEnforcementMode, bool); 3] {
+        use NetworkEnforcementMode::{Both, Capabilities, Firewall};
+
+        [(Capabilities, false), (Firewall, true), (Both, true)]
+    }
+
+    // -----------------------------------------------------------------------
+    // Spec-derived tests: ip6tables status
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Truth table — all four input combinations are enumerated and pinned.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn working_probe_with_active_ipv6_reports_available() {
+        // "A working probe means the tool is usable regardless of address state."
+        let result = NetworkIptablesManager::classify_ip6tables_status(true, true);
+        assert_eq!(
+            result,
+            Ip6tablesStatus::Available,
+            "classify_ip6tables_status(probe=true, ipv6_active=true) should be Available; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn working_probe_without_active_ipv6_still_reports_available() {
+        // "A working probe means the tool is usable regardless of address state."
+        let result = NetworkIptablesManager::classify_ip6tables_status(true, false);
+        assert_eq!(
+            result,
+            Ip6tablesStatus::Available,
+            "classify_ip6tables_status(probe=true, ipv6_active=false) should be Available; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn failed_probe_with_no_active_ipv6_reports_kernel_ipv6_disabled() {
+        // "if the kernel has no active IPv6 there is nothing to filter and skipping is safe"
+        let result = NetworkIptablesManager::classify_ip6tables_status(false, false);
+        assert_eq!(
+            result,
+            Ip6tablesStatus::KernelIpv6Disabled,
+            "classify_ip6tables_status(probe=false, ipv6_active=false) should be KernelIpv6Disabled; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn live_ipv6_with_a_broken_tool_must_fail_closed_not_skip() {
+        // "if IPv6 is live the tool is genuinely missing or broken and setup must
+        // fail closed rather than leave IPv6 egress unfiltered"
+        let result = NetworkIptablesManager::classify_ip6tables_status(false, true);
+        assert_eq!(
+            result,
+            Ip6tablesStatus::UnusableButIpv6Active,
+            "classify_ip6tables_status(probe=false, ipv6_active=true) should be UnusableButIpv6Active (fail-closed); got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Invariants — properties that must hold across the whole domain.
+    // -----------------------------------------------------------------------
+
+    /// A working probe always yields Available, regardless of IPv6 address state.
+    #[test]
+    fn working_probe_always_yields_available_regardless_of_ipv6_state() {
+        for ipv6_active in [false, true] {
+            let result = NetworkIptablesManager::classify_ip6tables_status(true, ipv6_active);
+            assert_eq!(
+                result,
+                Ip6tablesStatus::Available,
+                "probe_succeeded=true, ipv6_active={ipv6_active}: expected Available, got {result:?}"
+            );
+        }
+    }
+
+    /// A failed probe must never return Available — it can only be KernelIpv6Disabled
+    /// or UnusableButIpv6Active.
+    #[test]
+    fn failed_probe_never_reports_available() {
+        for ipv6_active in [false, true] {
+            let result = NetworkIptablesManager::classify_ip6tables_status(false, ipv6_active);
+            assert_ne!(
+                result,
+                Ip6tablesStatus::Available,
+                "probe_succeeded=false, ipv6_active={ipv6_active}: Available must not be returned when the probe failed; got {result:?}"
+            );
+        }
+    }
+
+    /// UnusableButIpv6Active is ONLY reachable when the probe failed AND IPv6 is
+    /// live.  If a mutation makes the fail-closed branch unreachable (silent
+    /// fail-open), this test catches it.
+    #[test]
+    fn fail_closed_outcome_is_reachable_only_when_probe_failed_and_ipv6_is_live() {
+        // The one combination that MUST produce UnusableButIpv6Active.
+        let fail_closed = NetworkIptablesManager::classify_ip6tables_status(false, true);
+        assert_eq!(
+            fail_closed,
+            Ip6tablesStatus::UnusableButIpv6Active,
+            "classify_ip6tables_status(probe=false, ipv6_active=true) must be UnusableButIpv6Active; got {fail_closed:?}"
+        );
+
+        // All other combinations must NOT produce UnusableButIpv6Active.
+        let other_pairs = [(true, true), (true, false), (false, false)];
+        for (probe, active) in other_pairs {
+            let result = NetworkIptablesManager::classify_ip6tables_status(probe, active);
+            assert_ne!(
+                result,
+                Ip6tablesStatus::UnusableButIpv6Active,
+                "classify_ip6tables_status(probe={probe}, ipv6_active={active}) must not be UnusableButIpv6Active; got {result:?}"
+            );
+        }
+    }
+
+    /// KernelIpv6Disabled is ONLY reachable when the probe failed AND IPv6 is
+    /// inactive.  It must not surface as a safe-skip when IPv6 is actually live.
+    #[test]
+    fn safe_skip_outcome_is_reachable_only_when_probe_failed_and_ipv6_is_inactive() {
+        // The one combination that MUST produce KernelIpv6Disabled.
+        let safe_skip = NetworkIptablesManager::classify_ip6tables_status(false, false);
+        assert_eq!(
+            safe_skip,
+            Ip6tablesStatus::KernelIpv6Disabled,
+            "classify_ip6tables_status(probe=false, ipv6_active=false) must be KernelIpv6Disabled; got {safe_skip:?}"
+        );
+
+        // All other combinations must NOT produce KernelIpv6Disabled.
+        let other_pairs = [(true, true), (true, false), (false, true)];
+        for (probe, active) in other_pairs {
+            let result = NetworkIptablesManager::classify_ip6tables_status(probe, active);
+            assert_ne!(
+                result,
+                Ip6tablesStatus::KernelIpv6Disabled,
+                "classify_ip6tables_status(probe={probe}, ipv6_active={active}) must not be KernelIpv6Disabled; got {result:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Discriminant distinctness — a mutation that collapses two variants must
+    // be caught before PartialEq-based assertions below would silently accept it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ip6tables_status_variants_are_all_distinct_from_each_other() {
+        assert_ne!(
+            Ip6tablesStatus::Available,
+            Ip6tablesStatus::KernelIpv6Disabled,
+            "Available and KernelIpv6Disabled must be distinct variants"
+        );
+        assert_ne!(
+            Ip6tablesStatus::Available,
+            Ip6tablesStatus::UnusableButIpv6Active,
+            "Available and UnusableButIpv6Active must be distinct variants"
+        );
+        assert_ne!(
+            Ip6tablesStatus::KernelIpv6Disabled,
+            Ip6tablesStatus::UnusableButIpv6Active,
+            "KernelIpv6Disabled and UnusableButIpv6Active must be distinct variants"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Spec-derived tests: host IPv6 state
+    // -----------------------------------------------------------------------
+
+    /// `/proc/net` exists, which is the ordinary case on any Linux host and the
+    /// precondition that makes a missing `if_inet6` mean "IPv6 is off".
+    const PROC_NET_MOUNTED: bool = true;
+
+    /// `/proc` is not mounted, so no IPv6 probe ever ran.
+    const PROC_NET_ABSENT: bool = false;
+
+    // A real `/proc/net/if_inet6` line: 32-hex-char address, if_index, prefix_len,
+    // scope, flags, and the device name in the final field. These samples mirror
+    // the kernel's actual formatting (space-separated fields).
+    const LOOPBACK_LINE: &str = "00000000000000000000000000000001 01 80 10 80         lo";
+    const ETH0_GLOBAL_LINE: &str = "2606280002200001024818932c5c1946 03 40 00 80         eth0";
+    const ETH0_LINKLOCAL_LINE: &str = "fe80000000000000020000fffe000001 03 40 20 80         eth0";
+
+    #[test]
+    fn a_real_interface_address_is_classified_active() {
+        // "a line is treated as evidence of active IPv6 only when its device is
+        // something other than `lo`" -- a global address on eth0 is egress-capable.
+        let contents = format!("{LOOPBACK_LINE}\n{ETH0_GLOBAL_LINE}\n");
+        let state =
+            NetworkIptablesManager::classify_host_ipv6_state(Ok(contents), PROC_NET_MOUNTED);
+        assert_eq!(
+            state,
+            HostIpv6State::Active,
+            "a non-loopback interface with an IPv6 address must classify as Active; got {state:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_local_address_on_a_real_interface_is_still_active() {
+        // The kernel lists the link-local `fe80::` address on any interface with
+        // IPv6 up; its device is not `lo`, so the host has an IPv6 stack to filter.
+        let contents = format!("{ETH0_LINKLOCAL_LINE}\n");
+        let state =
+            NetworkIptablesManager::classify_host_ipv6_state(Ok(contents), PROC_NET_MOUNTED);
+        assert_eq!(
+            state,
+            HostIpv6State::Active,
+            "a link-local address on eth0 must classify as Active; got {state:?}"
+        );
+    }
+
+    #[test]
+    fn loopback_only_is_not_a_basis_for_claiming_egress_capable_ipv6() {
+        // An IPv4-only host commonly still lists `::1` on `lo`. Loopback is not
+        // egress-capable, so it must NOT be treated as active IPv6.
+        let contents = format!("{LOOPBACK_LINE}\n");
+        let state =
+            NetworkIptablesManager::classify_host_ipv6_state(Ok(contents), PROC_NET_MOUNTED);
+        assert_eq!(
+            state,
+            HostIpv6State::Inactive,
+            "loopback-only `::1` on `lo` must classify as Inactive, not Active; got {state:?}"
+        );
+        assert_ne!(
+            state,
+            HostIpv6State::Active,
+            "loopback-only `::1` must never be reported as egress-capable IPv6"
+        );
+    }
+
+    #[test]
+    fn empty_contents_are_inactive() {
+        let state =
+            NetworkIptablesManager::classify_host_ipv6_state(Ok(String::new()), PROC_NET_MOUNTED);
+        assert_eq!(
+            state,
+            HostIpv6State::Inactive,
+            "an empty `/proc/net/if_inet6` means no IPv6 addresses; got {state:?}"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_contents_are_inactive() {
+        let state = NetworkIptablesManager::classify_host_ipv6_state(
+            Ok("\n  \n".to_string()),
+            PROC_NET_MOUNTED,
+        );
+        assert_eq!(
+            state,
+            HostIpv6State::Inactive,
+            "blank lines carry no interface, so the state is Inactive; got {state:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_a_confirmed_negative() {
+        // A `NotFound` read *while `/proc/net` exists* means the kernel never
+        // created the file (IPv6 disabled at boot), which IS a genuine
+        // "IPv6 is off" -> Inactive.
+        let state = NetworkIptablesManager::classify_host_ipv6_state(
+            Err(Error::from(ErrorKind::NotFound)),
+            PROC_NET_MOUNTED,
+        );
+        assert_eq!(
+            state,
+            HostIpv6State::Inactive,
+            "a NotFound read (IPv6 disabled at boot) is a confirmed negative; got {state:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_on_an_unmounted_proc_is_unknown_not_a_confirmed_negative() {
+        // An unmounted /proc reports the same NotFound as an IPv6-disabled
+        // kernel, but says nothing at all about IPv6: the probe never ran.
+        // Reading it as "IPv6 is off" would apply an IPv4-only policy and leave
+        // IPv6 egress unfiltered.
+        let state = NetworkIptablesManager::classify_host_ipv6_state(
+            Err(Error::from(ErrorKind::NotFound)),
+            PROC_NET_ABSENT,
+        );
+        assert_eq!(
+            state,
+            HostIpv6State::Unknown,
+            "NotFound with no /proc/net must be Unknown, not a confirmed negative; got {state:?}"
+        );
+        assert_ne!(
+            state,
+            HostIpv6State::Inactive,
+            "an unmounted /proc must never be reported as a confirmed 'IPv6 is off'"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_is_unknown_not_a_confirmed_negative() {
+        // Any read error other than NotFound (permission denied, I/O error, /proc
+        // not mounted) means "we could not determine the state", which must NOT be
+        // silently converted into "IPv6 is off". This is the fail-open guard.
+        let state = NetworkIptablesManager::classify_host_ipv6_state(
+            Err(Error::from(ErrorKind::PermissionDenied)),
+            PROC_NET_MOUNTED,
+        );
+        assert_eq!(
+            state,
+            HostIpv6State::Unknown,
+            "a PermissionDenied read must be Unknown, not Inactive; got {state:?}"
+        );
+        assert_ne!(
+            state,
+            HostIpv6State::Inactive,
+            "an unreadable IPv6 state must never be treated as a confirmed 'IPv6 is off'"
+        );
+    }
+
+    #[test]
+    fn a_generic_io_error_is_unknown_not_a_confirmed_negative() {
+        let state = NetworkIptablesManager::classify_host_ipv6_state(
+            Err(Error::from(ErrorKind::Other)),
+            PROC_NET_MOUNTED,
+        );
+        assert_eq!(
+            state,
+            HostIpv6State::Unknown,
+            "a generic I/O error must be Unknown, not Inactive; got {state:?}"
+        );
+    }
+
+    // The three states must be distinct, or the PartialEq-based assertions above
+    // could silently accept a mutation that collapses two of them.
+    #[test]
+    fn host_ipv6_states_are_all_distinct() {
+        assert_ne!(HostIpv6State::Active, HostIpv6State::Inactive);
+        assert_ne!(HostIpv6State::Active, HostIpv6State::Unknown);
+        assert_ne!(HostIpv6State::Inactive, HostIpv6State::Unknown);
+    }
+
+    // -----------------------------------------------------------------------
+    // State -> "treat as active" mapping. This is the fail-open guard: Unknown
+    // must be treated as active so an unreadable IPv6 state fails closed rather
+    // than leaving IPv6 egress unfiltered.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn active_state_is_treated_as_active() {
+        assert!(
+            NetworkIptablesManager::ipv6_state_treated_as_active(HostIpv6State::Active),
+            "Active must be treated as active"
+        );
+    }
+
+    #[test]
+    fn inactive_state_is_not_treated_as_active() {
+        assert!(
+            !NetworkIptablesManager::ipv6_state_treated_as_active(HostIpv6State::Inactive),
+            "Inactive must not be treated as active; there is genuinely nothing to filter"
+        );
+    }
+
+    #[test]
+    fn unknown_state_is_treated_as_active_to_fail_closed() {
+        // The fail-open guard: "we could not determine IPv6 state" must NOT become
+        // "IPv6 is off". Treating Unknown as active means a failed ip6tables probe
+        // then fails setup closed instead of leaving IPv6 egress unfiltered.
+        assert!(
+            NetworkIptablesManager::ipv6_state_treated_as_active(HostIpv6State::Unknown),
+            "Unknown must be treated as active so an unreadable IPv6 state fails closed"
+        );
     }
 }
