@@ -783,7 +783,7 @@ impl NetworkIptablesManager {
                 // ours, so adopt it rather than reporting a clean failure:
                 // otherwise `remove_firewall_rules` and `Drop` are both gated
                 // off and the leaked chain is never retried.
-                if self.adopt_failed_apply_residual(residual) {
+                if self.retain_residual_ownership(residual) {
                     logger.log_line(&format!(
                         "Firewall setup failed: {}. Rollback left iptables state behind; \
                          retained ownership so teardown retries it.",
@@ -800,14 +800,15 @@ impl NetworkIptablesManager {
         }
     }
 
-    /// Take ownership of whatever a failed apply's rollback could not remove,
-    /// so the ordinary teardown paths retry it.
+    /// Take ownership of whatever a teardown could not remove, so the
+    /// remaining cleanup paths retry it.
     ///
     /// Returns whether anything was retained. `rules_applied` is the gate on
-    /// both [`Self::remove_firewall_rules`] and `Drop`, so leaving it false
-    /// after a rollback that only partly succeeded strands the survivors: no
-    /// later path would know they were ours to remove.
-    fn adopt_failed_apply_residual(&mut self, residual: CreatedResources) -> bool {
+    /// both [`Self::remove_firewall_rules`] and `Drop`, so clearing it after a
+    /// teardown that only partly succeeded strands the survivors: no later path
+    /// would know they were ours to remove.  This is shared by the failed-apply
+    /// rollback and the ordinary removal path, which have the same obligation.
+    fn retain_residual_ownership(&mut self, residual: CreatedResources) -> bool {
         self.created = residual;
         self.rules_applied = !residual.is_empty();
         self.rules_applied
@@ -1045,8 +1046,10 @@ impl NetworkIptablesManager {
             logger,
         );
 
-        self.rules_applied = false;
-        self.created = residual;
+        // A removal command can fail, and what survived is still ours. Clearing
+        // the gate here regardless would strand it: Drop would then skip the
+        // retry that is the last chance to remove it.
+        self.retain_residual_ownership(residual);
         Ok(())
     }
 
@@ -1177,7 +1180,7 @@ mod tests {
         // before touching anything and returns early when the gate is closed.
         let mut manager = NetworkIptablesManager::new("survivor");
         let retained = manager
-            .adopt_failed_apply_residual(CreatedResources::for_test(true, false, false, false));
+            .retain_residual_ownership(CreatedResources::for_test(true, false, false, false));
         assert!(retained, "a non-empty residual must be retained");
 
         let mut after_partial = Logger::new(Mode::Buffer);
@@ -1194,7 +1197,7 @@ mod tests {
         // which would resurrect the collision the ownership record exists to
         // prevent.
         let mut clean = NetworkIptablesManager::new("fully-rolled-back");
-        let retained_clean = clean.adopt_failed_apply_residual(CreatedResources::default());
+        let retained_clean = clean.retain_residual_ownership(CreatedResources::default());
         assert!(!retained_clean, "an empty residual must not be retained");
 
         let mut after_clean = Logger::new(Mode::Buffer);
@@ -1203,6 +1206,38 @@ mod tests {
             after_clean.get_buffer(),
             "",
             "a fully rolled-back apply must not begin a teardown"
+        );
+    }
+
+    #[test]
+    fn a_removal_whose_commands_failed_stays_owned_for_the_drop_retry() {
+        // remove_firewall_rules used to clear rules_applied unconditionally, so
+        // a teardown whose commands failed reported itself done while the chain
+        // was still installed.  Drop is gated on the same flag, so that threw
+        // away the last retry.  On this host every iptables command fails, so a
+        // manager that owns something and is asked to remove it necessarily
+        // ends with a non-empty residual -- exactly the case that must stay
+        // owned.
+        let mut manager = NetworkIptablesManager::new("stubborn");
+        manager.retain_residual_ownership(CreatedResources::for_test(true, false, false, false));
+
+        let mut first = Logger::new(Mode::Buffer);
+        let _ = manager.remove_firewall_rules(&mut first);
+        assert!(
+            first.get_buffer().contains("MXC-stubborn"),
+            "the first removal must attempt the teardown, got: {:?}",
+            first.get_buffer()
+        );
+
+        // The observable for "still owned" is that a second removal still runs
+        // rather than short-circuiting on the gate.  That second call is what
+        // Drop makes.
+        let mut second = Logger::new(Mode::Buffer);
+        let _ = manager.remove_firewall_rules(&mut second);
+        assert!(
+            second.get_buffer().contains("MXC-stubborn"),
+            "a removal that failed must leave the chain owned so Drop retries it, got: {:?}",
+            second.get_buffer()
         );
     }
 
