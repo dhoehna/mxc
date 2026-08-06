@@ -1095,6 +1095,46 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_signal_arriving_before_anything_was_created_removes_nothing() {
+        // force_cleanup is ownership-blind once it starts: it rebuilds the
+        // chain name and removes whatever answers to it. The empty-record guard
+        // is the only thing standing between a process that created nothing and
+        // the chain of a concurrent start that did. Asserting the guard's
+        // predicate in isolation would not catch its deletion, so this drives
+        // force_cleanup itself and uses the log as the observable — the teardown
+        // announces the chain by name before it touches anything.
+        let mut quiet = Logger::new(Mode::Buffer);
+        NetworkIptablesManager::force_cleanup(
+            "racer-that-lost",
+            Some("mxcv-loser"),
+            CreatedResources::default(),
+            &mut quiet,
+        );
+        assert_eq!(
+            quiet.get_buffer(),
+            "",
+            "a process holding no ownership must not begin a teardown at all"
+        );
+
+        // Positive control: the same call with one resource published does
+        // reach the teardown, so the assertion above discriminates between the
+        // two cases rather than observing a permanently silent function.
+        let mut noisy = Logger::new(Mode::Buffer);
+        NetworkIptablesManager::force_cleanup(
+            "racer-that-won",
+            Some("mxcv-winner"),
+            CreatedResources::for_test(true, false, false, false),
+            &mut noisy,
+        );
+        assert!(
+            noisy.get_buffer().contains("MXC-racer-that-won"),
+            "a published resource must be torn down, got: {:?}",
+            noisy.get_buffer()
+        );
+    }
+
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
     }
