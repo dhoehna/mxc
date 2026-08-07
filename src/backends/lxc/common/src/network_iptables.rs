@@ -44,9 +44,14 @@ pub(crate) struct CreatedFirewallState {
 }
 
 impl CreatedFirewallState {
-    /// Everything this manager could have created. Used by the teardown paths
-    /// that run after a successful apply (and by `force_cleanup`), where the
-    /// manager owns all of it and iptables is the source of truth.
+    /// Everything this manager could have created.
+    ///
+    /// Test-only, and deliberately so: no teardown path may assume it owns the
+    /// full set.  Chain names truncate to 20 characters and can collide, so a
+    /// teardown that acted on `all()` rather than on the record it was handed
+    /// could remove a live container's chain.  Tests use it as the "stale
+    /// superset" that teardown must replace.
+    #[cfg(test)]
     fn all() -> Self {
         Self {
             v4_chain: true,
@@ -85,6 +90,15 @@ pub struct NetworkIptablesManager {
     rules_applied: bool,
     /// The container's veth interface name on the host.
     veth_interface: Option<String>,
+    /// Which chains and hooks this manager actually created.
+    ///
+    /// Teardown removes exactly these rather than every object the name could
+    /// refer to.  Chain names sanitize and truncate to 20 characters, so a
+    /// blanket teardown under a colliding name can flush a different live
+    /// container's rules.  Keeping the record on the manager makes "remove only
+    /// what we made" a property of the data rather than an argument about which
+    /// commands must have run first.
+    created: CreatedFirewallState,
 }
 
 impl NetworkIptablesManager {
@@ -101,6 +115,7 @@ impl NetworkIptablesManager {
             chain_name: format!("MXC-{}", sanitized),
             rules_applied: false,
             veth_interface: None,
+            created: CreatedFirewallState::default(),
         }
     }
 
@@ -675,6 +690,7 @@ impl NetworkIptablesManager {
         let mut created = CreatedFirewallState::default();
         match self.apply_firewall_rules_inner(policy, logger, &mut created) {
             Ok(()) => {
+                self.created = created;
                 self.rules_applied = true;
                 Ok(true)
             }
@@ -696,6 +712,7 @@ impl NetworkIptablesManager {
                 // `remove_firewall_rules` and `Drop`, so leaving it false after
                 // a rollback that only partly succeeded strands the survivors.
                 let residual = self.teardown_created(created, logger);
+                self.created = residual;
                 self.rules_applied = !residual.is_empty();
                 Err(e)
             }
@@ -926,16 +943,6 @@ impl NetworkIptablesManager {
         crate::signal_cleanup::set_active_created(*created);
     }
 
-    /// Best-effort removal of every hook and chain this manager could have
-    /// created, in both tables. Used by the post-apply teardown paths, where
-    /// the manager owns all of it and iptables is the source of truth.
-    ///
-    /// Returns the residual so the caller can decide whether ownership must be
-    /// retained for a later retry.
-    fn teardown_chains(&self, logger: &mut Logger) -> CreatedFirewallState {
-        self.teardown_created(CreatedFirewallState::all(), logger)
-    }
-
     /// Remove exactly the objects flagged in `created`, and republish what
     /// survived.
     ///
@@ -1038,7 +1045,12 @@ impl NetworkIptablesManager {
         // A removal command can fail, and what survived is still ours. Clearing
         // the gate regardless would strand it: Drop is gated on the same flag,
         // so it would skip the retry that is the last chance to remove it.
-        let residual = self.teardown_chains(logger);
+        //
+        // Tearing down `self.created` rather than every object the name could
+        // refer to is what keeps a colliding name from costing a different
+        // container its rules.
+        let residual = self.teardown_created(self.created, logger);
+        self.created = residual;
         self.rules_applied = !residual.is_empty();
         Ok(())
     }
@@ -1050,13 +1062,14 @@ impl NetworkIptablesManager {
     ///
     /// `created` is the ownership record the runner published as it installed
     /// each resource, carried across the thread boundary by `signal_cleanup`.
-    /// Using it — rather than assuming every chain and hook exists — is what
-    /// keeps this path from flushing a *different* container's live chain:
-    /// chain names sanitize and truncate to 20 characters, so a name collision
-    /// would otherwise let a signal delivered to container A empty container
-    /// B's chain, silently failing B open. Once this process owns anything
-    /// under the name (its `-N` succeeded, so it holds the name exclusively),
-    /// tearing down the full set only touches its own resources.
+    /// It is handed to the temporary manager and torn down verbatim, rather
+    /// than being used only as a non-empty check before removing everything the
+    /// name could refer to. Chain names sanitize and truncate to 20 characters,
+    /// so a name collision would otherwise let a signal delivered to container
+    /// A remove objects belonging to container B, silently failing B open.
+    /// Removing exactly what was published makes that impossible by
+    /// construction instead of by an argument about which commands must have
+    /// succeeded first.
     ///
     /// The sole caller (`signal_cleanup::run_watchdog`) is Linux-only, so this
     /// is dead code elsewhere. It stays compiled on every target rather than
@@ -1079,8 +1092,10 @@ impl NetworkIptablesManager {
         if let Some(v) = veth_interface {
             mgr.set_veth_interface(v);
         }
-        // Bypass the rules_applied gate; if there's nothing to remove the
-        // iptables `-D`/`-F`/`-X` calls just no-op.
+        // Adopt the published record, then bypass the rules_applied gate: this
+        // manager did not perform the apply, so the flag is false even though
+        // the resources exist.
+        mgr.created = created;
         mgr.rules_applied = true;
         let _ = mgr.remove_firewall_rules(logger);
     }
@@ -1460,6 +1475,15 @@ mod tests {
         assert!(all.v6_dhcp);
     }
 
+    /// The signal-cleanup registry is one process-global slot, so tests that
+    /// publish to it must not run concurrently with each other.
+    fn lock_active_slot() -> std::sync::MutexGuard<'static, ()> {
+        static ACTIVE_SLOT_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ACTIVE_SLOT_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn a_teardown_republishes_what_it_left_behind_rather_than_a_stale_superset() {
         // The watchdog acts on whatever ownership record was last published.
@@ -1471,6 +1495,7 @@ mod tests {
         //
         // The observable is the published record itself: it must track the
         // teardown rather than outlive it.
+        let _guard = lock_active_slot();
         crate::signal_cleanup::set_active("stale-record");
         crate::signal_cleanup::set_active_created(CreatedFirewallState::all());
 
@@ -1541,6 +1566,67 @@ mod tests {
             noisy.get_buffer().contains("MXC-racer-that-won"),
             "a published resource must be torn down, got: {:?}",
             noisy.get_buffer()
+        );
+    }
+
+    #[test]
+    fn force_cleanup_removes_only_what_was_published() {
+        // The signal path used to treat the published record as a mere
+        // non-empty check and then tear down every object the chain name could
+        // refer to.  Names truncate to 20 characters, so under a collision that
+        // removes a different live container's objects.  It must now act on the
+        // record verbatim.
+        //
+        // The logger cannot serve as the oracle here: on a host with no
+        // iptables binary every command fails at spawn, before anything is
+        // logged.  The published residual can, because teardown seeds it from
+        // the record it was handed -- so a force_cleanup that substituted
+        // `all()` would republish `all()`.
+        let _guard = lock_active_slot();
+        crate::signal_cleanup::set_active("partial");
+        let only_v4_chain = CreatedFirewallState {
+            v4_chain: true,
+            ..CreatedFirewallState::default()
+        };
+        crate::signal_cleanup::set_active_created(only_v4_chain);
+
+        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+        NetworkIptablesManager::force_cleanup("partial", Some("mxcv0"), only_v4_chain, &mut logger);
+
+        let published = crate::signal_cleanup::active_created_for_test();
+        assert_eq!(
+            published, only_v4_chain,
+            "force_cleanup must act on the published record verbatim, not on every object the \
+             chain name could refer to"
+        );
+        assert_ne!(
+            published,
+            CreatedFirewallState::all(),
+            "a force_cleanup that substituted all() would republish all()"
+        );
+    }
+
+    #[test]
+    fn force_cleanup_declines_an_empty_record_without_touching_the_registry() {
+        // Negative control for the assertion above.  An empty record means this
+        // process created nothing, so anything answering to the name belongs to
+        // a live container and must be left alone.
+        let _guard = lock_active_slot();
+        crate::signal_cleanup::set_active("empty-record");
+        crate::signal_cleanup::set_active_created(CreatedFirewallState::all());
+
+        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+        NetworkIptablesManager::force_cleanup(
+            "empty-record",
+            Some("mxcv0"),
+            CreatedFirewallState::default(),
+            &mut logger,
+        );
+
+        assert_eq!(
+            crate::signal_cleanup::active_created_for_test(),
+            CreatedFirewallState::all(),
+            "an empty record must make force_cleanup a no-op, leaving the registry untouched"
         );
     }
 
