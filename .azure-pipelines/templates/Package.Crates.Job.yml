@@ -1,39 +1,17 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 #
-# Packages the `mxc-sdk` crate closure into `.crate` files for ESRP-based
-# crates.io publishing. Publishes them as the `mxc-crates-package` pipeline
-# artifact, consumed by `1ES.Release.Crates.yml`'s Publish_to_CratesIo stage.
+# Packages the mxc-sdk crate closure into .crate files and publishes them as
+# the mxc-crates-package pipeline artifact.  Packages the ref the run was
+# queued against.
 #
-# This template has TWO callers, and both package the ref the run was queued
-# against:
-#   1. `templates/1ES.Build.Stages.yml` (official build) -- packages the commit
-#      the build is already building, producing the artifact purely as build
-#      output / validation.
-#   2. `.azure-pipelines/1ES.Release.Crates.yml` (dedicated crates release
-#      pipeline) -- queued against a release ref picked in the Run dialog's
-#      ref selector, so it packages that ref. That pipeline gates the ref in
-#      its Validate_Release_Ref stage, accepting only `refs/heads/release/*`
-#      or `refs/tags/v*`, which is why no ref handling is needed here.
-#
-# Source-only: unlike the npm SDK this needs no built binaries, only a cargo
-# toolchain plus the internal Mxc-Azure-Feed for dependency resolution.
-# `cargo package` tars each crate's source and verification-builds it, while
-# the helper validates that the complete first-party dependency graph is
-# publishable and leaf-first.
-#
-# `--registry Mxc-Azure-Feed` works around rust-lang/cargo#17196: when
-# `[source.crates-io] replace-with` is active, cargo registers the temporary
-# overlay holding the just-packaged workspace siblings under the PRE-replacement
-# source id (crates-io) but looks it up under the POST-replacement one (the
-# feed). The keys never match, the overlay is silently bypassed, and each
-# sibling is searched for in the feed where it does not exist. Passing the feed
-# as the registry makes both sides agree. The emitted `.crate` files are
-# byte-identical either way -- they record the canonical crates.io registry and
-# contain no internal URLs.
+# --registry Mxc-Azure-Feed works around rust-lang/cargo#17196, where the
+# overlay holding just-packaged workspace siblings is registered under the
+# pre-replacement source id and looked up under the post-replacement one.
+# The emitted .crate files are byte-identical either way.
 #
 # The helper script is copied into the artifact so the release job can run its
-# `stage`/`verify-order` subcommands without checking out the source.
+# stage and verify-order subcommands without a checkout.
 
 parameters:
   - name: cratesArtifactName
@@ -50,31 +28,12 @@ jobs:
     variables:
       outDir: $(Build.SourcesDirectory)/out/crates
     steps:
-      # Packages the ref the run was queued against. For a release that is the
-      # release branch or tag itself, selected in the Run dialog's ref selector
-      # and already validated by the Validate_Release_Ref stage, so there is no
-      # ref to resolve or check out here. Crate versions come from
-      # src/Cargo.toml at that ref, since every crate inherits
-      # `version.workspace = true`.
       - checkout: self
 
       - template: Rust.Toolchain.Public.yml@self
         parameters:
           targetTriple: x86_64-pc-windows-msvc
 
-      # Install the cross-compile targets that `cargo package --target` needs.
-      # crates_release.py passes all three triples to a single cargo package
-      # invocation per crate, so a crate that fails to compile for Linux or
-      # macOS fails the release here rather than after publishing.
-      #
-      # Rust.Toolchain.Public.yml prepends %USERPROFILE%\.cargo\bin to PATH, so
-      # rustup is available from this step onward.  The toolchain is pinned by
-      # name rather than resolved from src/rust-toolchain.toml because the
-      # working directory here is the sources root, not the workspace root.
-      #
-      # The script independently verifies each target is present before it
-      # invokes cargo, so a silent failure here still cannot produce a green
-      # run that verified fewer targets than it claims.
       - pwsh: |
           $ErrorActionPreference = 'Stop'
           foreach ($triple in @('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin'))
@@ -84,28 +43,10 @@ jobs:
           }
         displayName: Install cross-compile targets (linux-gnu, apple-darwin)
 
-      # Resolve dependencies through the internal feed (official build has the
-      # System.AccessToken needed to authenticate). Cargo #17196 currently
-      # causes unpublished workspace siblings to be looked up in this feed.
       - template: Cargo.Setup.Private.yml@self
 
-      # The same drift check CI runs, repeated here because CI cannot cover
-      # this.  Build.yml runs check-template on pull requests into main, but a
-      # release ref can be pushed straight to the remote without ever opening
-      # one, so a release built from an unchecked commit would otherwise reach
-      # the publish stage with a stale crateOrder.  verify-order does not catch
-      # it either: it accepts an ordered subset by design, so a template missing
-      # a newly-added crate passes and the crate is silently never published.
-      #
-      # It runs before packaging so the run stops before producing artifacts.
-      # A deliberate resume declares a RESUME-SUBSET marker in the template,
-      # which this accepts after proving the short list is still in valid
-      # dependency order.
-      # Resolve the Python interpreter once for this job.  `python3` is the
-      # name used by this repo's Linux jobs, but on Windows it is commonly
-      # absent (or an App Execution Alias stub that opens the Store), so the
-      # name is resolved here and failure is loud rather than a confusing
-      # "command not found" inside a later step.
+      # python3 is commonly absent on Windows, or an App Execution Alias stub
+      # that opens the Store.
       - pwsh: |
           $ErrorActionPreference = 'Stop'
           $exe = $null

@@ -1,72 +1,43 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 #
-# Publishes the `mxc-sdk` crate closure to crates.io through ESRP Release, under
-# the official `microsoft-oss-releases` account. Consumes the
-# `mxc-crates-package` artifact produced by Package.Crates.Job.yml in the SAME
-# pipeline run (1ES.Release.Crates.yml) -- ESRP publishes pre-built `.crate`
-# files, so no CARGO_REGISTRY_TOKEN ever lives in this repo.
+# Publishes the mxc-sdk crate closure to crates.io through ESRP Release, under
+# the microsoft-oss-releases account.  Consumes the mxc-crates-package
+# artifact.
 #
-# ESRP publishes via the crates.io API, which does NOT enforce dependency order
-# and offers no bulk sorting (see the ESRP crates.io docs). We therefore emit
-# one EsrpRelease task per crate, leaf-first. A run-time guard asserts the
-# compile-time `crateOrder` is an ordered subset of what was packaged.
+# Emits one EsrpRelease task per crate, leaf-first, since the crates.io API
+# does not enforce dependency order.  A runtime guard asserts crateOrder is an
+# ordered subset of what was packaged.
 #
-# This is a standard `job` with `templateContext.type: releaseJob`, modelled on
-# the pattern used by the NPM release job in 1ES.Release.yml. It is deliberately
-# NOT a `deployment` job: 1ES requires `environment:` on those, which would mean
-# provisioning an ADO Environment (and its approval gates) for no benefit here.
+# The pool enforces 1ES network isolation (CFSClean), so this job performs no
+# crates.io reads.  A publish that crates.io rejects fails its task and skips
+# every later crate.
 #
-# This pool enforces 1ES network isolation (CFSClean), so crates.io is NOT
-# reachable from here and this job performs no crates.io reads. Correct ordering
-# is established offline at packaging time; a publish that crates.io rejects
-# fails its EsrpRelease task, which fails the job and skips every later crate,
-# so the leaf-first chain halts instead of shipping a broken closure.
-#
-# RESUMING A FAILED RELEASE: crates.io rejects a duplicate version, so simply
-# re-running this job unchanged fails on the first crate that already landed.
-# The pool cannot ask crates.io what landed, and 1ES forbids `checkout` in a
-# release job, so there is no automated ledger. Instead the operator re-queues
-# the release with the already-published crates removed from `crateOrder`.
-# `verify-order` accepts that subset only if it is still in packaged leaf-first
-# order, and logs every dependency it is consequently assuming is already live.
+# Resuming a failed release: re-queue with the already-published crates
+# removed from crateOrder.  verify-order accepts that subset only if it is
+# still in packaged leaf-first order.
 
 parameters:
   - name: ESRPInfo
     type: object
-  # Leaf-first crate order -- a topological sort of the workspace dependency
-  # graph, NOT an operator choice, which is why it lives here rather than in
-  # the release pipeline's `parameters:` block (anything declared there renders
-  # as an editable field in the Run dialog, and no human should be hand-editing
-  # a dependency order at queue time).
+  # Leaf-first crate order, a topological sort of the workspace dependency
+  # graph.
   #
   # GENERATED.  Do not hand-edit or hand-sort.  Regenerate with:
   #
   #   python3 .azure-pipelines/scripts/crates_release.py order
   #
-  # and paste the output over every line below.  That command computes the
-  # order from `cargo metadata` and validates the graph before printing, so a
-  # bad edit produces a named error rather than a list that fails mid release.
+  # and paste the output over every line below.
   #
-  # This list has to be static YAML because ${{ each }} expands at compile
-  # time, before any script has run, so it is a pasted copy rather than a
-  # computed one.  `package` derives its order from the same function, but
-  # nothing prevents this copy going stale -- `verify-order` is what catches
-  # that, at run time, before anything is published.
+  # Static YAML because ${{ each }} expands at compile time.  verify-order
+  # catches a stale copy at run time, before anything is published.
   #
-  # ADDING A CRATE: add the package name anywhere in the CRATES list in
+  # ADDING A CRATE: add the package name to the CRATES list in
   # scripts/crates_release.py, then run the command above and paste the result
-  # here.  CRATES is an unordered set of names; this list is the ordering.
-  # Both steps are required.
+  # here.  Both steps are required.
   #
-  # Forgetting to add it to CRATES is caught, not silent:
-  # `_validate_release_graph` fails packaging with "local dependency is missing
-  # from CRATES" as soon as any published crate depends on the new one.
-  #
-  # Drop already-published crates from this list to resume a failed release --
-  # keep the survivors in their existing relative order rather than
-  # regenerating, because `verify-order` accepts only an ordered SUBSET of what
-  # was packaged.
+  # Drop already-published crates from this list to resume a failed release,
+  # keeping the survivors in their existing relative order.
   - name: crateOrder
     type: object
     default:
@@ -93,13 +64,9 @@ parameters:
   - name: cratesArtifactName
     type: string
     default: mxc-crates-package
-  # Compile-time backstop, not the primary gate.  The stage `condition:` in
-  # 1ES.Release.Crates.yml skips this entire job on a dry run, so the steps
-  # below do not normally execute at all.  This guard is kept so that deleting
-  # that condition still cannot publish: when true the ESRP task is never
-  # emitted, only dry-run echo steps are.  Defaults to TRUE so a caller that
-  # omits it cannot publish by accident; crates.io publication is irreversible
-  # and this job has no rollback.
+  # Compile-time backstop.  The stage condition in 1ES.Release.Crates.yml
+  # skips this job on a dry run; this guard means deleting that condition
+  # still cannot publish.
   - name: dryRun
     type: boolean
     default: true
@@ -124,9 +91,7 @@ jobs:
       orderFile: $(Pipeline.Workspace)/crates/release-order.json
       script: $(Pipeline.Workspace)/crates/crates_release.py
     steps:
-      # Resolve the Python interpreter once for this job.  See the matching
-      # comment in Package.Crates.Job.yml: `python3` is frequently absent on
-      # Windows agents, so the name is resolved here and failure is loud.
+      # python3 is frequently absent on Windows agents.
       - pwsh: |
           $ErrorActionPreference = 'Stop'
           $exe = $null
@@ -144,10 +109,7 @@ jobs:
           Write-Host "##vso[task.setvariable variable=pythonExe]$exe"
         displayName: Resolve Python interpreter
 
-      # Guard: the crates this run will publish must be a correctly
-      # ordered subset of what was packaged, or we could publish in the
-      # wrong order. A strict subset is allowed (resume); it is reported
-      # as a warning naming every dependency assumed already published.
+      # A strict subset is allowed, for resuming a failed release.
       - pwsh: |
           $ErrorActionPreference = 'Stop'
           & "$(pythonExe)" "$(script)" verify-order --order-file "$(orderFile)" --expected "$env:EXPECTED_ORDER"

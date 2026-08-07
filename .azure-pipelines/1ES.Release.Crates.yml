@@ -1,95 +1,30 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 #
-# ═══════════════════════════════════════════════════════════════════════════════
 # MXC Crates.io Release Pipeline (ESRP)
-# ═══════════════════════════════════════════════════════════════════════════════
 #
-# What this does:
-#   Packages the MXC Rust crate closure from a frozen release ref and publishes
-#   every crate to crates.io through ESRP Release, leaf-first.  It is ONE
-#   CLICK: pick the release branch in the Run dialog's ref selector, and it
-#   packages then publishes.
+# Packages the MXC Rust crate closure and publishes every crate to crates.io
+# through ESRP, leaf-first.
 #
-# Choosing the release (REQUIRED):
-#   The source packaged is the ref the run is QUEUED AGAINST -- selected from
-#   the ref selector at the top of the Run pipeline dialog.  There is no ref
-#   parameter to type.  Validate_Release_Ref accepts exactly two shapes and
-#   fails the run on anything else; every other stage depends on it.
+# The ref the run is queued against supplies both the source and this
+# definition.  Validate_Release_Ref accepts two shapes and fails anything else:
 #
-#     refs/heads/release/*   a release BRANCH, e.g. release/v0.8.0
-#     refs/tags/v*           a release TAG, e.g. v0.8.0
+#   refs/heads/release/*   release branch, e.g. release/v0.8.0
+#   refs/tags/v*           release tag, e.g. v0.8.0
 #
-#   Use the branch for a normal release.  For a GitHub-backed pipeline the Run
-#   dialog reliably enumerates branches, and a release branch is what an
-#   operator can actually select; tags are accepted so a run can also be queued
-#   against the repo's existing v<semver> tags through the REST API.
+# Selecting a commit does not work: a commit-queued run reports its containing
+# branch in Build.SourceBranch, not the SHA.
 #
-#   A release branch is NOT immutable by default -- it is made immutable by a
-#   GitHub ruleset on `release/*` that blocks pushes, force-pushes, and
-#   deletion.  That ruleset is a REPO SETTING, not something this file can
-#   enforce, and it is what makes the packaged source static.  Without it a
-#   release branch can still move, and the run would package whatever it points
-#   at.  See docs/crates-release.md.
+# Crate versions come from src/Cargo.toml at that ref.
 #
-#   Because the ref also supplies the pipeline DEFINITION, changing anything
-#   about how a release is built means cutting a new release ref.  Crate
-#   versions come from `src/Cargo.toml` at that ref because every crate in the
-#   workspace uses `version.workspace = true`.
-#
-#   Selecting a COMMIT in the Run dialog does not work: a commit-queued run is
-#   still branch-contextual and reports `Build.SourceBranch` as the containing
-#   branch (`refs/heads/main`), not the SHA, so the gate below rejects it.
-#
-# Dry-run:
-#   `dryRun` defaults to TRUE.  A default run packages the crate closure and
-#   checks the publish order against `cargo metadata`, then skips the publish
-#   stage entirely -- the stage stays visible in the run and is reported as
-#   `Skipped`.  Set it to false only for a deliberate real publish.
-#
-#   The default is deliberately safe because publishing is IRREVERSIBLE:
-#   crates.io does not allow a name to be deleted or reused once a version
-#   exists, and this pipeline has no atomic publish or rollback -- a failure
-#   partway through leaves the crates already sent to crates.io public, and
-#   yanking them is a manual process.  Until crate naming and ESRP `Rust`
-#   enablement are settled, an accidental run must not publish.
-#
-# Network / credentials:
-#   This pipeline needs NO crates.io network access. The 1ES pool's CFSClean
-#   isolation policy blocks crates.io; dependency resolution stays on the
-#   private `Mxc-Azure-Feed`; and ESRP owns the publishing credentials so no
-#   CARGO_REGISTRY_TOKEN or token variable group is needed.
-#
-# ─── One-time enablement prerequisites ───────────────────────────────────────
-#
-# 1. OSPO OSS-release registration: the crate closure must be registered in
-#    OSPO's open-source release tracker before ESRP will accept a Rust
-#    content-type release.
-#
-# 2. ESRP `Rust` content-type onboarding: the ESRP service connection must
-#    have the `Rust` content type enabled. File a request through the ESRP
-#    onboarding portal.
-#
-# 3. Public crate-name reservation. NOTE: `hyperlight_common` normalizes to
-#    `hyperlight-common`, which is already TAKEN on crates.io by
-#    github.com/hyperlight-dev/hyperlight. crates.io treats `-` and `_` as
-#    equivalent when checking name collisions, so that crate must be renamed
-#    or co-ownership obtained before the closure can publish.
-#
-# 4. crates.io `PublishNew` rate-limit override, requested via help@crates.io.
-#    The default allowance is a burst of 5 plus 1 per 10 minutes, so a
-#    20-crate first release is throttled partway through without one.
-#
-# ═══════════════════════════════════════════════════════════════════════════════
+# Setup, prerequisites, known blockers, and how to resume a failed release:
+# docs/crates-release.md
 
 trigger: none
 pr: none
 
 name: $(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
 
-# No `resources.pipelines` entry: unlike the npm release pipeline, this
-# pipeline packages its own source in-run (via Package.Crates.Job.yml) so it
-# does not consume artifacts from another pipeline.
 resources:
   repositories:
   - repository: 1ESPipelineTemplates
@@ -98,39 +33,10 @@ resources:
     ref: refs/tags/release
 
 parameters:
-  # Defaults to TRUE so an accidental or exploratory run cannot publish.
-  # Publishing to crates.io is irreversible and this pipeline cannot roll back,
-  # so a real publish must be an explicit, deliberate choice in the Run dialog.
   - name: dryRun
     displayName: 'Dry run — package and check order; publish stage is skipped'
     type: boolean
     default: true
-
-  # ESRP Release needs an owner email and an approver email, but the
-  # MXC-ESRP-Signing variable group does not carry them: inspected through the
-  # ADO variable-groups API, it holds exactly six code-signing fields --
-  # serviceName, tenantId, azureKeyVaultName, authCertName, signCertName, and
-  # clientId.
-  #
-  # They are NOT pipeline parameters.  Anything declared under `parameters:`
-  # renders as an editable field in the Run dialog, and an email address is not
-  # a decision the person clicking Run should be asked to make -- there is no
-  # right answer for them to know, and a typo submits a release to the wrong
-  # owner.  Both values are therefore fixed below to $(Build.RequestedForEmail),
-  # the predefined variable holding the email of whoever queued the run, so the
-  # person releasing owns and approves their own release with nothing typed.
-  #
-  # This is the value a default run already used; removing the fields removes
-  # the prompt, not the behavior.  To release under a different owner or
-  # approver, change it here and cut a new release ref -- the ref supplies the
-  # pipeline definition as well as the source, which is what keeps a release
-  # reproducible from its ref alone.
-  #
-  # $(Build.RequestedForEmail) survives template expansion as a literal macro
-  # token and is expanded by Azure DevOps at runtime in the EsrpRelease task
-  # inputs, since macro syntax is expanded in task inputs after template
-  # expansion.  A runtime guard in the gate stage fails the run if it resolves
-  # empty.
 
 variables:
   - group: MXC-ESRP-Signing
@@ -152,57 +58,17 @@ extends:
         os: windows
 
     stages:
-    # ─── Stage 0: Gate on the release ref ────────────────────────────────────
-    # The source packaged by this pipeline is whatever ref the run was queued
-    # against, chosen from the Run dialog's ref selector.  That selector cannot
-    # be filtered -- Azure DevOps offers no way to restrict which refs it
-    # lists.  This stage is what makes the choice safe: it fails unless the run
-    # was queued against a release branch or a release tag, and both stages
-    # below depend on it, so nothing is checked out, packaged, or published
-    # from `main`, a feature branch, or an unrelated tag.
-    #
-    # Two shapes are accepted, and the branch is the one an operator uses:
-    # for a GitHub-backed pipeline the Run dialog reliably enumerates branches,
-    # so a release BRANCH is what can actually be selected.  Tags are accepted
-    # as well so a run can be queued against the repo's existing v<semver>
-    # tags (v0.6.1, v0.7.0) through the REST API.
-    #
-    # A release branch is frozen by a GitHub ruleset on `release/*`, not by
-    # this file -- see the header.  This gate proves the run came from a
-    # release ref; it CANNOT prove that ref is immutable.
-    #
-    # This must be a RUNTIME check. `Build.SourceBranch` is not available to
-    # compile-time `${{ }}` template expressions, so the stages cannot be
-    # conditionally omitted based on it.
+    # Runtime check: Build.SourceBranch is not available to compile-time
+    # ${{ }} expressions.  Every other stage depends on this one.
     - stage: Validate_Release_Ref
       displayName: 'Validate Release Ref'
       dependsOn: []
-      # Operators can deselect stages in the Run dialog's "Stages to run" panel.
-      # `isSkippable: false` greys out this stage's checkbox so the gate cannot
-      # be switched off, which is the documented purpose of the property (the
-      # Learn example is an injected malware-detection stage). Without it, the
-      # guard below would be advisory rather than enforced.
       isSkippable: false
       jobs:
       - job: validate_release_ref
         displayName: 'Require a release ref'
         steps:
         - checkout: none
-        # Fail fast on an empty ESRP owner or approver email.  These flow
-        # unvalidated into EsrpRelease's `owners` and `approvers` (via
-        # Publish.CratesIo.Job.yml), and an empty value submits a release with
-        # no owner or no approver -- something the pipeline would otherwise not
-        # catch until packaging has already run.
-        #
-        # Both are fixed to $(Build.RequestedForEmail) rather than being Run
-        # dialog fields, so the failure this guards is no longer an operator
-        # clearing a box: it is the predefined variable resolving empty, which
-        # can happen when a run is queued by something other than a signed-in
-        # user.  That is a runtime condition, so this is a runtime check --
-        # a compile-time ${{ if }} would only ever see the unexpanded macro
-        # token and could never fire.  It lives in this stage because every
-        # other stage depends on it, so a missing value stops the run before
-        # any crate is checked out or packaged.
         - pwsh: |
             $ErrorActionPreference = 'Stop'
             if ([string]::IsNullOrWhiteSpace($env:OWNERS))
@@ -224,12 +90,7 @@ extends:
             $ErrorActionPreference = 'Stop'
             $ref = $env:SOURCE_REF
             Write-Host "Run was queued against: $ref"
-            # -clike, not -like: ? is exactly one character and * is any run in
-            # both, but -like is case-INSENSITIVE and would widen this gate to
-            # accept refs/heads/Release/x and refs/tags/V1.  Git refs are
-            # case-sensitive, so those are different refs from the ones the
-            # release/* ruleset freezes, and a publish is irreversible.  The ?*
-            # suffix requires a non-empty branch or tag name.
+            # -clike, not -like: -like is case-insensitive and git refs are not.
             if ($ref -clike 'refs/heads/release/?*')
             {
               Write-Host "OK: releasing from branch $($ref.Substring('refs/heads/'.Length))"
@@ -249,30 +110,16 @@ extends:
           env:
             SOURCE_REF: $(Build.SourceBranch)
 
-    # ─── Stage 1: Package ────────────────────────────────────────────────────
-    # Packaging happens in this pipeline (not the build pipeline) because:
-    # 1ES forbids `checkout` in a release JOB ("To adhere to compliance
-    # requirements, 1ES PT no longer supports checkout in release jobs"), but
-    # a regular job in the same PIPELINE may check out and build. So a normal
-    # job packages, and the release job consumes the artifact produced within
-    # this same run. This is what makes the release one click.
+    # Packages in a normal job, since 1ES forbids checkout in a release job.
     - stage: Package_Crates_For_Release
       displayName: 'Package Crates'
       dependsOn: Validate_Release_Ref
       jobs:
       - template: .azure-pipelines/templates/Package.Crates.Job.yml@self
 
-    # ─── Stage 2: Publish ────────────────────────────────────────────────────
     - stage: Publish_to_CratesIo
       displayName: 'Publish Crates.io Packages'
       dependsOn: Package_Crates_For_Release
-      # A dry run skips this stage outright rather than running a no-op copy of
-      # it, so the run UI reports it as `Skipped` instead of green.  `${{ }}` is
-      # evaluated at template expansion, so this compiles to a boolean literal
-      # -- `and(succeeded(), False)` or `and(succeeded(), True)` -- with no
-      # string comparison at runtime.  `succeeded()` must stay: naming any
-      # custom condition replaces the implicit default, and without it the
-      # stage would publish even after packaging failed.
       condition: and(succeeded(), ${{ eq(parameters.dryRun, false) }})
       jobs:
       - template: .azure-pipelines/templates/Publish.CratesIo.Job.yml@self
@@ -286,9 +133,5 @@ extends:
             clientId: $(clientId)
             OwnersEmail: $(Build.RequestedForEmail)
             ApproversEmail: $(Build.RequestedForEmail)
-          # crateOrder is deliberately NOT passed and NOT a pipeline parameter.
-          # It is a dependency-derived topological order, not an operator
-          # choice, so it lives in Publish.CratesIo.Job.yml where the Run
-          # dialog cannot render it.  Regenerate it with
-          # `python3 .azure-pipelines/scripts/crates_release.py order`.
+          # crateOrder lives in Publish.CratesIo.Job.yml, not here.
           dryRun: ${{ parameters.dryRun }}
