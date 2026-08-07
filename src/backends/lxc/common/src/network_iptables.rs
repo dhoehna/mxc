@@ -700,18 +700,7 @@ impl NetworkIptablesManager {
     /// missing or broken (must fail setup, since applying only the v4 policy
     /// would silently leave IPv6 egress unfiltered).
     fn ip6tables_status(logger: &mut Logger) -> Ip6tablesStatus {
-        let probe_succeeded = match Command::new("ip6tables").arg("-S").output() {
-            Ok(output) if output.status.success() => true,
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                logger.log_line(&format!("ip6tables probe failed ({})", stderr.trim()));
-                false
-            }
-            Err(e) => {
-                logger.log_line(&format!("ip6tables not found ({})", e));
-                false
-            }
-        };
+        let probe_succeeded = Self::ip6tables_probe_succeeded(logger);
 
         let status = Self::classify_ip6tables_status(
             probe_succeeded,
@@ -735,11 +724,51 @@ impl NetworkIptablesManager {
         status
     }
 
+    /// Run the read-only `ip6tables -S` probe, reporting whether the tool is
+    /// usable.
+    ///
+    /// Split out from [`Self::ip6tables_status`] because it is the second of
+    /// this file's two process spawns and the apply path reaches it before any
+    /// chain exists, so a test that does not intercept it takes a different
+    /// branch depending on the host's `ip6tables`.
+    fn ip6tables_probe_succeeded(logger: &mut Logger) -> bool {
+        #[cfg(test)]
+        if let Some(succeeded) = test_firewall::intercept_ip6tables_probe() {
+            return succeeded;
+        }
+
+        match Command::new("ip6tables").arg("-S").output() {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                logger.log_line(&format!("ip6tables probe failed ({})", stderr.trim()));
+                false
+            }
+            Err(e) => {
+                logger.log_line(&format!("ip6tables not found ({})", e));
+                false
+            }
+        }
+    }
+
     fn run_firewall_command(
         command: &str,
         args: &[&str],
         logger: &mut Logger,
     ) -> Result<bool, String> {
+        // A unit test may install a fake to record this command and supply its
+        // outcome, so the test states its own precondition instead of
+        // inheriting one from whatever `iptables` the host happens to have.
+        // Interception is opt-in: with no fake installed the real binary runs
+        // exactly as it did before, so tests that do not opt in are unaffected.
+        #[cfg(test)]
+        if let Some(outcome) = test_firewall::intercept(command, args) {
+            return match outcome {
+                Ok(()) => Ok(true),
+                Err(stderr) => Err(Self::log_command_failure(command, args, &stderr, logger)),
+            };
+        }
+
         let output = Command::new(command)
             .args(args)
             .output()
@@ -747,12 +776,25 @@ impl NetworkIptablesManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let msg = format!("{} {} failed: {}", command, args.join(" "), stderr);
-            logger.log_line(&msg);
-            return Err(msg);
+            return Err(Self::log_command_failure(command, args, &stderr, logger));
         }
 
         Ok(true)
+    }
+
+    /// Log a failed firewall command and return the message that becomes the
+    /// error. Shared by the real path and the test fake so a scripted failure
+    /// produces the same log line and error text as a genuine one, rather than
+    /// the fake reimplementing the format and drifting from it.
+    fn log_command_failure(
+        command: &str,
+        args: &[&str],
+        stderr: &str,
+        logger: &mut Logger,
+    ) -> String {
+        let msg = format!("{} {} failed: {}", command, args.join(" "), stderr);
+        logger.log_line(&msg);
+        msg
     }
 
     fn run_iptables_rule_args(args: &[Vec<String>], logger: &mut Logger) -> Result<(), String> {
@@ -1169,6 +1211,141 @@ impl Drop for NetworkIptablesManager {
     }
 }
 
+/// Test-only interception of this file's two process spawns.
+///
+/// Unit tests must not reach the real `iptables` binary. As root it would
+/// flush and delete whatever live chain answers to a colliding `MXC-<name>`,
+/// and a test that needs a command to *fail* would otherwise inherit that
+/// outcome from the host rather than arranging it -- so the same test passes
+/// on a machine without `iptables` and fails on one with it.
+///
+/// Interception is opt-in. A test that installs no fake behaves exactly as it
+/// did before this seam existed, so the ~70 tests in this file that never
+/// reach a firewall command are untouched.
+///
+/// The installed fake lives in thread-local storage because the firewall entry
+/// points are associated functions with no `self` to carry a runner, and
+/// because `cargo test` runs tests in parallel -- a process-global fake would
+/// have to be serialized behind a lock and would let one test observe
+/// another's commands.
+#[cfg(test)]
+mod test_firewall {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    struct State {
+        issued: Vec<Vec<String>>,
+        /// Outcome for the next commands, in order. An exhausted queue falls
+        /// back to `fallback`.
+        scripted: VecDeque<Result<(), String>>,
+        fallback: Result<(), String>,
+    }
+
+    thread_local! {
+        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    /// Installs the fake for the current thread and uninstalls it on drop.
+    ///
+    /// Declare the guard **before** any manager whose `Drop` tears down: locals
+    /// drop in reverse declaration order, so a guard declared first is still
+    /// installed while the manager runs its teardown.
+    pub(super) struct FakeFirewall;
+
+    /// Intercept every firewall command on this thread. Commands succeed and
+    /// the `ip6tables` probe reports the tool available, so a test that cares
+    /// about neither gets a deterministic dual-stack host.
+    pub(super) fn install() -> FakeFirewall {
+        STATE.with(|slot| {
+            *slot.borrow_mut() = Some(State {
+                issued: Vec::new(),
+                scripted: VecDeque::new(),
+                fallback: Ok(()),
+            });
+        });
+        FakeFirewall
+    }
+
+    impl Drop for FakeFirewall {
+        fn drop(&mut self) {
+            STATE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    impl FakeFirewall {
+        /// Every command from here on fails with `stderr`.
+        pub(super) fn fail_every_command(&self, stderr: &str) -> &Self {
+            Self::with_state(|state| state.fallback = Err(stderr.to_string()));
+            self
+        }
+
+        /// Every command issued so far, in order, each as `[binary, args..]`.
+        pub(super) fn issued(&self) -> Vec<Vec<String>> {
+            Self::with_state(|state| state.issued.clone())
+        }
+
+        /// Forget the commands issued so far, so a later assertion covers only
+        /// what was issued after this point.
+        pub(super) fn forget_issued(&self) -> &Self {
+            Self::with_state(|state| state.issued.clear());
+            self
+        }
+
+        fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> T {
+            STATE.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let state = slot
+                    .as_mut()
+                    .expect("the FakeFirewall guard must still be in scope");
+                f(state)
+            })
+        }
+    }
+
+    /// Record a command and return its scripted outcome, or `None` when no
+    /// fake is installed so the caller runs the real binary.
+    pub(super) fn intercept(command: &str, args: &[&str]) -> Option<Result<(), String>> {
+        STATE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let state = slot.as_mut()?;
+            let mut argv = Vec::with_capacity(args.len() + 1);
+            argv.push(command.to_string());
+            argv.extend(args.iter().map(|arg| arg.to_string()));
+            state.issued.push(argv);
+            Some(
+                state
+                    .scripted
+                    .pop_front()
+                    .unwrap_or_else(|| state.fallback.clone()),
+            )
+        })
+    }
+
+    /// The scripted result of the `ip6tables -S` probe, or `None` when no fake
+    /// is installed so the caller runs the real probe.
+    ///
+    /// A fake always reports the tool available. `classify_ip6tables_status`
+    /// maps `(true, _)` to `Available` without consulting the host's IPv6
+    /// state, so this is the one answer that makes the apply path independent
+    /// of the machine the test runs on. Reporting the probe as *failed* would
+    /// not be: the classification then turns on `/proc/net/if_inet6`, which
+    /// this seam does not fake. Those branches are covered by the pure-function
+    /// tests of `classify_ip6tables_status` instead.
+    ///
+    /// The probe is recorded like any other command so `issued` stays a
+    /// complete account of what the code under test would have run.
+    pub(super) fn intercept_ip6tables_probe() -> Option<bool> {
+        STATE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let state = slot.as_mut()?;
+            state
+                .issued
+                .push(vec!["ip6tables".to_string(), "-S".to_string()]);
+            Some(true)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1202,8 +1379,8 @@ mod tests {
         // is the only thing standing between a process that created nothing and
         // the chain of a concurrent start that did. Asserting the guard's
         // predicate in isolation would not catch its deletion, so this drives
-        // force_cleanup itself and uses the log as the observable — the teardown
-        // announces the chain by name before it touches anything.
+        // force_cleanup itself and observes the commands it issued.
+        let fake = test_firewall::install();
         let mut quiet = Logger::new(Mode::Buffer);
         NetworkIptablesManager::force_cleanup(
             "racer-that-lost",
@@ -1216,6 +1393,11 @@ mod tests {
             "",
             "a process holding no ownership must not begin a teardown at all"
         );
+        assert!(
+            fake.issued().is_empty(),
+            "...and must not issue a single command, got: {:?}",
+            fake.issued()
+        );
 
         // Positive control: the same call with one resource published does
         // reach the teardown, so the assertion above discriminates between the
@@ -1227,10 +1409,13 @@ mod tests {
             CreatedResources::for_test(true, false, false, false),
             &mut noisy,
         );
-        assert!(
-            noisy.get_buffer().contains("MXC-racer-that-won"),
-            "a published resource must be torn down, got: {:?}",
-            noisy.get_buffer()
+        assert_eq!(
+            fake.issued(),
+            vec![
+                strings(&["iptables", "-F", "MXC-racer-that-won"]),
+                strings(&["iptables", "-X", "MXC-racer-that-won"]),
+            ],
+            "only the published chain may be flushed and deleted, and only it"
         );
     }
 
@@ -1243,9 +1428,11 @@ mod tests {
         // floor strands the chain -- nothing afterward knows it was ours.
         //
         // Asserting rules_applied directly would only restate the assignment.
-        // This drives the downstream path instead and uses the log as the
-        // observable, because remove_firewall_rules announces the chain by name
-        // before touching anything and returns early when the gate is closed.
+        // This drives the downstream path instead and observes the commands it
+        // issued, since removing the chain is what the ownership is for.
+        let fake = test_firewall::install();
+        fake.fail_every_command("iptables: chain is not empty");
+
         let mut manager = NetworkIptablesManager::new("survivor");
         let retained = manager
             .retain_residual_ownership(CreatedResources::for_test(true, false, false, false));
@@ -1253,10 +1440,13 @@ mod tests {
 
         let mut after_partial = Logger::new(Mode::Buffer);
         let _ = manager.remove_firewall_rules(&mut after_partial);
-        assert!(
-            after_partial.get_buffer().contains("MXC-survivor"),
-            "a chain that survived rollback must still be torn down later, got: {:?}",
-            after_partial.get_buffer()
+        assert_eq!(
+            fake.issued(),
+            vec![
+                strings(&["iptables", "-F", "MXC-survivor"]),
+                strings(&["iptables", "-X", "MXC-survivor"]),
+            ],
+            "a chain that survived rollback must still be torn down later"
         );
 
         // Negative control: a rollback that removed everything leaves nothing
@@ -1264,6 +1454,7 @@ mod tests {
         // above would pass even if ownership were retained unconditionally,
         // which would resurrect the collision the ownership record exists to
         // prevent.
+        fake.forget_issued();
         let mut clean = NetworkIptablesManager::new("fully-rolled-back");
         let retained_clean = clean.retain_residual_ownership(CreatedResources::default());
         assert!(!retained_clean, "an empty residual must not be retained");
@@ -1274,6 +1465,11 @@ mod tests {
             after_clean.get_buffer(),
             "",
             "a fully rolled-back apply must not begin a teardown"
+        );
+        assert!(
+            fake.issued().is_empty(),
+            "...and must not issue a single command, got: {:?}",
+            fake.issued()
         );
     }
 
@@ -1286,6 +1482,9 @@ mod tests {
         // whose own removal command failed reports, and asserts the manager
         // adopts it. The observable is the same downstream one, because
         // teardown is what the ownership is for.
+        let fake = test_firewall::install();
+        fake.fail_every_command("iptables: chain is not empty");
+
         let mut manager = NetworkIptablesManager::new("adopted");
         let mut apply_log = Logger::new(Mode::Buffer);
         let outcome = Err((
@@ -1303,15 +1502,19 @@ mod tests {
 
         let mut teardown_log = Logger::new(Mode::Buffer);
         let _ = manager.remove_firewall_rules(&mut teardown_log);
-        assert!(
-            teardown_log.get_buffer().contains("MXC-adopted"),
-            "what the rollback could not remove must still be torn down later, got: {:?}",
-            teardown_log.get_buffer()
+        assert_eq!(
+            fake.issued(),
+            vec![
+                strings(&["iptables", "-F", "MXC-adopted"]),
+                strings(&["iptables", "-X", "MXC-adopted"]),
+            ],
+            "what the rollback could not remove must still be torn down later"
         );
 
         // Negative control: a rollback that removed everything must leave the
         // manager owning nothing, so the assertion above cannot be satisfied by
         // retaining unconditionally.
+        fake.forget_issued();
         let mut clean = NetworkIptablesManager::new("clean-failure");
         let mut clean_log = Logger::new(Mode::Buffer);
         let clean_result = clean.record_apply_outcome(
@@ -1332,6 +1535,11 @@ mod tests {
             after_clean.get_buffer(),
             "",
             "a failure that left nothing behind must not begin a teardown"
+        );
+        assert!(
+            fake.issued().is_empty(),
+            "...and must not issue a single command, got: {:?}",
+            fake.issued()
         );
     }
 
@@ -1392,30 +1600,72 @@ mod tests {
         // remove_firewall_rules used to clear rules_applied unconditionally, so
         // a teardown whose commands failed reported itself done while the chain
         // was still installed.  Drop is gated on the same flag, so that threw
-        // away the last retry.  On this host every iptables command fails, so a
-        // manager that owns something and is asked to remove it necessarily
-        // ends with a non-empty residual -- exactly the case that must stay
-        // owned.
+        // away the last retry.  The fake scripts the failure, so the test states
+        // its own precondition rather than depending on the host's iptables
+        // refusing the command -- which is what made this pass on a machine
+        // without iptables and fail on one with it.
+        let fake = test_firewall::install();
+        fake.fail_every_command("iptables: permission denied");
+
         let mut manager = NetworkIptablesManager::new("stubborn");
         manager.retain_residual_ownership(CreatedResources::for_test(true, false, false, false));
 
         let mut first = Logger::new(Mode::Buffer);
         let _ = manager.remove_firewall_rules(&mut first);
-        assert!(
-            first.get_buffer().contains("MXC-stubborn"),
-            "the first removal must attempt the teardown, got: {:?}",
-            first.get_buffer()
+        assert_eq!(
+            fake.issued(),
+            vec![
+                strings(&["iptables", "-F", "MXC-stubborn"]),
+                strings(&["iptables", "-X", "MXC-stubborn"]),
+            ],
+            "the first removal must attempt the teardown"
         );
 
-        // The observable for "still owned" is that a second removal still runs
-        // rather than short-circuiting on the gate.  That second call is what
-        // Drop makes.
+        // The observable for "still owned" is that a second removal still
+        // issues the commands rather than short-circuiting on the gate.  That
+        // second call is what Drop makes.
+        fake.forget_issued();
+        let mut second = Logger::new(Mode::Buffer);
+        let _ = manager.remove_firewall_rules(&mut second);
+        assert_eq!(
+            fake.issued(),
+            vec![
+                strings(&["iptables", "-F", "MXC-stubborn"]),
+                strings(&["iptables", "-X", "MXC-stubborn"]),
+            ],
+            "a removal that failed must leave the chain owned so Drop retries it"
+        );
+    }
+
+    #[test]
+    fn a_removal_whose_commands_all_succeeded_releases_ownership() {
+        // The mirror of the test above, and the arm that could not be reached
+        // before the fake existed: `-X` is what actually relinquishes the
+        // chain, so a teardown whose commands all succeed must clear the gate
+        // and leave Drop nothing to retry.  Without it, "still owned after a
+        // failure" would be satisfied by never releasing ownership at all.
+        let fake = test_firewall::install();
+        let mut manager = NetworkIptablesManager::new("released");
+        manager.retain_residual_ownership(CreatedResources::for_test(true, false, false, false));
+
+        let mut first = Logger::new(Mode::Buffer);
+        let _ = manager.remove_firewall_rules(&mut first);
+        assert_eq!(
+            fake.issued(),
+            vec![
+                strings(&["iptables", "-F", "MXC-released"]),
+                strings(&["iptables", "-X", "MXC-released"]),
+            ],
+            "the teardown must flush the chain and then delete it"
+        );
+
+        fake.forget_issued();
         let mut second = Logger::new(Mode::Buffer);
         let _ = manager.remove_firewall_rules(&mut second);
         assert!(
-            second.get_buffer().contains("MXC-stubborn"),
-            "a removal that failed must leave the chain owned so Drop retries it, got: {:?}",
-            second.get_buffer()
+            fake.issued().is_empty(),
+            "a chain whose -X succeeded is no longer ours to remove, got: {:?}",
+            fake.issued()
         );
     }
 
@@ -1426,6 +1676,11 @@ mod tests {
         // something would drop the earlier record and strand whatever it named.
         // Refusing makes that unreachable instead of relying on callers to
         // build a fresh manager each time.
+        //
+        // The fake is declared first so it outlives `manager`: locals drop in
+        // reverse declaration order, and this manager still owns a chain, so
+        // its Drop runs a teardown that must not reach the real binary.
+        let _fake = test_firewall::install();
         let mut manager = NetworkIptablesManager::new("already-owned");
         manager.retain_residual_ownership(CreatedResources::for_test(true, false, false, false));
 
@@ -1447,9 +1702,12 @@ mod tests {
     #[test]
     fn a_manager_that_owns_nothing_still_reaches_the_apply_path() {
         // Negative control for the guard above: it must key on live ownership,
-        // not refuse every apply.  On this host the commands themselves fail,
-        // so the observable is that the attempt was made at all rather than
-        // short-circuited by the guard.
+        // not refuse every apply.  The observable is that the apply actually
+        // issued its chain-creation commands rather than short-circuiting.
+        //
+        // The fake is declared first so it outlives `manager`, whose Drop tears
+        // down the chains this apply creates.
+        let fake = test_firewall::install();
         let mut manager = NetworkIptablesManager::new("fresh");
         let policy = policy_with_enforcement_mode(NetworkEnforcementMode::Firewall);
         let mut logger = Logger::new(Mode::Buffer);
@@ -1462,10 +1720,16 @@ mod tests {
                 e
             );
         }
+        let issued = fake.issued();
         assert!(
-            logger.get_buffer().contains("MXC-fresh"),
-            "the apply must actually run its commands, got: {:?}",
-            logger.get_buffer()
+            issued.contains(&strings(&["iptables", "-N", "MXC-fresh"])),
+            "the apply must create the IPv4 chain, got: {:?}",
+            issued
+        );
+        assert!(
+            issued.contains(&strings(&["ip6tables", "-N", "MXC-fresh"])),
+            "a host whose ip6tables probe succeeds must get the parallel v6 chain, got: {:?}",
+            issued
         );
     }
 
