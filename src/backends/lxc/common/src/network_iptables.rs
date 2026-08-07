@@ -48,7 +48,7 @@ pub(crate) struct CreatedFirewallState {
 /// itself. One ownership flag covers the pair.
 const HOOKS: &[&str] = &["FORWARD", "INPUT"];
 
-/// Attempt `remove` for every hook and report whether all of them succeeded.
+/// Attempt `remove` for every hook and report whether all of them are *gone*.
 ///
 /// Deliberately not `Iterator::all`, which stops at the first failure. One flag
 /// covers the whole pair, so a short-circuit means a failed FORWARD delete
@@ -58,18 +58,64 @@ const HOOKS: &[&str] = &["FORWARD", "INPUT"];
 /// of the host, and it is the hook covering traffic addressed to the host
 /// itself.
 ///
-/// A `-D` for a hook that is already gone is a harmless no-op: it is scoped to
-/// this container's own veth, so it cannot match another container's rule.
-/// Attempting all of them costs nothing and is the only way the second one is
-/// reached.
-fn remove_every_hook(hooks: &[&str], mut remove: impl FnMut(&str) -> bool) -> bool {
+/// Absence, not the delete's exit code, is what clears the flag. Ownership is
+/// published *before* the insert that creates a hook, so the record routinely
+/// names a hook whose `-I` then failed, and `-D` for a rule that was never
+/// installed fails too. Clearing only on a successful delete leaves such a flag
+/// set forever: every retry re-runs a delete that cannot succeed, the chain
+/// stays owned but unremovable, and `Drop` never converges. So a delete that
+/// failed is followed by an existence check, and a hook that is not there
+/// counts as removed.
+///
+/// Per-hook ownership flags would not fix this on their own -- a flag published
+/// ahead of a failed `-I` sticks exactly the same way -- which is why the seam
+/// is the existence check rather than the shape of the record.
+///
+/// The check is scoped to this container's own veth *and* its own chain name,
+/// so it cannot observe or clear a colliding container's hook.
+fn remove_every_hook(
+    hooks: &[&str],
+    mut remove: impl FnMut(&str) -> bool,
+    mut still_present: impl FnMut(&str) -> bool,
+) -> bool {
     let mut all_removed = true;
     for hook in hooks {
-        if !remove(hook) {
+        if remove(hook) {
+            continue;
+        }
+        if still_present(hook) {
             all_removed = false;
         }
     }
     all_removed
+}
+
+/// Flush and delete the chain, reporting whether it is still owned afterward.
+///
+/// `hooks_remain` gates the entire step, flush included. That ordering is the
+/// point of the function: a hook that survived its own delete still jumps to
+/// this chain, and a flushed chain returns to the caller instead of reaching
+/// its closing DROP. Flushing first would therefore fail a still-running
+/// container open, and `-X` would fail anyway because iptables refuses to
+/// delete a referenced chain -- so the flush buys nothing and costs the
+/// container its filtering. Leaving the chain populated keeps the intermediate
+/// state fail closed, and returning `true` keeps it published so a later pass
+/// retries.
+fn teardown_chain(
+    created_chain: bool,
+    hooks_remain: bool,
+    logger: &mut Logger,
+    mut flush: impl FnMut(&mut Logger),
+    mut delete: impl FnMut(&mut Logger) -> bool,
+) -> bool {
+    if !created_chain {
+        return false;
+    }
+    if hooks_remain {
+        return true;
+    }
+    flush(logger);
+    !delete(logger)
 }
 
 impl CreatedFirewallState {
@@ -299,6 +345,23 @@ impl NetworkIptablesManager {
         }
 
         Ok(true)
+    }
+
+    /// Whether a rule is still installed, asked with `-C`.
+    ///
+    /// `iptables -C` exits 0 when the rule is present and 1 when it is not.
+    /// Any other exit code, or a failure to run the binary at all, means the
+    /// question was not answered -- and an unanswered question must read as
+    /// "still installed". The opposite default would let a broken, missing, or
+    /// permission-denied iptables report a live hook as gone, clearing its
+    /// ownership and letting the caller flush a chain something still jumps
+    /// to. Being wrong in this direction only costs a retry.
+    fn rule_is_installed(command: &str, args: &[&str]) -> bool {
+        match Command::new(command).args(args).output() {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => output.status.code() != Some(1),
+            Err(_) => true,
+        }
     }
 
     fn run_iptables_args(args: &[String], logger: &mut Logger) -> Result<bool, String> {
@@ -1011,10 +1074,22 @@ impl NetworkIptablesManager {
                 residual.v4_dhcp = false;
             }
             if created.v4_hooks {
-                let removed = remove_every_hook(HOOKS, |hook| {
-                    Self::run_iptables(&["-D", hook, "-i", iface, "-j", &self.chain_name], logger)
+                let removed = remove_every_hook(
+                    HOOKS,
+                    |hook| {
+                        Self::run_iptables(
+                            &["-D", hook, "-i", iface, "-j", &self.chain_name],
+                            logger,
+                        )
                         .is_ok()
-                });
+                    },
+                    |hook| {
+                        Self::rule_is_installed(
+                            "iptables",
+                            &["-C", hook, "-i", iface, "-j", &self.chain_name],
+                        )
+                    },
+                );
                 if removed {
                     residual.v4_hooks = false;
                 }
@@ -1031,10 +1106,22 @@ impl NetworkIptablesManager {
                 residual.v6_dhcp = false;
             }
             if created.v6_hooks {
-                let removed = remove_every_hook(HOOKS, |hook| {
-                    Self::run_ip6tables(&["-D", hook, "-i", iface, "-j", &self.chain_name], logger)
+                let removed = remove_every_hook(
+                    HOOKS,
+                    |hook| {
+                        Self::run_ip6tables(
+                            &["-D", hook, "-i", iface, "-j", &self.chain_name],
+                            logger,
+                        )
                         .is_ok()
-                });
+                    },
+                    |hook| {
+                        Self::rule_is_installed(
+                            "ip6tables",
+                            &["-C", hook, "-i", iface, "-j", &self.chain_name],
+                        )
+                    },
+                );
                 if removed {
                     residual.v6_hooks = false;
                 }
@@ -1042,19 +1129,27 @@ impl NetworkIptablesManager {
         }
 
         // Flush and delete the chains. `-X` is the command that actually
-        // relinquishes the chain, so ownership is only cleared when it succeeds.
-        if created.v4_chain {
-            let _ = Self::run_iptables(&["-F", &self.chain_name], logger);
-            if Self::run_iptables(&["-X", &self.chain_name], logger).is_ok() {
-                residual.v4_chain = false;
-            }
-        }
-        if created.v6_chain {
-            let _ = Self::run_ip6tables(&["-F", &self.chain_name], logger);
-            if Self::run_ip6tables(&["-X", &self.chain_name], logger).is_ok() {
-                residual.v6_chain = false;
-            }
-        }
+        // relinquishes the chain, so ownership is only cleared when it succeeds,
+        // and neither command runs while a hook still points at the chain --
+        // see `teardown_chain`.
+        residual.v4_chain = teardown_chain(
+            created.v4_chain,
+            residual.v4_hooks,
+            logger,
+            |log| {
+                let _ = Self::run_iptables(&["-F", &self.chain_name], log);
+            },
+            |log| Self::run_iptables(&["-X", &self.chain_name], log).is_ok(),
+        );
+        residual.v6_chain = teardown_chain(
+            created.v6_chain,
+            residual.v6_hooks,
+            logger,
+            |log| {
+                let _ = Self::run_ip6tables(&["-F", &self.chain_name], log);
+            },
+            |log| Self::run_ip6tables(&["-X", &self.chain_name], log).is_ok(),
+        );
 
         Self::publish_created(&residual);
         residual
@@ -1606,10 +1701,14 @@ mod tests {
         // reaches the second.  INPUT carries traffic addressed to the host
         // itself, so leaking it is the hole the chain exists to close.
         let mut attempted = Vec::new();
-        let all_removed = remove_every_hook(HOOKS, |hook| {
-            attempted.push(hook.to_string());
-            false
-        });
+        let all_removed = remove_every_hook(
+            HOOKS,
+            |hook| {
+                attempted.push(hook.to_string());
+                false
+            },
+            |_| true,
+        );
 
         assert_eq!(
             attempted,
@@ -1626,25 +1725,142 @@ mod tests {
     fn ownership_is_given_up_only_when_every_hook_was_removed() {
         let mut attempted = Vec::new();
         assert!(
-            remove_every_hook(HOOKS, |hook| {
-                attempted.push(hook.to_string());
-                true
-            }),
+            remove_every_hook(
+                HOOKS,
+                |hook| {
+                    attempted.push(hook.to_string());
+                    true
+                },
+                |_| true
+            ),
             "every hook was removed, so the flag must clear"
         );
         assert_eq!(attempted.len(), 2);
 
         // The mixed case is the one that motivated this: FORWARD succeeds,
-        // INPUT does not.  The pair is not fully removed, so the flag stays.
+        // INPUT does not, and INPUT is still installed.  The pair is not fully
+        // removed, so the flag stays.
         let mut seen = Vec::new();
         assert!(
-            !remove_every_hook(HOOKS, |hook| {
-                seen.push(hook.to_string());
-                hook == "FORWARD"
-            }),
+            !remove_every_hook(
+                HOOKS,
+                |hook| {
+                    seen.push(hook.to_string());
+                    hook == "FORWARD"
+                },
+                |_| true
+            ),
             "a half-removed pair must not report itself removed"
         );
         assert_eq!(seen, vec!["FORWARD".to_string(), "INPUT".to_string()]);
+    }
+
+    #[test]
+    fn a_hook_that_was_never_installed_does_not_hold_ownership_forever() {
+        // Ownership is published before the `-I` that installs a hook, to close
+        // the window in which a signal would find the rule unpublished.  The
+        // cost is that the record can name a hook whose insert then failed, and
+        // `-D` for a rule that was never installed fails too.
+        //
+        // Clearing only on a successful delete strands exactly that case: the
+        // flag stays set, so the chain is never flushed or deleted, and every
+        // later pass re-runs a delete that cannot succeed.  Nothing converges
+        // and the chain leaks for the life of the host.  What matters is that
+        // the hook is absent, not how it came to be absent.
+        assert!(
+            remove_every_hook(HOOKS, |_| false, |_| false),
+            "hooks that are not installed must not hold ownership open"
+        );
+
+        // The mixed case a rollback actually produces: FORWARD was installed
+        // and deletes cleanly, INPUT never got installed because its insert is
+        // what failed.
+        assert!(
+            remove_every_hook(HOOKS, |hook| hook == "FORWARD", |hook| hook != "INPUT"),
+            "a rollback of a partly installed pair must converge"
+        );
+
+        // Negative control: a delete that failed on a hook that is still there
+        // must still hold ownership, or teardown would abandon a live hook.
+        assert!(
+            !remove_every_hook(HOOKS, |_| false, |hook| hook == "INPUT"),
+            "a hook that survived its delete must keep ownership"
+        );
+    }
+
+    #[test]
+    fn a_chain_is_not_flushed_while_a_hook_still_points_at_it() {
+        // The flush is the dangerous half. `-X` failing on a referenced chain is
+        // harmless -- the chain stays and stays owned -- but `-F` succeeds
+        // regardless of who points at the chain, and an empty user chain returns
+        // to the caller instead of hitting the closing DROP. A container whose
+        // hook survived teardown would keep running with the jump intact and
+        // nothing behind it, which is the fail-open the chain exists to prevent.
+        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+        let mut flushed = false;
+        let mut deleted = false;
+        let still_owned = teardown_chain(
+            true,
+            true,
+            &mut logger,
+            |_| flushed = true,
+            |_| {
+                deleted = true;
+                true
+            },
+        );
+
+        assert!(!flushed, "a referenced chain must not be flushed");
+        assert!(!deleted, "a referenced chain must not be deleted");
+        assert!(
+            still_owned,
+            "a chain that could not be torn down must stay published for a retry"
+        );
+    }
+
+    #[test]
+    fn a_chain_is_torn_down_once_its_hooks_are_gone() {
+        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+        let order = std::cell::RefCell::new(Vec::new());
+        let still_owned = teardown_chain(
+            true,
+            false,
+            &mut logger,
+            |_| order.borrow_mut().push("flush"),
+            |_| {
+                order.borrow_mut().push("delete");
+                true
+            },
+        );
+
+        assert_eq!(order.into_inner(), vec!["flush", "delete"]);
+        assert!(!still_owned, "a deleted chain must give up ownership");
+
+        // A delete that failed keeps the chain owned so a later pass retries it.
+        let mut retry_logger = Logger::new(wxc_common::logger::Mode::Buffer);
+        assert!(
+            teardown_chain(true, false, &mut retry_logger, |_| {}, |_| false),
+            "a chain whose -X failed is still ours"
+        );
+
+        // Negative control: a chain this manager never created is never touched,
+        // because the name may by now answer for a different container.
+        let mut untouched_logger = Logger::new(wxc_common::logger::Mode::Buffer);
+        let touched = std::cell::Cell::new(false);
+        assert!(!teardown_chain(
+            false,
+            false,
+            &mut untouched_logger,
+            |_| touched.set(true),
+            |_| {
+                touched.set(true);
+                true
+            }
+        ));
+        assert!(
+            !touched.get(),
+            "a chain we did not create must not be touched"
+        );
     }
 
     #[test]
