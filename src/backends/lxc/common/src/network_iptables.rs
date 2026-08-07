@@ -412,23 +412,65 @@ impl NetworkIptablesManager {
         // stayed referenced, the `-X` below failed too and the whole chain
         // leaked. Enumerating FORWARD and deleting by the `-j <chain>` target
         // removes exactly what was installed.
-        self.remove_forward_hooks(logger);
-
-        // Flush and delete the chain. `-X` is the command that relinquishes the
-        // chain, so it also decides whether this process still owns it. Telling
-        // the watchdog we no longer own it is only safe once `-X` has succeeded:
-        // chain names truncate to 20 characters and can collide, so a bit left
-        // set after a successful teardown lets a later signal strip the firewall
-        // off whichever live container has since claimed the name, while a bit
-        // cleared after a failed one leaks a chain nobody will remove.
-        let _ = Self::run_iptables(&["-F", &self.chain_name], logger);
-        if Self::run_iptables(&["-X", &self.chain_name], logger).is_ok() {
+        //
+        // Flush and delete only once FORWARD is confirmed free of jumps to this
+        // chain. `-F` succeeds whether or not anything still jumps here, and an
+        // emptied user chain returns to its caller instead of reaching its own
+        // closing DROP -- so flushing a chain that is still hooked converts a
+        // filtered container into an unfiltered one. Leaving the chain intact
+        // costs a leaked chain that still filters correctly, which a later
+        // teardown reclaims.
+        let chain = self.chain_name.clone();
+        let hooks_are_gone = self.remove_forward_hooks(logger);
+        let relinquished = Self::teardown_chain(&chain, hooks_are_gone, &mut |args| {
+            Self::run_iptables(args, logger).is_ok()
+        });
+        if relinquished {
             self.chain_created = false;
             crate::signal_cleanup::clear_active_chain_created();
+        } else if !hooks_are_gone {
+            logger.log_line(&format!(
+                "Leaving chain {} in place: FORWARD still jumps to it, and flushing a hooked \
+                 chain would let traffic through it unfiltered",
+                chain
+            ));
         }
 
         self.rules_applied = false;
         Ok(())
+    }
+
+    /// Flush and delete `chain`, but only once its hooks are confirmed gone.
+    /// Returns whether the chain was relinquished.
+    ///
+    /// Flushing is the dangerous half of teardown. `-F` succeeds whether or not
+    /// anything still jumps to the chain, and an emptied user chain returns to
+    /// its caller instead of reaching its own closing DROP -- so flushing a
+    /// chain that is still hooked converts a filtered container into an
+    /// unfiltered one, silently, with no error to notice. Deleting is the safe
+    /// half: `-X` on a still-referenced chain simply fails, and the chain stays
+    /// owned and filtering for a later teardown to retry.
+    ///
+    /// `-X` is also what decides ownership. Clearing the created bit is only
+    /// safe once `-X` has succeeded: chain names truncate to 20 characters and
+    /// can collide, so a bit left set after a successful teardown lets a later
+    /// signal strip the firewall off whichever live container has since claimed
+    /// the name, while a bit cleared after a failed one leaks a chain nobody
+    /// will remove.
+    ///
+    /// Split from process execution so the ordering has an oracle. Every
+    /// iptables command fails at spawn on a non-Linux host, so a test that drove
+    /// the real path could never observe a flush at all.
+    fn teardown_chain(
+        chain: &str,
+        hooks_are_gone: bool,
+        run: &mut impl FnMut(&[&str]) -> bool,
+    ) -> bool {
+        if !hooks_are_gone {
+            return false;
+        }
+        let _ = run(&["-F", chain]);
+        run(&["-X", chain])
     }
 
     /// Delete every rule in the FORWARD chain that jumps to this manager's
@@ -439,15 +481,41 @@ impl NetworkIptablesManager {
     /// or was never discovered. If FORWARD cannot be read (no privilege, no
     /// iptables) it is a no-op — there is nothing this process can safely delete
     /// without the ruleset.
-    fn remove_forward_hooks(&self, logger: &mut Logger) {
-        let output = match Command::new("iptables").args(["-S", "FORWARD"]).output() {
-            Ok(o) if o.status.success() => o,
-            _ => return,
+    ///
+    /// Returns whether FORWARD is now free of jumps to this chain. That verdict
+    /// gates the `-F` that follows, because flushing is the dangerous half of
+    /// teardown: an emptied user chain returns to its caller instead of reaching
+    /// its own closing DROP, so a chain that is still hooked but no longer
+    /// filtering is a fail-open. Deleting is the safe half -- `-X` on a still
+    /// referenced chain simply fails and the chain stays, owned and filtering,
+    /// for a later teardown to retry.
+    ///
+    /// An unreadable FORWARD (no privilege, no iptables) answers `false`: the
+    /// question was not answered, so it is read as still hooked. Being wrong
+    /// that way costs a retry; being wrong the other way unfilters a live
+    /// container.
+    fn remove_forward_hooks(&self, logger: &mut Logger) -> bool {
+        let Some(dump) = Self::read_forward_chain() else {
+            return false;
         };
-        let dump = String::from_utf8_lossy(&output.stdout);
         for deletion in Self::forward_hook_deletions(&dump, &self.chain_name) {
             let args: Vec<&str> = deletion.iter().map(String::as_str).collect();
             let _ = Self::run_iptables(&args, logger);
+        }
+        // Re-read rather than trust the deletes. A `-D` can fail for a rule
+        // another process is also tearing down, and the exit code does not say
+        // whether the rule is gone -- only whether this call removed it.
+        match Self::read_forward_chain() {
+            Some(after) => Self::forward_hook_deletions(&after, &self.chain_name).is_empty(),
+            None => false,
+        }
+    }
+
+    /// Read `iptables -S FORWARD`, or `None` when the ruleset cannot be read.
+    fn read_forward_chain() -> Option<String> {
+        match Command::new("iptables").args(["-S", "FORWARD"]).output() {
+            Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+            _ => None,
         }
     }
 
@@ -518,6 +586,59 @@ mod chainname_spec_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records the iptables commands `teardown_chain` issued, failing whichever
+    /// commands `failing_verbs` names by their leading flag.
+    fn teardown_calls(hooks_are_gone: bool, failing_verbs: &[&str]) -> (Vec<String>, bool) {
+        let issued = std::cell::RefCell::new(Vec::new());
+        let relinquished =
+            NetworkIptablesManager::teardown_chain("MXC-c", hooks_are_gone, &mut |args| {
+                issued.borrow_mut().push(args.join(" "));
+                !failing_verbs.contains(&args[0])
+            });
+        (issued.into_inner(), relinquished)
+    }
+
+    #[test]
+    fn a_chain_that_is_still_hooked_is_never_flushed() {
+        // Flushing is the dangerous half of teardown. `-F` succeeds whether or
+        // not anything still jumps to the chain, and an emptied user chain
+        // returns to its caller instead of reaching its own closing DROP -- so
+        // flushing a chain that is still hooked turns a filtered container into
+        // an unfiltered one, with no error raised to notice it.
+        let (issued, relinquished) = teardown_calls(false, &[]);
+        assert!(
+            issued.is_empty(),
+            "nothing may run against a chain FORWARD still jumps to, got: {:?}",
+            issued
+        );
+        assert!(
+            !relinquished,
+            "a chain that was never deleted must not be reported as relinquished"
+        );
+    }
+
+    #[test]
+    fn a_chain_whose_hooks_are_gone_is_flushed_then_deleted() {
+        // The negative control: once nothing jumps to the chain, flushing is
+        // safe and teardown must actually happen. Without this, "never flush"
+        // would pass the test above while leaking every chain.
+        let (issued, relinquished) = teardown_calls(true, &[]);
+        assert_eq!(issued, vec!["-F MXC-c".to_string(), "-X MXC-c".to_string()]);
+        assert!(relinquished, "a successful -X relinquishes the chain");
+    }
+
+    #[test]
+    fn a_chain_that_could_not_be_deleted_is_not_reported_as_relinquished() {
+        // `-X` is what decides ownership. Chain names truncate to 20 characters
+        // and can collide, so clearing the created bit after a failed delete
+        // leaks a chain nobody will remove -- and setting it after a successful
+        // one lets a later signal strip the firewall off whichever live
+        // container has since claimed the name.
+        let (issued, relinquished) = teardown_calls(true, &["-X"]);
+        assert_eq!(issued, vec!["-F MXC-c".to_string(), "-X MXC-c".to_string()]);
+        assert!(!relinquished);
+    }
 
     #[test]
     fn chain_name_sanitization() {

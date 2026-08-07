@@ -104,6 +104,34 @@ fn rollback_plan(rollback: SignalRollback, chain_created: bool) -> Vec<RollbackS
     plan
 }
 
+/// Runs `plan`, asking `run_step` to perform each step and report whether it
+/// succeeded.
+///
+/// A failed `StopContainer` abandons the rest of the plan. The steps after it
+/// exist to clean up a container that is no longer running, and the only one
+/// that follows it is `RemoveFirewall` -- so continuing would strip the egress
+/// chain off a container that is still up, which is precisely the state the
+/// ordering above exists to prevent. Ordering alone does not achieve that;
+/// `lxc-stop` can fail, and then the order it ran in no longer matters.
+///
+/// Stopping is the only gate. In a `DestroyContainer` plan nothing precedes
+/// `RemoveFirewall`, and `DestroyContainer` is last, so neither can be reached
+/// with a container left running behind it.
+///
+/// Bailing out leaks the chain rather than exposing the container, which is the
+/// same trade the ordinary stop path already makes deliberately: it propagates
+/// the stop error and leaves the rules in place rather than unfilter a
+/// still-running container (`state_aware.rs`, `stop`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn execute_rollback(plan: &[RollbackStep], run_step: &mut impl FnMut(RollbackStep) -> bool) {
+    for &step in plan {
+        let ok = run_step(step);
+        if !ok && step == RollbackStep::StopContainer {
+            return;
+        }
+    }
+}
+
 /// What the watchdog needs to roll back on a fatal signal: the container
 /// name (so we can `lxc-destroy` it) plus, when known, the host-side veth
 /// interface (so we can also remove the iptables FORWARD hook the runner
@@ -289,23 +317,19 @@ fn run_watchdog(mask: SigSet) -> ! {
             // host's stdio. The order comes from `rollback_plan`, which is
             // where the reasoning about it lives.
             let mut buf_logger = Logger::new(Mode::Buffer);
-            for step in rollback_plan(active.rollback, active.chain_created) {
-                match step {
-                    RollbackStep::StopContainer => {
-                        let _ = LxcContainer::new(&name, None).stop();
-                    }
-                    RollbackStep::RemoveFirewall => {
-                        NetworkIptablesManager::force_cleanup(
-                            &name,
-                            active.veth.as_deref(),
-                            &mut buf_logger,
-                        );
-                    }
-                    RollbackStep::DestroyContainer => {
-                        let _ = LxcContainer::new(&name, None).destroy();
-                    }
+            let plan = rollback_plan(active.rollback, active.chain_created);
+            execute_rollback(&plan, &mut |step| match step {
+                RollbackStep::StopContainer => LxcContainer::new(&name, None).stop().is_ok(),
+                RollbackStep::RemoveFirewall => {
+                    NetworkIptablesManager::force_cleanup(
+                        &name,
+                        active.veth.as_deref(),
+                        &mut buf_logger,
+                    );
+                    true
                 }
-            }
+                RollbackStep::DestroyContainer => LxcContainer::new(&name, None).destroy().is_ok(),
+            });
         }
         std::process::exit(128 + sig as i32);
     }
@@ -314,6 +338,65 @@ fn run_watchdog(mask: SigSet) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records the steps `execute_rollback` actually ran, failing whichever
+    /// steps `failing` names.
+    fn run_plan(plan: &[RollbackStep], failing: &[RollbackStep]) -> Vec<RollbackStep> {
+        let mut ran = Vec::new();
+        execute_rollback(plan, &mut |step| {
+            ran.push(step);
+            !failing.contains(&step)
+        });
+        ran
+    }
+
+    #[test]
+    fn a_stop_that_failed_does_not_unfilter_the_container_anyway() {
+        // Ordering the stop first is not enough on its own: `lxc-stop` can
+        // fail, and then removing the firewall next leaves a running container
+        // with no egress policy -- the exact state the ordering exists to
+        // prevent, reached by a different route. The rollback must abandon the
+        // rest of the plan instead.
+        //
+        // Leaking the chain is the correct trade here, and the ordinary stop
+        // path already makes it deliberately: it propagates the stop error and
+        // leaves the rules in place rather than unfilter a still-running
+        // container (`state_aware.rs`, `stop`).
+        let plan = rollback_plan(SignalRollback::NetworkOnly, true);
+        assert_eq!(
+            run_plan(&plan, &[RollbackStep::StopContainer]),
+            vec![RollbackStep::StopContainer],
+            "a failed stop must not be followed by removing the firewall"
+        );
+    }
+
+    #[test]
+    fn a_stop_that_succeeded_still_removes_the_firewall() {
+        // The negative control for the test above. Bailing out is only correct
+        // when the stop actually failed; a rollback that never removed the
+        // firewall would leak the chain on every signal, so "always bail" must
+        // not pass.
+        let plan = rollback_plan(SignalRollback::NetworkOnly, true);
+        assert_eq!(
+            run_plan(&plan, &[]),
+            vec![RollbackStep::StopContainer, RollbackStep::RemoveFirewall],
+            "a successful stop must still be followed by removing the firewall"
+        );
+    }
+
+    #[test]
+    fn a_destroy_rollback_removes_the_firewall_even_though_nothing_stopped_first() {
+        // The gate is specific to a failed stop. Nothing precedes
+        // `RemoveFirewall` in a destroy plan, so it can never run behind a
+        // container that is still up, and a failed `destroy` has nothing after
+        // it to suppress. Gating on any failure at all would break this path.
+        let plan = rollback_plan(SignalRollback::DestroyContainer, true);
+        assert_eq!(
+            run_plan(&plan, &[RollbackStep::DestroyContainer]),
+            vec![RollbackStep::RemoveFirewall, RollbackStep::DestroyContainer],
+            "a destroy rollback must still remove the firewall it created"
+        );
+    }
 
     #[test]
     fn a_state_aware_rollback_stops_the_container_before_unfiltering_it() {
