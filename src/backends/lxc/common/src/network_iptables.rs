@@ -786,7 +786,24 @@ impl NetworkIptablesManager {
             ));
         }
 
-        match self.apply_firewall_rules_inner(policy, logger) {
+        let outcome = self.apply_firewall_rules_inner(policy, logger);
+        self.record_apply_outcome(outcome, logger)
+    }
+
+    /// Record what an apply attempt left behind and turn it into the public
+    /// result.
+    ///
+    /// Split out from [`Self::apply_firewall_rules`] so a test can drive the
+    /// failure arm directly. On a real host the inner call fails on its very
+    /// first command, which rolls back nothing and so never produces the
+    /// residual this arm exists to adopt -- the branch that matters is the one
+    /// that is hardest to reach by accident.
+    fn record_apply_outcome(
+        &mut self,
+        outcome: Result<CreatedResources, (String, CreatedResources)>,
+        logger: &mut Logger,
+    ) -> Result<bool, String> {
+        match outcome {
             Ok(created) => {
                 self.created = created;
                 self.rules_applied = true;
@@ -1221,6 +1238,64 @@ mod tests {
             after_clean.get_buffer(),
             "",
             "a fully rolled-back apply must not begin a teardown"
+        );
+    }
+
+    #[test]
+    fn a_failed_apply_adopts_the_residual_its_rollback_left_behind() {
+        // The test above starts from an already-retained residual, so it proves
+        // only that ownership works once held -- it would still pass if the
+        // failure arm threw the residual away before getting there. This one
+        // drives that arm: it hands the recording step exactly what a rollback
+        // whose own removal command failed reports, and asserts the manager
+        // adopts it. The observable is the same downstream one, because
+        // teardown is what the ownership is for.
+        let mut manager = NetworkIptablesManager::new("adopted");
+        let mut apply_log = Logger::new(Mode::Buffer);
+        let outcome = Err((
+            "append failed".to_string(),
+            CreatedResources::for_test(true, false, false, false),
+        ));
+        let result = manager.record_apply_outcome(outcome, &mut apply_log);
+
+        assert!(result.is_err(), "a failed apply must still report failure");
+        assert!(
+            apply_log.get_buffer().contains("retained ownership"),
+            "a failed rollback must be reported as retained, not as clean, got: {:?}",
+            apply_log.get_buffer()
+        );
+
+        let mut teardown_log = Logger::new(Mode::Buffer);
+        let _ = manager.remove_firewall_rules(&mut teardown_log);
+        assert!(
+            teardown_log.get_buffer().contains("MXC-adopted"),
+            "what the rollback could not remove must still be torn down later, got: {:?}",
+            teardown_log.get_buffer()
+        );
+
+        // Negative control: a rollback that removed everything must leave the
+        // manager owning nothing, so the assertion above cannot be satisfied by
+        // retaining unconditionally.
+        let mut clean = NetworkIptablesManager::new("clean-failure");
+        let mut clean_log = Logger::new(Mode::Buffer);
+        let clean_result = clean.record_apply_outcome(
+            Err(("boom".to_string(), CreatedResources::default())),
+            &mut clean_log,
+        );
+
+        assert!(clean_result.is_err());
+        assert!(
+            clean_log.get_buffer().contains("rolled back"),
+            "a complete rollback must be reported as clean, got: {:?}",
+            clean_log.get_buffer()
+        );
+
+        let mut after_clean = Logger::new(Mode::Buffer);
+        let _ = clean.remove_firewall_rules(&mut after_clean);
+        assert_eq!(
+            after_clean.get_buffer(),
+            "",
+            "a failure that left nothing behind must not begin a teardown"
         );
     }
 
