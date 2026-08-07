@@ -24,6 +24,7 @@ use nix::sys::signal::{SigSet, Signal};
 
 #[cfg(target_os = "linux")]
 use crate::lxc_bindings::LxcContainer;
+use crate::network_iptables::CreatedResources;
 #[cfg(target_os = "linux")]
 use crate::network_iptables::NetworkIptablesManager;
 #[cfg(target_os = "linux")]
@@ -85,17 +86,17 @@ enum RollbackStep {
 /// derive from the container name and truncate to 20 characters, so the name
 /// may by now answer for a different, live container.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn rollback_plan(rollback: SignalRollback, chain_created: bool) -> Vec<RollbackStep> {
+fn rollback_plan(rollback: SignalRollback, owns_firewall: bool) -> Vec<RollbackStep> {
     let mut plan = Vec::new();
     match rollback {
         SignalRollback::NetworkOnly => {
             plan.push(RollbackStep::StopContainer);
-            if chain_created {
+            if owns_firewall {
                 plan.push(RollbackStep::RemoveFirewall);
             }
         }
         SignalRollback::DestroyContainer => {
-            if chain_created {
+            if owns_firewall {
                 plan.push(RollbackStep::RemoveFirewall);
             }
             plan.push(RollbackStep::DestroyContainer);
@@ -133,9 +134,14 @@ fn execute_rollback(plan: &[RollbackStep], run_step: &mut impl FnMut(RollbackSte
 }
 
 /// What the watchdog needs to roll back on a fatal signal: the container
-/// name (so we can `lxc-destroy` it) plus, when known, the host-side veth
-/// interface (so we can also remove the iptables FORWARD hook the runner
-/// installed against it).
+/// name (so we can `lxc-destroy` it), the host-side veth interface when
+/// known (so we can also remove the iptables FORWARD hook the runner
+/// installed against it), and the set of chains and hooks the runner has
+/// actually created so far (so we remove only those).
+///
+/// All three live behind one mutex on purpose. The watchdog takes a single
+/// snapshot of the whole struct, so it can never pair one container's
+/// identity with another's ownership record.
 #[derive(Default)]
 struct ActiveSandbox {
     name: Option<String>,
@@ -143,17 +149,18 @@ struct ActiveSandbox {
     /// Read only by the Linux watchdog, but written on every target.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     rollback: SignalRollback,
-    /// Whether this process created the firewall chain for `name`.
+    /// Which per-family chains and FORWARD hooks this process created for
+    /// `name`, so the watchdog removes only what this process installed.
     ///
     /// The chain name is derived from the container name, so two processes
     /// starting the same sandbox target the same chain and only one of them
     /// creates it. Without this the watchdog would tear the chain down on a
     /// signal no matter which process it interrupted, and interrupting the
     /// loser would strip the firewall off the winner's running container. The
-    /// bit is set by the manager the moment its `iptables -N` succeeds, so the
-    /// whole window in which the chain exists is covered and no wider.
+    /// record is published the moment a creating command succeeds, so the
+    /// whole window in which the resource exists is covered and no wider.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    chain_created: bool,
+    created: CreatedResources,
 }
 
 static ACTIVE_CONTAINER: OnceLock<Mutex<ActiveSandbox>> = OnceLock::new();
@@ -169,14 +176,15 @@ fn lock_slot() -> std::sync::MutexGuard<'static, ActiveSandbox> {
 
 /// Records `name` as the currently active container so the cleanup watchdog
 /// can destroy it if a fatal signal arrives. Replaces any previous value
-/// (including any previously registered veth, since the new container has
-/// not had its veth discovered yet).
+/// (including any previously registered veth and created-resource record,
+/// since the new container has not had its veth discovered and has not
+/// created anything yet).
 pub fn set_active(name: &str) {
     let mut slot = lock_slot();
     slot.name = Some(name.to_owned());
     slot.veth = None;
     slot.rollback = SignalRollback::DestroyContainer;
-    slot.chain_created = false;
+    slot.created = CreatedResources::default();
 }
 
 /// Records `name` as the currently active container for the *state-aware*
@@ -198,41 +206,29 @@ pub fn set_active_network_only(name: &str) {
     slot.name = Some(name.to_owned());
     slot.veth = None;
     slot.rollback = SignalRollback::NetworkOnly;
-    slot.chain_created = false;
+    slot.created = CreatedResources::default();
 }
 
-/// Records that this process created the firewall chain for the active
-/// container, so the watchdog may remove it on a fatal signal.
+/// Records which iptables chains and FORWARD hooks this process created for
+/// the active container, so the watchdog removes exactly those on a fatal
+/// signal.
 ///
-/// Called by [`crate::network_iptables::NetworkIptablesManager`] the moment its
-/// `iptables -N` succeeds — the instant the chain starts existing, and not
-/// before. Registering a name is deliberately not enough on its own: a process
-/// whose `-N` lost the race to a concurrent start of the same sandbox owns
-/// nothing, and a signal must not make it delete the winner's chain and leave
-/// the winner's container running unfiltered.
+/// Called by [`crate::network_iptables::NetworkIptablesManager`] the moment a
+/// creating command succeeds — the instant the resource starts existing, and
+/// not before. Registering a name is deliberately not enough on its own: a
+/// process whose `-N` lost the race to a concurrent start of the same sandbox
+/// owns nothing, and a signal must not make it delete the winner's chain and
+/// leave the winner's container running unfiltered.
+///
+/// Publication is whole-record rather than incremental: each call supersedes
+/// the previous one, so callers pass the complete set they own.
 ///
 /// No-op if no container is currently registered.
-pub fn set_active_chain_created() {
+pub(crate) fn set_active_created(created: CreatedResources) {
     let mut slot = lock_slot();
     if slot.name.is_some() {
-        slot.chain_created = true;
+        slot.created = created;
     }
-}
-
-/// Records that this process no longer owns the firewall chain for the active
-/// container, because it removed it.
-///
-/// The mirror of [`set_active_chain_created`], and required for the same
-/// reason. Chain names are derived from the container name and truncate to 20
-/// characters, so they can collide; a bit left set after a successful teardown
-/// would let a later signal run cleanup against a name that by then may answer
-/// for a different, live container — stripping its firewall while it runs.
-///
-/// Only call this when the removal actually succeeded. A failed `-X` means the
-/// chain is still there and still ours, and dropping the bit would leak it.
-pub fn clear_active_chain_created() {
-    let mut slot = lock_slot();
-    slot.chain_created = false;
 }
 
 /// Unregisters the active sandbox, so a later signal rolls nothing back.
@@ -240,6 +236,13 @@ pub fn clear_active_chain_created() {
 /// Used at the end of a successful state-aware start: the chain and the
 /// container are both meant to persist from there on, and rolling either back
 /// would be the bug rather than the fix.
+///
+/// Also the mirror of [`set_active_created`] after a successful teardown.
+/// Chain names are derived from the container name and truncate to 20
+/// characters, so they can collide; an ownership record left published after a
+/// successful teardown would let a later signal run cleanup against a name that
+/// by then may answer for a different, live container — stripping its firewall
+/// while it runs.
 pub fn clear_active() {
     *lock_slot() = ActiveSandbox::default();
 }
@@ -252,6 +255,14 @@ pub fn set_active_veth(veth: &str) {
     if slot.name.is_some() {
         slot.veth = Some(veth.to_owned());
     }
+}
+
+/// Reads back what the watchdog would act on. Test-only: production code has
+/// exactly one reader, and it is the watchdog itself.
+#[cfg(test)]
+fn active_snapshot() -> (Option<String>, Option<String>, CreatedResources) {
+    let slot = lock_slot();
+    (slot.name.clone(), slot.veth.clone(), slot.created)
 }
 
 /// Block SIGHUP/SIGTERM/SIGINT in the calling thread and spawn a watchdog
@@ -317,13 +328,14 @@ fn run_watchdog(mask: SigSet) -> ! {
             // host's stdio. The order comes from `rollback_plan`, which is
             // where the reasoning about it lives.
             let mut buf_logger = Logger::new(Mode::Buffer);
-            let plan = rollback_plan(active.rollback, active.chain_created);
+            let plan = rollback_plan(active.rollback, !active.created.is_empty());
             execute_rollback(&plan, &mut |step| match step {
                 RollbackStep::StopContainer => LxcContainer::new(&name, None).stop().is_ok(),
                 RollbackStep::RemoveFirewall => {
                     NetworkIptablesManager::force_cleanup(
                         &name,
                         active.veth.as_deref(),
+                        active.created,
                         &mut buf_logger,
                     );
                     true
@@ -477,26 +489,27 @@ mod tests {
         assert_eq!(lock_slot().veth.as_deref(), Some("mxcv-abc"));
 
         // Registering a name is not by itself a claim on the firewall chain.
-        // The watchdog gates its ownership-blind force_cleanup on this bit, so
-        // a process whose `iptables -N` lost the race to a concurrent start
-        // must not be holding it — otherwise a signal would make the loser
+        // The watchdog gates its ownership-blind force_cleanup on this record,
+        // so a process whose `iptables -N` lost the race to a concurrent start
+        // must not be holding one — otherwise a signal would make the loser
         // delete the winner's chain and leave the winner unfiltered.
-        assert!(!lock_slot().chain_created);
+        assert!(lock_slot().created.is_empty());
 
-        // The manager sets it the moment its own `-N` succeeds.
-        set_active_chain_created();
-        assert!(lock_slot().chain_created);
+        // The manager publishes it the moment its own creating command succeeds.
+        let v4_only = CreatedResources::for_test(true, false, true, false);
+        set_active_created(v4_only);
+        assert_eq!(lock_slot().created, v4_only);
 
-        // A successful teardown gives the claim back. Without this the bit
+        // A successful teardown gives the claim back. Without this the record
         // outlives the chain it describes, and since chain names truncate to 20
         // characters and can collide, a signal arriving afterwards would run
         // cleanup against a name that may by then answer for a different, live
         // container.
         set_active_network_only("torn-down-box");
-        set_active_chain_created();
-        assert!(lock_slot().chain_created);
-        clear_active_chain_created();
-        assert!(!lock_slot().chain_created);
+        set_active_created(v4_only);
+        assert!(!lock_slot().created.is_empty());
+        set_active_created(CreatedResources::default());
+        assert!(lock_slot().created.is_empty());
 
         // Giving the claim back is not the same as unregistering: the container
         // is still the active one, so a signal must still roll back whatever
@@ -505,11 +518,11 @@ mod tests {
 
         // Re-registering a different container drops the claim with it.
         set_active_network_only("yet-another-box");
-        assert!(!lock_slot().chain_created);
-        set_active_chain_created();
-        assert!(lock_slot().chain_created);
+        assert!(lock_slot().created.is_empty());
+        set_active_created(v4_only);
+        assert!(!lock_slot().created.is_empty());
         set_active("one-shot-box");
-        assert!(!lock_slot().chain_created);
+        assert!(lock_slot().created.is_empty());
 
         // Clearing leaves nothing to roll back. Without this, a signal after a
         // successful start would strip the firewall off a running container.
@@ -518,22 +531,81 @@ mod tests {
             let slot = lock_slot();
             assert!(slot.name.is_none());
             assert!(slot.veth.is_none());
-            assert!(!slot.chain_created);
+            assert!(slot.created.is_empty());
         }
 
         // Neither late registration may resurrect a cleared slot.
         set_active_veth("mxcv-def");
-        set_active_chain_created();
+        set_active_created(v4_only);
         {
             let slot = lock_slot();
             assert!(slot.veth.is_none());
-            assert!(!slot.chain_created);
+            assert!(slot.created.is_empty());
         }
 
         // Re-registering resets the veth, since the new container has not had
         // one discovered yet.
         set_active_network_only("another-box");
         assert!(lock_slot().veth.is_none());
+        clear_active();
+    }
+
+    /// `ACTIVE_CONTAINER` is process-global and the test binary runs tests in
+    /// parallel, so the whole publication contract is asserted in one test.
+    /// Splitting it would let two tests race on the same slot.
+    #[test]
+    fn the_watchdogs_view_of_a_container_is_built_and_reset_as_a_single_unit() {
+        clear_active();
+
+        // Before any container registers, ownership publication is a no-op.
+        // Bubblewrap builds the same firewall manager but never registers, so
+        // its resources must not become something the watchdog would remove.
+        set_active_created(CreatedResources::for_test(true, true, true, true));
+        let (name, veth, created) = active_snapshot();
+        assert_eq!(name, None, "no container should be registered yet");
+        assert_eq!(
+            created,
+            CreatedResources::default(),
+            "ownership published with no registered container must be discarded"
+        );
+        assert_eq!(veth, None);
+
+        // Registering a container opens the slot.
+        set_active("ctr-a");
+        set_active_veth("veth-a");
+        let v4_chain_only = CreatedResources::for_test(true, false, false, false);
+        set_active_created(v4_chain_only);
+        assert_eq!(
+            active_snapshot(),
+            (
+                Some("ctr-a".to_owned()),
+                Some("veth-a".to_owned()),
+                v4_chain_only
+            ),
+            "a registered container must see its own identity and ownership"
+        );
+
+        // Publication is incremental: each creation site republishes the whole
+        // record, so a later publish supersedes an earlier one rather than
+        // merging with it.
+        let both_chains = CreatedResources::for_test(true, true, false, false);
+        set_active_created(both_chains);
+        assert_eq!(
+            active_snapshot().2,
+            both_chains,
+            "the most recent publication is what the watchdog must act on"
+        );
+
+        // A new container must not inherit the previous one's ownership record.
+        // Chain names truncate, so acting on a stale record can tear down a
+        // different container's chain.
+        set_active("ctr-b");
+        assert_eq!(
+            active_snapshot(),
+            (Some("ctr-b".to_owned()), None, CreatedResources::default()),
+            "registering a new container must reset veth and ownership"
+        );
+
         clear_active();
     }
 }

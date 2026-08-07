@@ -25,7 +25,7 @@ use wxc_common::state_aware_backend::{
 
 use crate::filesystem_mounts;
 use crate::lxc_bindings::LxcContainer;
-use crate::network_iptables::NetworkIptablesManager;
+use crate::network_iptables::{CreatedResources, NetworkIptablesManager};
 use crate::signal_cleanup;
 
 /// Stateless state-aware LXC runner.
@@ -258,11 +258,16 @@ fn validate_start_policy(request: &ExecutionRequest) -> Result<(), MxcError> {
     reject_unenforceable_network_policy(&policy)
 }
 
+/// Apply the network policy, returning the record of what it installed.
+///
+/// The record is what lets the caller undo exactly this attempt if the start
+/// then fails, without touching a chain that a concurrent start owns. An
+/// enforcement-free policy installs nothing and returns an empty record.
 fn apply_network_policy(
     container: &LxcContainer,
     request: &ExecutionRequest,
     logger: &mut Logger,
-) -> Result<(), MxcError> {
+) -> Result<CreatedResources, MxcError> {
     reject_unenforceable_network_policy(&request.policy)?;
 
     let policy = normalized_policy(request, logger)?;
@@ -347,10 +352,18 @@ fn apply_network_policy(
         Ok(true) => {
             if fw_manager.rules_applied() {
                 // Rules must survive after the start phase returns. stop and
-                // deprovision call force_cleanup to remove this persistent state.
+                // deprovision call force_cleanup_authoritative to remove this
+                // persistent state.
+                //
+                // Read the ownership record out before forgetting the manager.
+                // It is the only surviving evidence of what this attempt
+                // installed, and the start path needs it to tear down exactly
+                // that much if the container then fails to start.
+                let created = fw_manager.created();
                 std::mem::forget(fw_manager);
+                return Ok(created);
             }
-            Ok(())
+            Ok(CreatedResources::default())
         }
         Ok(false) => Err(MxcError::policy_validation(
             "Failed to apply network firewall rules",
@@ -367,7 +380,7 @@ fn apply_network_policy(
             // loser delete the winner's chain and hooks, and the winner would
             // then start its container with nothing filtering it — turning a
             // recoverable collision into a fail-open.
-            if fw_manager.chain_created() {
+            if fw_manager.owns_resources() {
                 // Tear down through the manager that created the chain, not a
                 // fresh one. `Drop` re-runs the teardown whenever
                 // `chain_created` is still set, and a fresh manager cannot clear
@@ -406,14 +419,38 @@ fn apply_network_policy(
     }
 }
 
-/// Best-effort teardown of the iptables state installed for a container.
+/// Best-effort teardown of iptables state this process installed.
 ///
-/// `veth` must be the host-side veth interface name discovered *while the
-/// container was still running* — it disappears once the container stops, but
-/// iptables can still delete a `FORWARD` rule that names it, so callers pass
-/// the previously-discovered name through here after stopping the container.
-fn cleanup_network(container_name: &str, veth: Option<&str>, logger: &mut Logger) {
-    NetworkIptablesManager::force_cleanup(container_name, veth, logger);
+/// `veth` is the host-side veth interface name when it is known. Teardown no
+/// longer needs it to find the FORWARD hooks — those are located by
+/// enumerating the live FORWARD chain and matching the `-j <chain>` target —
+/// but it is still passed through for logging and for the callers that
+/// discovered it while the container was running.
+///
+/// `created` is the ownership record: only the chains and hooks named in it are
+/// removed, so a process that created nothing removes nothing. Use this from
+/// the start path, which knows what it installed.
+fn cleanup_network_owned(
+    container_name: &str,
+    veth: Option<&str>,
+    created: CreatedResources,
+    logger: &mut Logger,
+) {
+    NetworkIptablesManager::force_cleanup(container_name, veth, created, logger);
+}
+
+/// Best-effort teardown of whatever iptables state exists for a container,
+/// whichever process installed it.
+///
+/// For `stop` and `deprovision` only. They run in a different process from the
+/// `start` that created the chain, so they hold no ownership record and an
+/// ownership-gated teardown would silently do nothing — stranding the chain and
+/// blocking every later start, which fails on a chain it did not create. Both
+/// callers have already stopped or destroyed the container by this point, so
+/// nothing is left for the chain to protect. See
+/// `NetworkIptablesManager::force_cleanup_authoritative` for the full argument.
+fn cleanup_network_authoritative(container_name: &str, veth: Option<&str>, logger: &mut Logger) {
+    NetworkIptablesManager::force_cleanup_authoritative(container_name, veth, logger);
 }
 
 impl StatefulSandboxBackend for LxcStateAwareRunner {
@@ -493,21 +530,29 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             // the one-shot `set_active`: this container is provisioned and must
             // survive, so only the firewall is rolled back.
             signal_cleanup::set_active_network_only(container_name);
-            if let Err(e) = apply_network_policy(&container, request, &mut logger) {
-                // Clear before returning. apply_network_policy already removed
-                // whatever it created, and when it failed because another start
-                // owns the chain it deliberately removed nothing — a signal
-                // arriving now would otherwise delete that owner's chain and
-                // leave its container running unfiltered.
-                signal_cleanup::clear_active();
-                return Err(e);
-            }
+            let installed = match apply_network_policy(&container, request, &mut logger) {
+                Ok(created) => created,
+                Err(e) => {
+                    // Clear before returning. apply_network_policy already removed
+                    // whatever it created, and when it failed because another start
+                    // owns the chain it deliberately removed nothing — a signal
+                    // arriving now would otherwise delete that owner's chain and
+                    // leave its container running unfiltered.
+                    signal_cleanup::clear_active();
+                    return Err(e);
+                }
+            };
             if let Err(e) = container.start() {
                 // The firewall is already installed; tear it down so an aborted
                 // start does not leak iptables state. The veth never came up, so
-                // no interface-scoped discovery is needed — force_cleanup removes
-                // the chain and its FORWARD hooks by chain name.
-                cleanup_network(container_name, None, &mut logger);
+                // no interface-scoped discovery is needed — the FORWARD hooks are
+                // found by enumerating on the chain name.
+                //
+                // Ownership-scoped, not authoritative: `apply_network_policy` may
+                // have installed nothing, and a chain present without this attempt
+                // creating it belongs to a concurrent start whose container is
+                // running behind it.
+                cleanup_network_owned(container_name, None, installed, &mut logger);
                 signal_cleanup::clear_active();
                 return Err(MxcError::backend_error(format!(
                     "Failed to start container: {e}"
@@ -597,7 +642,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
                 .stop()
                 .map_err(|e| MxcError::backend_error(format!("Failed to stop container: {e}")))?;
         }
-        cleanup_network(container_name, veth.as_deref(), &mut logger);
+        cleanup_network_authoritative(container_name, veth.as_deref(), &mut logger);
         Ok(StopResult { metadata: None })
     }
 
@@ -625,7 +670,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
                 MxcError::backend_error(format!("Failed to destroy container: {e}"))
             })?;
         }
-        cleanup_network(container_name, veth.as_deref(), &mut logger);
+        cleanup_network_authoritative(container_name, veth.as_deref(), &mut logger);
         Ok(DeprovisionResult { metadata: None })
     }
 
