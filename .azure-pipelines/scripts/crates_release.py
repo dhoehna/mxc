@@ -110,21 +110,6 @@ CRATES: list[str] = [
     "mxc-sdk",
 ]
 
-# Target triples verified by `cargo package`, all passed to one cargo
-# invocation covering the whole closure.
-#
-# A platform-specific crate must gate itself with cfg so it still compiles,
-# possibly to an empty library, on the other two triples.
-#
-# lib-only crates require no linker for cross-compilation, so no cross-linker
-# toolchain or Apple SDK is needed -- `rustup target add` alone is sufficient.
-VERIFY_TARGETS: list[str] = [
-    "x86_64-pc-windows-msvc",
-    "x86_64-unknown-linux-gnu",
-    "aarch64-apple-darwin",
-]
-
-
 def _cargo_metadata(manifest_path: str) -> dict:
     result = subprocess.run(
         [
@@ -326,8 +311,6 @@ def cmd_package(args: argparse.Namespace) -> int:
         "--manifest-path",
         manifest,
     ]
-    for triple in VERIFY_TARGETS:
-        package_args += ["--target", triple]
     for crate in order:
         package_args += ["-p", crate]
     rc = _run(package_args)

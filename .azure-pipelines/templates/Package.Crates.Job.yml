@@ -1,14 +1,17 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 #
-# Packages the mxc-sdk crate closure into .crate files and publishes them as
-# the mxc-crates-package pipeline artifact.  Packages the ref the run was
-# queued against.
+# Packages the mxc-sdk crate closure into .crate files, once per operating
+# system, on that system's own agent.  `cargo package` compiles each crate to
+# verify it, so a leg proves the closure builds natively on its OS.
+#
+# The .crate archive is the crate's source, so all three legs emit identical
+# tarballs.  Only the Windows leg publishes them as the mxc-crates-package
+# artifact; the other two are verification.
 #
 # --registry Mxc-Azure-Feed works around rust-lang/cargo#17196, where the
 # overlay holding just-packaged workspace siblings is registered under the
 # pre-replacement source id and looked up under the post-replacement one.
-# The emitted .crate files are byte-identical either way.
 #
 # The helper script is copied into the artifact so the release job can run its
 # stage and verify-order subcommands without a checkout.
@@ -17,70 +20,80 @@ parameters:
   - name: cratesArtifactName
     type: string
     default: mxc-crates-package
+  - name: matrix
+    type: object
+    default:
+      - name: windows_x64
+        os: windows
+        triplet: x86_64-pc-windows-msvc
+      - name: linux_x64
+        os: linux
+        triplet: x86_64-unknown-linux-gnu
+      - name: macos_arm64
+        os: macos
+        triplet: aarch64-apple-darwin
 
 jobs:
-  - job: package_crates
-    displayName: Package Crates (crates.io)
-    pool:
-      name: Azure-Pipelines-1ESPT-ExDShared
-      image: windows-2022
-      os: windows
-    variables:
-      outDir: $(Build.SourcesDirectory)/out/crates
-    steps:
-      - checkout: self
+  - ${{ each item in parameters.matrix }}:
+    - job: package_crates_${{ item.name }}
+      displayName: Package Crates (${{ item.os }})
 
-      - template: Rust.Toolchain.Public.yml@self
-        parameters:
-          targetTriple: x86_64-pc-windows-msvc
+      pool:
+        ${{ if eq(item.os, 'macos') }}:
+          name: Azure Pipelines
+          vmImage: macOS-15-arm64
+          os: macOS
+        ${{ if ne(item.os, 'macos') }}:
+          name: Azure-Pipelines-1ESPT-ExDShared
+          ${{ if eq(item.os, 'windows') }}:
+            image: windows-2022
+            os: windows
+          ${{ if eq(item.os, 'linux') }}:
+            image: ubuntu-latest
+            os: linux
 
-      - pwsh: |
-          $ErrorActionPreference = 'Stop'
-          foreach ($triple in @('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin'))
-          {
-            rustup target add $triple --toolchain 1.93
-            if ($LASTEXITCODE -ne 0) { throw "rustup target add $triple failed with exit $LASTEXITCODE" }
-          }
-        displayName: Install cross-compile targets (linux-gnu, apple-darwin)
+      variables:
+        outDir: $(Build.SourcesDirectory)/out/crates
+        # python3 on Windows is often an App Execution Alias stub that opens
+        # the Store.
+        ${{ if eq(item.os, 'windows') }}:
+          python: python
+        ${{ if ne(item.os, 'windows') }}:
+          python: python3
 
-      - template: Cargo.Setup.Private.yml@self
+      steps:
+        - checkout: self
 
-      # python3 is commonly absent on Windows, or an App Execution Alias stub
-      # that opens the Store.
-      - pwsh: |
-          $ErrorActionPreference = 'Stop'
-          $exe = $null
-          foreach ($candidate in @('python', 'python3'))
-          {
-            $found = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found -and (& $found.Source --version) -match 'Python 3')
-            {
-              $exe = $found.Source
-              break
-            }
-          }
-          if (-not $exe) { throw 'No Python 3 interpreter found on PATH (tried python, python3).' }
-          Write-Host "Using Python interpreter: $exe"
-          Write-Host "##vso[task.setvariable variable=pythonExe]$exe"
-        displayName: Resolve Python interpreter
+        - template: Rust.Toolchain.Public.yml@self
+          parameters:
+            targetTriple: ${{ item.triplet }}
 
-      - pwsh: |
-          $ErrorActionPreference = 'Stop'
-          & "$(pythonExe)" .azure-pipelines/scripts/crates_release.py check-template --manifest-path src/Cargo.toml --template-path .azure-pipelines/templates/Publish.CratesIo.Job.yml
-          if ($LASTEXITCODE -ne 0) { throw "check-template failed with exit $LASTEXITCODE" }
-        displayName: Verify crate order matches the workspace
-        workingDirectory: $(Build.SourcesDirectory)
+        - template: Cargo.Setup.Private.yml@self
 
-      - pwsh: |
-          $ErrorActionPreference = 'Stop'
-          & "$(pythonExe)" .azure-pipelines/scripts/crates_release.py package --manifest-path src/Cargo.toml --registry Mxc-Azure-Feed --out-dir "$(outDir)"
-          if ($LASTEXITCODE -ne 0) { throw "package failed with exit $LASTEXITCODE" }
-          Copy-Item .azure-pipelines/scripts/crates_release.py -Destination "$(outDir)/"
-        displayName: Package crate closure (leaf-first)
-        workingDirectory: $(Build.SourcesDirectory)
+        - ${{ if eq(item.os, 'windows') }}:
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              & $(python) .azure-pipelines/scripts/crates_release.py check-template --manifest-path src/Cargo.toml --template-path .azure-pipelines/templates/Publish.CratesIo.Job.yml
+              if ($LASTEXITCODE -ne 0) { throw "check-template failed with exit $LASTEXITCODE" }
+            displayName: Verify crate order matches the workspace
+            workingDirectory: $(Build.SourcesDirectory)
 
-      - task: 1ES.PublishPipelineArtifact@1
-        displayName: Publish crate package artifact
-        inputs:
-          path: $(outDir)
-          artifactName: ${{ parameters.cratesArtifactName }}
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            & $(python) .azure-pipelines/scripts/crates_release.py package --manifest-path src/Cargo.toml --registry Mxc-Azure-Feed --out-dir "$(outDir)"
+            if ($LASTEXITCODE -ne 0) { throw "package failed with exit $LASTEXITCODE" }
+          displayName: Package crate closure
+          workingDirectory: $(Build.SourcesDirectory)
+
+        - ${{ if eq(item.os, 'windows') }}:
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              Copy-Item .azure-pipelines/scripts/crates_release.py -Destination "$(outDir)/"
+            displayName: Copy the release script into the artifact
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - task: 1ES.PublishPipelineArtifact@1
+            displayName: Publish crate package artifact
+            inputs:
+              path: $(outDir)
+              artifactName: ${{ parameters.cratesArtifactName }}
