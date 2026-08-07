@@ -424,24 +424,29 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
     );
   });
 
-  it('does not mistake a script that ended its stderr with an error envelope for a dispatch failure', async () => {
-    // Some backends relay the guest's own stderr onto this stream, so a script
-    // may legitimately print something envelope-shaped. A dispatch failure
-    // happens before the script runs and so produces no stdout; this one did,
-    // and must come back as an ExecResult carrying its real exit code.
+  it('throws when a script that already produced output is killed by its timeout', async () => {
+    // A script timeout is a dispatch failure raised *after* the script has
+    // streamed its output, so stdout is non-empty and the envelope is on
+    // stderr. Requiring stdout to be empty before reading stderr dropped this
+    // envelope and handed the caller an ordinary ExecResult -- a run that was
+    // killed mid-flight, reported as one that finished with exit code 3.
+    //
+    // The guest cannot contaminate this stream: the streaming exec puts the
+    // guest on a pty whose primary end is relayed to the executor's stdout
+    // (mxc_pty run_with_pty), so guest stderr is merged into stdout.
     const fake = fakeSpawn({
-      stdout: 'partial output\n',
-      stderr: '{"error":{"code":"not_started","message":"printed by the script"}}\n',
+      stdout: 'partial output before the kill\n',
+      stderr:
+        'diagnostic: attaching to container\n' +
+        '{"error":{"code":"backend_error","message":"Execution failed: script timed out after 5000ms"}}\n',
       exitCode: 3,
     });
     _setSpawnImpl(fake.spawn);
     const id = 'iso:abc' as SandboxId<'isolation_session'>;
-    const result = await execInSandboxAsync(
-      id,
-      { process: { commandLine: 'noisy' } },
-      testOptions(),
+    await assert.rejects(
+      execInSandboxAsync(id, { process: { commandLine: 'slow' } }, testOptions()),
+      (err: Error) => err.message.includes('script timed out after 5000ms'),
     );
-    assert.strictEqual(result.exitCode, 3);
   });
 
   it('does not treat an envelope buried mid-stderr as a dispatch failure', async () => {

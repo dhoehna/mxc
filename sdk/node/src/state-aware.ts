@@ -148,14 +148,15 @@ export async function execInSandboxAsync<C extends StateAwareContainmentBackend>
     // already written the container's raw output there, so its envelope goes to
     // stderr instead.
     //
-    // The stderr fallback is additionally gated on stdout being empty. A
-    // dispatch failure happens before the script runs, so it never produces
-    // stdout; requiring that keeps a script that both wrote output and ended its
-    // stderr with something envelope-shaped from being reported as a sandbox
-    // that never started.
+    // Do not gate the stderr check on stdout being empty. A script timeout is a
+    // dispatch failure raised *after* the script has streamed output, so that
+    // gate would drop the envelope for a killed script and hand the caller an
+    // ordinary result for a run that never finished. The narrowing that keeps a
+    // script's own output from being misread lives in
+    // `tryParseErrorEnvelopeFromLines`, which considers only the last non-empty
+    // line.
     const errorEnvelope =
-      tryParseErrorEnvelope(stdout) ??
-      (stdout === '' ? tryParseErrorEnvelopeFromLines(stderr) : null);
+      tryParseErrorEnvelope(stdout) ?? tryParseErrorEnvelopeFromLines(stderr);
     if (errorEnvelope) {
       const e = errorEnvelope.error;
       throw mxcErrorFromCode(e.code, e.message, e.details);

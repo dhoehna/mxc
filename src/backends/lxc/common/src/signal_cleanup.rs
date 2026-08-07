@@ -135,6 +135,22 @@ pub fn set_active_chain_created() {
     }
 }
 
+/// Records that this process no longer owns the firewall chain for the active
+/// container, because it removed it.
+///
+/// The mirror of [`set_active_chain_created`], and required for the same
+/// reason. Chain names are derived from the container name and truncate to 20
+/// characters, so they can collide; a bit left set after a successful teardown
+/// would let a later signal run cleanup against a name that by then may answer
+/// for a different, live container — stripping its firewall while it runs.
+///
+/// Only call this when the removal actually succeeded. A failed `-X` means the
+/// chain is still there and still ours, and dropping the bit would leak it.
+pub fn clear_active_chain_created() {
+    let mut slot = lock_slot();
+    slot.chain_created = false;
+}
+
 /// Unregisters the active sandbox, so a later signal rolls nothing back.
 ///
 /// Used at the end of a successful state-aware start: the chain and the
@@ -278,6 +294,22 @@ mod tests {
         // The manager sets it the moment its own `-N` succeeds.
         set_active_chain_created();
         assert!(lock_slot().chain_created);
+
+        // A successful teardown gives the claim back. Without this the bit
+        // outlives the chain it describes, and since chain names truncate to 20
+        // characters and can collide, a signal arriving afterwards would run
+        // cleanup against a name that may by then answer for a different, live
+        // container.
+        set_active_network_only("torn-down-box");
+        set_active_chain_created();
+        assert!(lock_slot().chain_created);
+        clear_active_chain_created();
+        assert!(!lock_slot().chain_created);
+
+        // Giving the claim back is not the same as unregistering: the container
+        // is still the active one, so a signal must still roll back whatever
+        // else the registration covers.
+        assert_eq!(lock_slot().name.as_deref(), Some("torn-down-box"));
 
         // Re-registering a different container drops the claim with it.
         set_active_network_only("yet-another-box");

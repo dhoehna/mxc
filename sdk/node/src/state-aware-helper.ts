@@ -163,12 +163,16 @@ export function tryParseErrorEnvelope(stdout: string): WireErrorEnvelope | null 
  * than the entire stream.
  *
  * Only the last non-empty line is considered, and only when it is a well-formed
- * envelope. That narrowness is the point. Some backends relay the guest's own
- * stderr onto this same stream, so a script is entitled to print something
- * envelope-shaped; scanning the whole stream would turn that script's ordinary
- * non-zero exit into a thrown dispatch error and hide its real result. A genuine
- * dispatch failure always ends the stream with its envelope, because the
- * executor emits the diagnostic buffer, then the envelope, then exits.
+ * envelope. That narrowness is what keeps an ordinary diagnostic line that
+ * happens to be JSON from being read as a dispatch failure. A genuine dispatch
+ * failure always ends the stream with its envelope, because the executor emits
+ * the diagnostic buffer, then the envelope, then exits.
+ *
+ * The guest's own output is not a hazard on this channel: the streaming exec
+ * runs the guest on a pty whose primary end is relayed to the executor's
+ * *stdout*, so guest stderr is merged into stdout and never reaches this
+ * stream. Callers must therefore not additionally require stdout to be empty —
+ * a script timeout produces both a full stdout and an envelope here.
  */
 export function tryParseErrorEnvelopeFromLines(stderr: string): WireErrorEnvelope | null {
   const lines = stderr.split('\n');

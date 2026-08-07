@@ -408,9 +408,17 @@ impl NetworkIptablesManager {
         // removes exactly what was installed.
         self.remove_forward_hooks(logger);
 
-        // Flush and delete the chain
+        // Flush and delete the chain. `-X` is the command that relinquishes the
+        // chain, so it also decides whether this process still owns it. Telling
+        // the watchdog we no longer own it is only safe once `-X` has succeeded:
+        // chain names truncate to 20 characters and can collide, so a bit left
+        // set after a successful teardown lets a later signal strip the firewall
+        // off whichever live container has since claimed the name, while a bit
+        // cleared after a failed one leaks a chain nobody will remove.
         let _ = Self::run_iptables(&["-F", &self.chain_name], logger);
-        let _ = Self::run_iptables(&["-X", &self.chain_name], logger);
+        if Self::run_iptables(&["-X", &self.chain_name], logger).is_ok() {
+            crate::signal_cleanup::clear_active_chain_created();
+        }
 
         self.rules_applied = false;
         Ok(())
