@@ -51,7 +51,7 @@ therefore assuming is already live.
 from __future__ import annotations
 
 import argparse
-import glob
+
 import hashlib
 import json
 import os
@@ -110,15 +110,11 @@ CRATES: list[str] = [
     "mxc-sdk",
 ]
 
-# Target triples verified by `cargo package`.  All three are passed to one
-# cargo invocation covering the whole closure, which verifies them in parallel
-# on the Windows agent that owns packaging.  The Windows triple comes with the
-# toolchain; Package.Crates.Job.yml installs the Linux and macOS triples, and
-# _verify_targets fails the run if any of the three is absent.
+# Target triples verified by `cargo package`, all passed to one cargo
+# invocation covering the whole closure.
 #
-# A crate that is platform-specific must gate itself with cfg so it still
-# compiles (possibly to an empty library) on the other two triples; that is a
-# published-API decision and is documented per crate, not worked around here.
+# A platform-specific crate must gate itself with cfg so it still compiles,
+# possibly to an empty library, on the other two triples.
 #
 # lib-only crates require no linker for cross-compilation, so no cross-linker
 # toolchain or Apple SDK is needed -- `rustup target add` alone is sufficient.
@@ -287,52 +283,6 @@ def _validate_release_graph(metadata: dict) -> dict[str, list[str]]:
     return dependencies
 
 
-def _verify_targets(targets: list[str]) -> int:
-    """Fail unless the standard library for every triple in *targets* is present.
-
-    Installing the targets is the pipeline's job -- Package.Crates.Job.yml runs
-    `rustup target add` after the toolchain step puts cargo on PATH.  This
-    function only checks, and deliberately does not shell out to rustup: the
-    packaging job installs its toolchain with rustup-init today, but the rest
-    of the repo builds against the internal `ms-prod-1.93` toolchain, where
-    rustup is not guaranteed to exist.  Asking rustc where a target's libdir
-    lives works under either.
-
-    A missing target has to stop the run.  Cargo would otherwise be handed a
-    --target it cannot satisfy, and the resulting error reads as a compile
-    failure in the crate rather than a missing toolchain component.
-    """
-    missing: list[str] = []
-    for triple in targets:
-        result = subprocess.run(
-            ["rustc", "--print", "target-libdir", "--target", triple],
-            capture_output=True,
-            text=True,
-        )
-        # rustc exits 0 and prints a plausible path even for a target whose
-        # std was never installed, so the exit code proves nothing here and
-        # the directory's existence is the real check.
-        libdir = result.stdout.strip()
-        installed = bool(
-            result.returncode == 0
-            and libdir
-            and os.path.isdir(libdir)
-            and glob.glob(os.path.join(libdir, "libstd-*.rlib"))
-        )
-        print(f"    target {triple}: {'ok' if installed else 'MISSING'}", flush=True)
-        if not installed:
-            missing.append(triple)
-    if missing:
-        print(
-            f"FAIL  the standard library is missing for: {', '.join(missing)}.\n"
-            f"      Install it with: rustup target add {' '.join(missing)}\n"
-            f"      Cross-verification is not optional; every triple in "
-            f"VERIFY_TARGETS must be present."
-        )
-        return 1
-    return 0
-
-
 def cmd_package(args: argparse.Namespace) -> int:
     metadata = _cargo_metadata(args.manifest_path)
     versions = {
@@ -368,72 +318,21 @@ def cmd_package(args: argparse.Namespace) -> int:
     # .cargo/config.toml, which lies outside every package directory, so a
     # dirty-tree failure here means a crate source really was modified.
 
-    # Every target must be present before cargo is invoked.  A missing target
-    # fails the run here -- silently skipping a triple would produce a green
-    # pipeline that verified less than it claims to have verified.
-    print("=== verifying cross-compilation targets ===", flush=True)
-    target_rc = _verify_targets(VERIFY_TARGETS)
-    if target_rc != 0:
-        return target_rc
-
-    # Build the base argument list shared by all cargo package invocations.
-    # --target is repeated once per triple; cargo honors all of them and
-    # builds the verification step for each in parallel (proved empirically:
-    # reversing the flag order produces an identical set of per-triple
-    # artifacts with identical timestamps).  The archive itself is
-    # byte-identical regardless of which targets are verified -- cargo creates
-    # the tarball before entering the verification build.
-    def _base_package_args() -> list[str]:
-        base = [
-            "cargo",
-            "package",
-            "--registry",
-            args.registry,
-            "--manifest-path",
-            manifest,
-        ]
-        for triple in VERIFY_TARGETS:
-            base += ["--target", triple]
-        return base
-
-    package_args = _base_package_args()
+    package_args = [
+        "cargo",
+        "package",
+        "--registry",
+        args.registry,
+        "--manifest-path",
+        manifest,
+    ]
+    for triple in VERIFY_TARGETS:
+        package_args += ["--target", triple]
     for crate in order:
         package_args += ["-p", crate]
     rc = _run(package_args)
     if rc != 0:
-        # The multi-target, multi-crate invocation failed but the interleaved
-        # output does not tell a human which target caused it.  Run one
-        # invocation per target against all crates to isolate the failure(s).
-        print(
-            f"FAIL  cargo package exited {rc}; "
-            f"re-running per-target to isolate the failure",
-            flush=True,
-        )
-        failed_targets: list[str] = []
-        for triple in VERIFY_TARGETS:
-            print(f"\n=== isolating failure: target {triple} ===", flush=True)
-            per_target_args = [
-                "cargo",
-                "package",
-                "--registry",
-                args.registry,
-                "--manifest-path",
-                manifest,
-                "--target",
-                triple,
-            ]
-            for crate in order:
-                per_target_args += ["-p", crate]
-            per_rc = _run(per_target_args)
-            if per_rc != 0:
-                print(f"FAIL  target {triple} failed (exit {per_rc})", flush=True)
-                failed_targets.append(triple)
-            else:
-                print(f"OK    target {triple} passed", flush=True)
-        print(
-            f"\nFAIL  cross-verification failed for: {', '.join(failed_targets)}",
-            flush=True,
-        )
+        print(f"FAIL  cargo package exited {rc}", flush=True)
         return 1
 
     ordered: list[dict] = []
