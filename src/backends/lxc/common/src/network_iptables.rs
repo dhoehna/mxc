@@ -391,8 +391,14 @@ impl NetworkIptablesManager {
     }
 
     /// Remove all iptables rules created by this manager.
+    ///
+    /// Gated on owning the *chain*, not on the apply having run to completion.
+    /// `rules_applied` is set only by the last statement of
+    /// [`Self::apply_firewall_rules`], so an apply that failed on any rule
+    /// append between `-N` and that statement leaves a chain this process
+    /// created and nothing willing to remove it.
     pub fn remove_firewall_rules(&mut self, logger: &mut Logger) -> Result<(), String> {
-        if !self.rules_applied {
+        if !self.rules_applied && !self.chain_created {
             return Ok(());
         }
 
@@ -417,6 +423,7 @@ impl NetworkIptablesManager {
         // cleared after a failed one leaks a chain nobody will remove.
         let _ = Self::run_iptables(&["-F", &self.chain_name], logger);
         if Self::run_iptables(&["-X", &self.chain_name], logger).is_ok() {
+            self.chain_created = false;
             crate::signal_cleanup::clear_active_chain_created();
         }
 
@@ -492,7 +499,12 @@ impl NetworkIptablesManager {
 
 impl Drop for NetworkIptablesManager {
     fn drop(&mut self) {
-        if self.rules_applied {
+        // Owning the chain is enough. A `-N` that succeeded and a rule append
+        // that then failed leaves `rules_applied` false, so gating on it alone
+        // dropped the manager while the chain it created was still installed --
+        // and the one-shot runner's error arm returns immediately, so this is
+        // the only teardown that error path ever reaches.
+        if self.rules_applied || self.chain_created {
             let mut logger = wxc_common::logger::Logger::new(wxc_common::logger::Mode::Buffer);
             let _ = self.remove_firewall_rules(&mut logger);
         }
@@ -571,6 +583,45 @@ mod tests {
         // down. A fresh manager has created nothing, so it must claim nothing.
         let mgr = NetworkIptablesManager::new("box");
         assert!(!mgr.chain_created());
+    }
+
+    #[test]
+    fn a_chain_created_before_a_failed_rule_append_is_still_torn_down() {
+        // `rules_applied` is set by the last statement of apply_firewall_rules,
+        // so an apply that failed on any rule between `-N` and that statement
+        // leaves this flag false while the chain it created is installed. The
+        // one-shot runner's error arm returns immediately, so the only teardown
+        // that path reaches is this one -- gating it on `rules_applied` alone
+        // leaked the chain for the life of the host, and a later container
+        // whose name truncates to the same 20 characters would then fail its
+        // own `-N` and refuse to start.
+        let mut mgr = NetworkIptablesManager::new("half-applied");
+        mgr.chain_created = true;
+        assert!(!mgr.rules_applied);
+
+        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+        assert!(mgr.remove_firewall_rules(&mut logger).is_ok());
+        assert!(
+            logger.get_buffer().contains("Removing iptables chain"),
+            "owning the chain must be enough to reach teardown, got: {:?}",
+            logger.get_buffer()
+        );
+    }
+
+    #[test]
+    fn a_manager_that_created_nothing_runs_no_teardown() {
+        // Negative control. Without this the assertion above would pass on a
+        // teardown that had simply stopped gating on anything at all, which
+        // would run `-F`/`-X` against a name this process never claimed -- and
+        // truncated names collide, so that is another container's chain.
+        let mut mgr = NetworkIptablesManager::new("never-applied");
+        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+        assert!(mgr.remove_firewall_rules(&mut logger).is_ok());
+        assert_eq!(
+            logger.get_buffer(),
+            "",
+            "a manager that created nothing must issue no teardown at all"
+        );
     }
 
     #[test]
