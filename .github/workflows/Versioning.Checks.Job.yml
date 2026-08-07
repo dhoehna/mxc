@@ -36,6 +36,9 @@ jobs:
       - name: Check crates.io publish order is in sync (codegen)
         run: python3 .azure-pipelines/scripts/crates_release.py check-template
 
+      - name: Check PSEC generated contract (provenance + drift)
+        run: node scripts/versioning/check-psec-codegen.js
+
       - name: Check SDK wire types are in sync with the Rust wire model (codegen)
         run: node scripts/versioning/check-sdk-types-codegen.js
 
