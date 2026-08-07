@@ -24,6 +24,7 @@
 //!     network: None,
 //!     ui: None,
 //!     timeout_ms: None,
+//!     capture_denials: None,
 //! };
 //! let mut request = build_request(&policy, None)?;
 //! request.set_script("echo hi");
@@ -66,6 +67,7 @@
 //! # let policy = SandboxPolicy {
 //! #     version: "0.7.0-alpha".to_string(),
 //! #     filesystem: None, network: None, ui: None, timeout_ms: None,
+//! #     capture_denials: None,
 //! # };
 //! // Run a command inside a WSL container (Windows, --features wslc).
 //! let wslc = WslcSection { image: "python:3.12".to_string(), ..Default::default() };
