@@ -44,8 +44,64 @@ enum SignalRollback {
     DestroyContainer,
     /// State-aware: the container is provisioned and deliberately outlives this
     /// process, so a signal removes only the firewall this process installed.
-    /// The container is left for a later `stop` or `deprovision` to reclaim.
+    /// The container is stopped, not destroyed, and left for a later `stop` or
+    /// `deprovision` to reclaim.
     NetworkOnly,
+}
+
+/// One action the watchdog takes on a fatal signal.
+///
+/// The watchdog is Linux-only, so this is dead code elsewhere. It stays
+/// compiled on every target rather than being `cfg`-gated so Windows and macOS
+/// CI still type-check and test the ordering.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RollbackStep {
+    /// Halt the container without discarding it.
+    StopContainer,
+    /// Remove the firewall chain and hooks this process created.
+    RemoveFirewall,
+    /// Discard the container entirely.
+    DestroyContainer,
+}
+
+/// The steps a signal rollback runs, in the order they must run.
+///
+/// Ordering is the whole content of this function, and it differs by rollback
+/// kind for a reason.
+///
+/// A state-aware start installs the chain *before* `lxc-start` so the container
+/// is never up without it. The rollback has to preserve that invariant in
+/// reverse: `lxc-start` may already have succeeded when the signal lands, so
+/// removing the firewall first would leave a running container unfiltered with
+/// no process left to notice. Stopping first cannot produce that state.
+///
+/// The one-shot path is the mirror. Its container is going away entirely, and
+/// `destroy` subsumes stopping it, so the only hazard is leaking host state
+/// that outlives the process -- which argues for removing the firewall while
+/// the name is still unambiguous, before the container is gone.
+///
+/// A process that never created the chain must not remove one: chain names
+/// derive from the container name and truncate to 20 characters, so the name
+/// may by now answer for a different, live container.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn rollback_plan(rollback: SignalRollback, chain_created: bool) -> Vec<RollbackStep> {
+    let mut plan = Vec::new();
+    match rollback {
+        SignalRollback::NetworkOnly => {
+            plan.push(RollbackStep::StopContainer);
+            if chain_created {
+                plan.push(RollbackStep::RemoveFirewall);
+            }
+        }
+        SignalRollback::DestroyContainer => {
+            if chain_created {
+                plan.push(RollbackStep::RemoveFirewall);
+            }
+            plan.push(RollbackStep::DestroyContainer);
+        }
+    }
+    plan
 }
 
 /// What the watchdog needs to roll back on a fatal signal: the container
@@ -228,27 +284,27 @@ fn run_watchdog(mask: SigSet) -> ! {
         let Ok(sig) = mask.wait() else { continue };
         let active = std::mem::take(&mut *lock_slot());
         if let Some(name) = active.name {
-            // Remove iptables rules first so the FORWARD hook and chain
-            // don't outlive the container. The veth disappears once the
-            // container is destroyed below; cleaning up first avoids a
-            // dangling reference. Best-effort with a buffered logger so
-            // signal-time output doesn't interleave with whatever else
-            // might still be writing to the host's stdio.
-            //
-            // Only what this process created, though. force_cleanup itself is
-            // ownership-blind — it rebuilds the chain name and removes whatever
-            // is there — so gating the call is what keeps a process that lost
-            // the chain-creation race from deleting the winner's firewall.
+            // Best-effort, with a buffered logger so signal-time output doesn't
+            // interleave with whatever else might still be writing to the
+            // host's stdio. The order comes from `rollback_plan`, which is
+            // where the reasoning about it lives.
             let mut buf_logger = Logger::new(Mode::Buffer);
-            if active.chain_created {
-                NetworkIptablesManager::force_cleanup(
-                    &name,
-                    active.veth.as_deref(),
-                    &mut buf_logger,
-                );
-            }
-            if active.rollback == SignalRollback::DestroyContainer {
-                let _ = LxcContainer::new(&name, None).destroy();
+            for step in rollback_plan(active.rollback, active.chain_created) {
+                match step {
+                    RollbackStep::StopContainer => {
+                        let _ = LxcContainer::new(&name, None).stop();
+                    }
+                    RollbackStep::RemoveFirewall => {
+                        NetworkIptablesManager::force_cleanup(
+                            &name,
+                            active.veth.as_deref(),
+                            &mut buf_logger,
+                        );
+                    }
+                    RollbackStep::DestroyContainer => {
+                        let _ = LxcContainer::new(&name, None).destroy();
+                    }
+                }
             }
         }
         std::process::exit(128 + sig as i32);
@@ -258,6 +314,59 @@ fn run_watchdog(mask: SigSet) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_state_aware_rollback_stops_the_container_before_unfiltering_it() {
+        // The start phase installs the chain before lxc-start so the container
+        // is never up without it. A signal can land after lxc-start has already
+        // succeeded, so a rollback that removed the firewall first would create
+        // exactly the state the ordering exists to prevent -- a running,
+        // unfiltered container with no process left to notice. Nothing later
+        // repairs it: the watchdog exits the process immediately afterward.
+        let plan = rollback_plan(SignalRollback::NetworkOnly, true);
+        assert_eq!(
+            plan,
+            vec![RollbackStep::StopContainer, RollbackStep::RemoveFirewall],
+            "a state-aware rollback must stop the container before removing its firewall"
+        );
+
+        // The container is provisioned to outlive this process, so the rollback
+        // stops it and never destroys it.
+        assert!(
+            !plan.contains(&RollbackStep::DestroyContainer),
+            "a provisioned container must survive a signal"
+        );
+
+        // A process that created no chain must remove none: names truncate to
+        // 20 characters and can collide, so the chain may by now belong to a
+        // different live container. The container this process was starting is
+        // still stopped, because that start is what is being rolled back.
+        assert_eq!(
+            rollback_plan(SignalRollback::NetworkOnly, false),
+            vec![RollbackStep::StopContainer],
+            "a rollback that owns no chain must not remove one"
+        );
+    }
+
+    #[test]
+    fn a_one_shot_rollback_removes_the_firewall_then_destroys_the_container() {
+        // The mirror case. This container is going away entirely and destroy
+        // subsumes stopping it, so the only hazard is host state outliving the
+        // process -- which argues for removing the chain while the name still
+        // unambiguously refers to this container.
+        assert_eq!(
+            rollback_plan(SignalRollback::DestroyContainer, true),
+            vec![RollbackStep::RemoveFirewall, RollbackStep::DestroyContainer],
+        );
+
+        // Same ownership rule, and the destroy is unconditional: a one-shot
+        // container is this process's to reclaim whether or not a chain was
+        // ever created.
+        assert_eq!(
+            rollback_plan(SignalRollback::DestroyContainer, false),
+            vec![RollbackStep::DestroyContainer],
+        );
+    }
 
     /// The registration slot is process-global, so these assertions cannot be
     /// split across test functions without racing each other.
