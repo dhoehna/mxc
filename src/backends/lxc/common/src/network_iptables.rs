@@ -43,6 +43,35 @@ pub(crate) struct CreatedFirewallState {
     v6_dhcp: bool,
 }
 
+/// The two builtin chains a container's jump is hooked into. FORWARD carries
+/// traffic routed through the host; INPUT carries traffic addressed to the host
+/// itself. One ownership flag covers the pair.
+const HOOKS: &[&str] = &["FORWARD", "INPUT"];
+
+/// Attempt `remove` for every hook and report whether all of them succeeded.
+///
+/// Deliberately not `Iterator::all`, which stops at the first failure. One flag
+/// covers the whole pair, so a short-circuit means a failed FORWARD delete
+/// leaves INPUT untried; the flag then stays set, and every retry fails on
+/// FORWARD again -- which by now may fail precisely *because* it already
+/// succeeded -- and never reaches INPUT. The INPUT hook would leak for the life
+/// of the host, and it is the hook covering traffic addressed to the host
+/// itself.
+///
+/// A `-D` for a hook that is already gone is a harmless no-op: it is scoped to
+/// this container's own veth, so it cannot match another container's rule.
+/// Attempting all of them costs nothing and is the only way the second one is
+/// reached.
+fn remove_every_hook(hooks: &[&str], mut remove: impl FnMut(&str) -> bool) -> bool {
+    let mut all_removed = true;
+    for hook in hooks {
+        if !remove(hook) {
+            all_removed = false;
+        }
+    }
+    all_removed
+}
+
 impl CreatedFirewallState {
     /// Everything this manager could have created.
     ///
@@ -982,7 +1011,7 @@ impl NetworkIptablesManager {
                 residual.v4_dhcp = false;
             }
             if created.v4_hooks {
-                let removed = ["FORWARD", "INPUT"].iter().all(|hook| {
+                let removed = remove_every_hook(HOOKS, |hook| {
                     Self::run_iptables(&["-D", hook, "-i", iface, "-j", &self.chain_name], logger)
                         .is_ok()
                 });
@@ -1002,7 +1031,7 @@ impl NetworkIptablesManager {
                 residual.v6_dhcp = false;
             }
             if created.v6_hooks {
-                let removed = ["FORWARD", "INPUT"].iter().all(|hook| {
+                let removed = remove_every_hook(HOOKS, |hook| {
                     Self::run_ip6tables(&["-D", hook, "-i", iface, "-j", &self.chain_name], logger)
                         .is_ok()
                 });
@@ -1567,6 +1596,55 @@ mod tests {
             "a published resource must be torn down, got: {:?}",
             noisy.get_buffer()
         );
+    }
+
+    #[test]
+    fn a_failed_hook_delete_does_not_stop_the_other_hook_being_attempted() {
+        // One ownership flag covers the FORWARD+INPUT pair, so a short-circuit
+        // on the first failure leaves the second hook untried -- and since the
+        // flag stays set, every retry fails on the first hook again and never
+        // reaches the second.  INPUT carries traffic addressed to the host
+        // itself, so leaking it is the hole the chain exists to close.
+        let mut attempted = Vec::new();
+        let all_removed = remove_every_hook(HOOKS, |hook| {
+            attempted.push(hook.to_string());
+            false
+        });
+
+        assert_eq!(
+            attempted,
+            vec!["FORWARD".to_string(), "INPUT".to_string()],
+            "a failing FORWARD delete must not stop INPUT being attempted"
+        );
+        assert!(
+            !all_removed,
+            "ownership must be retained when a delete failed"
+        );
+    }
+
+    #[test]
+    fn ownership_is_given_up_only_when_every_hook_was_removed() {
+        let mut attempted = Vec::new();
+        assert!(
+            remove_every_hook(HOOKS, |hook| {
+                attempted.push(hook.to_string());
+                true
+            }),
+            "every hook was removed, so the flag must clear"
+        );
+        assert_eq!(attempted.len(), 2);
+
+        // The mixed case is the one that motivated this: FORWARD succeeds,
+        // INPUT does not.  The pair is not fully removed, so the flag stays.
+        let mut seen = Vec::new();
+        assert!(
+            !remove_every_hook(HOOKS, |hook| {
+                seen.push(hook.to_string());
+                hook == "FORWARD"
+            }),
+            "a half-removed pair must not report itself removed"
+        );
+        assert_eq!(seen, vec!["FORWARD".to_string(), "INPUT".to_string()]);
     }
 
     #[test]
