@@ -110,6 +110,11 @@ CRATES: list[str] = [
     "mxc-sdk",
 ]
 
+# The pipeline packages this list on a Windows, a Linux, and a macOS agent, so
+# every crate here has to compile on all three.  A platform-specific crate
+# gates its code with cfg and builds to an empty library elsewhere.
+
+
 def _cargo_metadata(manifest_path: str) -> dict:
     result = subprocess.run(
         [
