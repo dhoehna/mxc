@@ -70,6 +70,34 @@ pub(crate) struct CreatedResources {
     v6_hook: bool,
 }
 
+/// Flush and delete the chain, reporting whether it is still owned afterward.
+///
+/// `hooks_remain` gates the entire step, flush included. That ordering is the
+/// point of the function: a hook that survived its own delete still jumps to
+/// this chain, and a flushed chain returns to the caller instead of reaching
+/// its closing DROP. Flushing first would therefore fail a still-running
+/// container open, and `-X` would fail anyway because iptables refuses to
+/// delete a referenced chain -- so the flush buys nothing and costs the
+/// container its filtering. Leaving the chain populated keeps the intermediate
+/// state fail closed, and returning `true` keeps it published so a later pass
+/// retries.
+fn teardown_chain(
+    created_chain: bool,
+    hooks_remain: bool,
+    logger: &mut Logger,
+    mut flush: impl FnMut(&mut Logger),
+    mut delete: impl FnMut(&mut Logger) -> bool,
+) -> bool {
+    if !created_chain {
+        return false;
+    }
+    if hooks_remain {
+        return true;
+    }
+    flush(logger);
+    !delete(logger)
+}
+
 impl CreatedResources {
     /// Whether nothing was created, in which case there is nothing to tear
     /// down and teardown must not run a single iptables command.
@@ -1040,21 +1068,29 @@ impl NetworkIptablesManager {
             }
         }
 
-        // Flush and delete only the chains this attempt created. `-X` is the
-        // command that actually relinquishes the chain, so ownership is only
-        // cleared when it succeeds.
-        if created.v4_chain {
-            let _ = Self::run_iptables(&["-F", chain_name], logger);
-            if Self::run_iptables(&["-X", chain_name], logger).is_ok() {
-                residual.v4_chain = false;
-            }
-        }
-        if created.v6_chain {
-            let _ = Self::run_ip6tables(&["-F", chain_name], logger);
-            if Self::run_ip6tables(&["-X", chain_name], logger).is_ok() {
-                residual.v6_chain = false;
-            }
-        }
+        // Flush and delete only the chains this attempt created, and only once
+        // that family's FORWARD hook is confirmed gone. `-X` is the command
+        // that actually relinquishes the chain, so ownership is only cleared
+        // when it succeeds. The gate is per family because the two chains live
+        // in different tables and are referenced independently.
+        residual.v4_chain = teardown_chain(
+            created.v4_chain,
+            residual.v4_hook,
+            logger,
+            |logger| {
+                let _ = Self::run_iptables(&["-F", chain_name], logger);
+            },
+            |logger| Self::run_iptables(&["-X", chain_name], logger).is_ok(),
+        );
+        residual.v6_chain = teardown_chain(
+            created.v6_chain,
+            residual.v6_hook,
+            logger,
+            |logger| {
+                let _ = Self::run_ip6tables(&["-F", chain_name], logger);
+            },
+            |logger| Self::run_ip6tables(&["-X", chain_name], logger).is_ok(),
+        );
 
         Self::publish_created(&residual);
         residual
@@ -1297,6 +1333,58 @@ mod tests {
             "",
             "a failure that left nothing behind must not begin a teardown"
         );
+    }
+
+    #[test]
+    fn a_flush_is_withheld_while_the_chain_is_still_hooked() {
+        // -F succeeds no matter who references the chain, and an emptied user
+        // chain returns to its caller instead of reaching its own closing DROP.
+        // So flushing a chain FORWARD still jumps to unfilters a container that
+        // may still be running -- a fail-open.  -X would fail anyway on a
+        // referenced chain, so the flush buys nothing and costs the filtering.
+        // The whole step is gated on the hook being confirmed gone.
+        let mut logger = Logger::new(Mode::Buffer);
+        let mut flushed = false;
+        let mut deleted = false;
+        let still_owned = teardown_chain(
+            true,
+            true,
+            &mut logger,
+            |_| flushed = true,
+            |_| {
+                deleted = true;
+                true
+            },
+        );
+
+        assert!(
+            !flushed,
+            "a chain something still jumps to must not be flushed"
+        );
+        assert!(!deleted, "a referenced chain must not be deleted");
+        assert!(
+            still_owned,
+            "a chain left populated is still ours, so a later pass retries it"
+        );
+
+        // Negative control: once the hook is gone the step must actually run
+        // and must release ownership, so the assertions above cannot be
+        // satisfied by never flushing at all.
+        let mut logger = Logger::new(Mode::Buffer);
+        let mut flushed = false;
+        let still_owned = teardown_chain(true, false, &mut logger, |_| flushed = true, |_| true);
+
+        assert!(flushed, "an unreferenced chain must be flushed");
+        assert!(!still_owned, "a chain whose -X succeeded is no longer ours");
+
+        // A chain this attempt never created is not ours to touch at all --
+        // chain names truncate and can collide with a live container.
+        let mut logger = Logger::new(Mode::Buffer);
+        let mut flushed = false;
+        let still_owned = teardown_chain(false, false, &mut logger, |_| flushed = true, |_| true);
+
+        assert!(!flushed, "a chain we did not create must not be flushed");
+        assert!(!still_owned);
     }
 
     #[test]
