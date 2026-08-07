@@ -131,14 +131,51 @@ export interface LxcProvisionConfig {
  * - `enforcementMode` is restricted to the firewall modes. LXC has no
  *   capability-based network enforcement, so `'capabilities'` cannot enforce
  *   anything; start rejects it when the policy carries any restriction.
+ *
+ * The union below is what makes that last bullet true at compile time. An
+ * optional `enforcementMode` alone did not: `{ defaultPolicy: 'block' }` type
+ * checked, then failed at run time, because Rust treats an omitted mode as
+ * `Capabilities` and rejects a restriction it cannot enforce.
+ *
+ * The split mirrors `requires_firewall_enforcement`
+ * (`src/backends/lxc/common/src/state_aware.rs:166`) exactly. A restriction is
+ * a non-empty `allowedHosts`, a non-empty `blockedHosts`, or an explicit
+ * `defaultPolicy: 'block'` — and nothing else. An explicit
+ * `defaultPolicy: 'allow'` and an omitted `defaultPolicy` are *not*
+ * restrictions, so they must keep working without an `enforcementMode`; the
+ * plain start in `run_lxc_state_aware_test.sh` is exactly that case.
  */
-export type LxcNetworkConfig = Pick<
-  NetworkConfig,
-  'defaultPolicy' | 'allowedHosts' | 'blockedHosts'
-> & {
+type LxcFirewallEnforcementMode = 'firewall' | 'both';
+
+/**
+ * A policy carrying at least one restriction LXC can only deliver through
+ * iptables. `enforcementMode` is mandatory here.
+ */
+export interface LxcRestrictedNetworkConfig {
   /** LXC enforces network policy only via iptables. */
-  enforcementMode?: 'firewall' | 'both';
-};
+  enforcementMode: LxcFirewallEnforcementMode;
+  defaultPolicy?: NetworkConfig['defaultPolicy'];
+  allowedHosts?: NetworkConfig['allowedHosts'];
+  blockedHosts?: NetworkConfig['blockedHosts'];
+}
+
+/**
+ * A policy expressing no restriction. `enforcementMode` may be omitted, and
+ * the restrictive fields are forbidden rather than optional so that adding one
+ * moves the value to `LxcRestrictedNetworkConfig`, where the mode is required.
+ */
+export interface LxcUnrestrictedNetworkConfig {
+  /** LXC enforces network policy only via iptables. */
+  enforcementMode?: LxcFirewallEnforcementMode;
+  /** Only the non-restrictive default is expressible without a firewall mode. */
+  defaultPolicy?: Extract<NetworkConfig['defaultPolicy'], 'allow'>;
+  allowedHosts?: never;
+  blockedHosts?: never;
+}
+
+export type LxcNetworkConfig =
+  | LxcRestrictedNetworkConfig
+  | LxcUnrestrictedNetworkConfig;
 
 export interface LxcStartConfig {
   /** Schema version (semver). */

@@ -11,6 +11,7 @@ import {
   IsolationSessionProvisionConfig,
   IsolationSessionStartConfig,
   IsolationSessionUserConfig,
+  LxcNetworkConfig,
   ProvisionMetadataFor,
   ProvisionResult,
   SandboxId,
@@ -213,6 +214,39 @@ describe('LxcStartConfig', () => {
       },
     };
     assert.ok(cfg);
+  });
+
+  it('requires an explicit firewall mode when the policy carries a restriction', () => {
+    // Rust treats an omitted enforcementMode as `Capabilities` and rejects any
+    // restriction it cannot enforce, so an optional mode made these compile and
+    // then fail at run time. See `requires_firewall_enforcement`,
+    // src/backends/lxc/common/src/state_aware.rs:166.
+
+    // @ts-expect-error — an explicit default-deny is a restriction, so the mode is required.
+    const defaultDeny: LxcNetworkConfig = { defaultPolicy: 'block' };
+
+    // @ts-expect-error — allowedHosts is a restriction, so the mode is required.
+    const allowed: LxcNetworkConfig = { allowedHosts: ['example.com'] };
+
+    // @ts-expect-error — blockedHosts is a restriction, so the mode is required.
+    const blocked: LxcNetworkConfig = { blockedHosts: ['blocked.example.com'] };
+
+    assert.ok(defaultDeny);
+    assert.ok(allowed);
+    assert.ok(blocked);
+  });
+
+  it('still accepts the policies Rust does not treat as restrictive', () => {
+    // `requires_firewall_enforcement` counts only a non-empty allowedHosts, a
+    // non-empty blockedHosts, or an explicit `defaultPolicy: 'block'`. An
+    // explicit 'allow' and a policy-free start are not restrictions and must
+    // keep compiling without an enforcementMode; the latter is the plain start
+    // exercised by run_lxc_state_aware_test.sh, which must not be rejected.
+    const explicitAllow: LxcNetworkConfig = { defaultPolicy: 'allow' };
+    const policyFree: LxcNetworkConfig = {};
+
+    assert.strictEqual(explicitAllow.defaultPolicy, 'allow');
+    assert.ok(policyFree);
   });
 });
 
