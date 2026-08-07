@@ -399,7 +399,7 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
       exitCode: 1,
     });
     _setSpawnImpl(fake.spawn);
-    const id = 'wsb:prov-1' as SandboxId<'windows_sandbox'>;
+    const id = 'lxc:prov-1' as SandboxId<'lxc'>;
     await assert.rejects(
       () => execInSandboxAsync(id, { process: { commandLine: 'echo' } }, testOptions()),
       (err: unknown) => err instanceof MxcError && err.code === 'not_started',
@@ -417,7 +417,7 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
       exitCode: 1,
     });
     _setSpawnImpl(fake.spawn);
-    const id = 'wsb:prov-1' as SandboxId<'windows_sandbox'>;
+    const id = 'lxc:prov-1' as SandboxId<'lxc'>;
     await assert.rejects(
       () => execInSandboxAsync(id, { process: { commandLine: 'echo' } }, testOptions()),
       (err: unknown) => err instanceof MxcError && err.code === 'not_started',
@@ -431,9 +431,10 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
     // envelope and handed the caller an ordinary ExecResult -- a run that was
     // killed mid-flight, reported as one that finished with exit code 3.
     //
-    // The guest cannot contaminate this stream: the streaming exec puts the
-    // guest on a pty whose primary end is relayed to the executor's stdout
-    // (mxc_pty run_with_pty), so guest stderr is merged into stdout.
+    // This is an LXC id because LXC is the backend whose executor owns stderr:
+    // its streaming exec puts the guest on a pty whose primary end is relayed
+    // to the executor's stdout (mxc_pty run_with_pty), so guest stderr is
+    // merged into stdout and cannot appear here.
     const fake = fakeSpawn({
       stdout: 'partial output before the kill\n',
       stderr:
@@ -442,7 +443,7 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
       exitCode: 3,
     });
     _setSpawnImpl(fake.spawn);
-    const id = 'iso:abc' as SandboxId<'isolation_session'>;
+    const id = 'lxc:abc' as SandboxId<'lxc'>;
     await assert.rejects(
       execInSandboxAsync(id, { process: { commandLine: 'slow' } }, testOptions()),
       (err: Error) => err.message.includes('script timed out after 5000ms'),
@@ -462,13 +463,49 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
       exitCode: 4,
     });
     _setSpawnImpl(fake.spawn);
-    const id = 'iso:abc' as SandboxId<'isolation_session'>;
+    const id = 'lxc:abc' as SandboxId<'lxc'>;
     const result = await execInSandboxAsync(
       id,
       { process: { commandLine: 'noisy' } },
       testOptions(),
     );
     assert.strictEqual(result.exitCode, 4);
+  });
+
+  it('does not read stderr as an envelope for backends that relay the guest there', async () => {
+    // The stderr fallback rests on LXC merging guest stderr into stdout, and
+    // that reasoning is backend-specific. Windows Sandbox forwards guest
+    // FrameKind::Stderr frames straight to this stream
+    // (backends/windows_sandbox/lifecycle/src/state_aware.rs:408-414), and the
+    // isolation-session exec relays the guest to wxc-exec's own stdout and
+    // stderr. On both, the last stderr line can be the script's own -- so a
+    // script that ends with envelope-shaped stderr and exits nonzero would be
+    // turned into a thrown MxcError rather than the result it actually is.
+    const stderrLookingLikeADispatchFailure =
+      '{"error":{"code":"not_started","message":"the script printed this itself"}}\n';
+
+    for (const id of [
+      'wsb:abc' as SandboxId<'windows_sandbox'>,
+      'iso:abc' as SandboxId<'isolation_session'>,
+    ]) {
+      const fake = fakeSpawn({
+        stdout: 'script output\n',
+        stderr: stderrLookingLikeADispatchFailure,
+        exitCode: 7,
+      });
+      _setSpawnImpl(fake.spawn);
+      const result = await execInSandboxAsync(
+        id as SandboxId<'windows_sandbox'>,
+        { process: { commandLine: 'noisy' } },
+        testOptions(),
+      );
+      assert.strictEqual(
+        result.exitCode,
+        7,
+        `${id} must return the script's result, not throw its stderr as a dispatch failure`,
+      );
+      assert.strictEqual(result.stderr, stderrLookingLikeADispatchFailure);
+    }
   });
 
   it('closes the child stdin so a stdin-reading command sees EOF instead of hanging', async () => {
