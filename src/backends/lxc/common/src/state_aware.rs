@@ -368,7 +368,22 @@ fn apply_network_policy(
             // then start its container with nothing filtering it — turning a
             // recoverable collision into a fail-open.
             if fw_manager.chain_created() {
-                cleanup_network(container.name(), None, logger);
+                // Tear down through the manager that created the chain, not a
+                // fresh one. `Drop` re-runs the teardown whenever
+                // `chain_created` is still set, and a fresh manager cannot clear
+                // that flag on the original -- so cleaning up any other way
+                // leaves this function returning into a second teardown of a
+                // chain it has already deleted. Between the two, another start
+                // can create the same deterministic chain name and install its
+                // rules, and the trailing teardown would then strip the new
+                // owner's hooks and delete its chain, leaving *its* container
+                // running unfiltered.
+                //
+                // Going through `fw_manager` clears `chain_created` on a
+                // successful `-X`, so the drop is a no-op; when `-X` fails the
+                // flag stays set and the drop is the retry it is there to be.
+                // It also knows the pinned veth, which a fresh manager does not.
+                let _ = fw_manager.remove_firewall_rules(logger);
                 return Err(MxcError::policy_validation(format!(
                     "Network policy error: {e}"
                 )));

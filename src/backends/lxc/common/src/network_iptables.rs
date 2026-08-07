@@ -425,10 +425,8 @@ impl NetworkIptablesManager {
         let relinquished = Self::teardown_chain(&chain, hooks_are_gone, &mut |args| {
             Self::run_iptables(args, logger).is_ok()
         });
-        if relinquished {
-            self.chain_created = false;
-            crate::signal_cleanup::clear_active_chain_created();
-        } else if !hooks_are_gone {
+        self.apply_teardown_outcome(relinquished);
+        if !relinquished && !hooks_are_gone {
             logger.log_line(&format!(
                 "Leaving chain {} in place: FORWARD still jumps to it, and flushing a hooked \
                  chain would let traffic through it unfiltered",
@@ -438,6 +436,30 @@ impl NetworkIptablesManager {
 
         self.rules_applied = false;
         Ok(())
+    }
+
+    /// Record whether this manager still owns its chain after a teardown.
+    ///
+    /// A relinquished chain must stop being this manager's responsibility, or
+    /// `Drop` tears it down a second time -- and between the two, another start
+    /// can create the same deterministic chain name and install its rules, so
+    /// the trailing teardown would strip a live container's firewall. A chain
+    /// that could *not* be relinquished must stay owned, so the drop retries it.
+    fn apply_teardown_outcome(&mut self, relinquished: bool) {
+        if relinquished {
+            self.chain_created = false;
+            crate::signal_cleanup::clear_active_chain_created();
+        }
+    }
+
+    /// Whether dropping this manager should still tear its chain down.
+    ///
+    /// Owning the chain is enough. A `-N` that succeeded and a rule append that
+    /// then failed leaves `rules_applied` false while the chain it created is
+    /// installed, and the one-shot runner's error arm returns immediately, so
+    /// the drop is the only teardown that path ever reaches.
+    fn needs_teardown(&self) -> bool {
+        self.rules_applied || self.chain_created
     }
 
     /// Flush and delete `chain`, but only once its hooks are confirmed gone.
@@ -567,12 +589,7 @@ impl NetworkIptablesManager {
 
 impl Drop for NetworkIptablesManager {
     fn drop(&mut self) {
-        // Owning the chain is enough. A `-N` that succeeded and a rule append
-        // that then failed leaves `rules_applied` false, so gating on it alone
-        // dropped the manager while the chain it created was still installed --
-        // and the one-shot runner's error arm returns immediately, so this is
-        // the only teardown that error path ever reaches.
-        if self.rules_applied || self.chain_created {
+        if self.needs_teardown() {
             let mut logger = wxc_common::logger::Logger::new(wxc_common::logger::Mode::Buffer);
             let _ = self.remove_firewall_rules(&mut logger);
         }
@@ -704,6 +721,43 @@ mod tests {
         // down. A fresh manager has created nothing, so it must claim nothing.
         let mgr = NetworkIptablesManager::new("box");
         assert!(!mgr.chain_created());
+    }
+
+    #[test]
+    fn a_relinquished_chain_is_not_torn_down_a_second_time_on_drop() {
+        // The error arm of the start path used to clean up through a *fresh*
+        // manager, which cannot clear the owning manager's state. The owner then
+        // returned into its own `Drop` and tore the chain down again. Between
+        // the two teardowns another start can create the same deterministic
+        // chain name and install its rules, and the trailing teardown would then
+        // strip that live container's hooks and delete its chain -- turning this
+        // process's failed start into someone else's fail-open.
+        let mut mgr = NetworkIptablesManager::new("relinquished");
+        mgr.chain_created = true;
+        assert!(mgr.needs_teardown());
+
+        mgr.apply_teardown_outcome(true);
+        assert!(!mgr.chain_created, "a deleted chain is no longer owned");
+        assert!(
+            !mgr.needs_teardown(),
+            "a chain this manager already relinquished must not be torn down again on drop"
+        );
+    }
+
+    #[test]
+    fn a_chain_that_could_not_be_relinquished_stays_owned_so_drop_retries() {
+        // The negative control. Clearing ownership unconditionally would leak
+        // every chain whose `-X` failed, with nothing left that believes it
+        // owns them.
+        let mut mgr = NetworkIptablesManager::new("still-owned");
+        mgr.chain_created = true;
+
+        mgr.apply_teardown_outcome(false);
+        assert!(mgr.chain_created);
+        assert!(
+            mgr.needs_teardown(),
+            "a chain that could not be deleted must stay owned so the drop retries it"
+        );
     }
 
     #[test]
