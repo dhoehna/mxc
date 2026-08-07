@@ -215,24 +215,26 @@ fn apply_filesystem_policy(
         .map_err(|e| MxcError::policy_validation(format!("Failed to configure filesystem: {e}")))
 }
 
-fn apply_network_policy(
-    container: &LxcContainer,
-    request: &ExecutionRequest,
-    logger: &mut Logger,
-) -> Result<(), MxcError> {
-    if request.policy.network_proxy.is_enabled() {
+/// The network rejections that depend on the requested policy alone.
+///
+/// Split out of `apply_network_policy` so `validate_start` can reach the same
+/// verdict without a container. A dry run stops after `validate_start`
+/// (`state_aware_dispatch.rs`, `Phase::Start`), so anything checked only inside
+/// the apply path is invisible to it -- and a dry run that answers "this start
+/// is fine" for a policy the real start refuses is worse than no dry run, since
+/// the caller has asked precisely that question and been told the wrong answer.
+fn reject_unenforceable_network_policy(policy: &ContainerPolicy) -> Result<(), MxcError> {
+    if policy.network_proxy.is_enabled() {
         return Err(MxcError::policy_validation(
             "LXC state-aware start does not support network.proxy",
         ));
     }
 
-    let policy = normalized_policy(request, logger)?;
-
     // Reject a policy this backend cannot enforce, rather than reporting a
     // successful start that silently leaves the container unfiltered. LXC
     // enforces network policy only through iptables, and `apply_firewall_rules`
     // treats any non-firewall mode as a successful no-op.
-    if requires_firewall_enforcement(&policy) && !uses_firewall_mode(&policy) {
+    if requires_firewall_enforcement(policy) && !uses_firewall_mode(policy) {
         return Err(MxcError::policy_validation(format!(
             "LXC state-aware start cannot enforce this network policy under \
              enforcementMode {:?}: LXC has no capability-based network enforcement, \
@@ -242,6 +244,28 @@ fn apply_network_policy(
             policy.network_enforcement_mode
         )));
     }
+    Ok(())
+}
+
+/// Every start rejection that needs only the request, in the order the real
+/// start reaches them: filesystem normalization first (`apply_filesystem_policy`
+/// runs before `apply_network_policy`), then the network verdicts. Keeping the
+/// order means a dry run reports the same error the real start would, not merely
+/// some error.
+fn validate_start_policy(request: &ExecutionRequest) -> Result<(), MxcError> {
+    let mut logger = Logger::new(Mode::Buffer);
+    let policy = normalized_policy(request, &mut logger)?;
+    reject_unenforceable_network_policy(&policy)
+}
+
+fn apply_network_policy(
+    container: &LxcContainer,
+    request: &ExecutionRequest,
+    logger: &mut Logger,
+) -> Result<(), MxcError> {
+    reject_unenforceable_network_policy(&request.policy)?;
+
+    let policy = normalized_policy(request, logger)?;
 
     let mut fw_manager = NetworkIptablesManager::new(container.name());
 
@@ -603,11 +627,11 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
     fn validate_start(
         &self,
         sandbox_id: &str,
-        _request: &ExecutionRequest,
+        request: &ExecutionRequest,
         _config: Option<&()>,
     ) -> Result<(), MxcError> {
         extract_container_name(sandbox_id)?;
-        Ok(())
+        validate_start_policy(request)
     }
 
     fn validate_exec(
@@ -646,6 +670,7 @@ mod tests {
     use super::*;
     use wxc_common::models::LifecycleConfig;
     use wxc_common::models::NetworkPolicy;
+    use wxc_common::models::ProxyConfig;
     use wxc_common::mxc_error::MxcErrorCode;
 
     fn provision_config() -> LxcConfig {
@@ -920,6 +945,74 @@ mod tests {
             policy: ContainerPolicy {
                 readonly_paths: vec!["/workspace".to_string()],
                 ..Default::default()
+            },
+            ..Default::default()
+        };
+        runner
+            .validate_start("lxc:mxc-abcd1234", &req, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_start_rejects_a_start_the_real_start_would_refuse() {
+        // A dry run stops after `validate_start` and answers with an empty
+        // success envelope (`state_aware_dispatch.rs`, `Phase::Start`). While
+        // the start-only rejections lived inside `apply_network_policy`, the
+        // dry run could not see them, so it answered "this start is fine" for
+        // policies the real start refuses outright -- the one question a dry run
+        // exists to answer, answered wrongly. These are the two rejections that
+        // need nothing but the request.
+        let runner = LxcStateAwareRunner::new();
+
+        let proxy = ExecutionRequest {
+            policy: ContainerPolicy {
+                network_proxy: ProxyConfig {
+                    builtin_test_server: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = runner
+            .validate_start("lxc:mxc-abcd1234", &proxy, None)
+            .unwrap_err();
+        assert_eq!(err.code, MxcErrorCode::PolicyValidation);
+        assert!(
+            err.message.contains("network.proxy"),
+            "expected the proxy rejection, got: {}",
+            err.message
+        );
+
+        // A host restriction under a non-firewall enforcement mode: LXC has no
+        // capability-based network enforcement, so this would start unfiltered.
+        let unenforceable = ExecutionRequest {
+            policy: restrictive_policy(),
+            ..Default::default()
+        };
+        assert!(!uses_firewall_mode(&unenforceable.policy));
+        let err = runner
+            .validate_start("lxc:mxc-abcd1234", &unenforceable, None)
+            .unwrap_err();
+        assert_eq!(err.code, MxcErrorCode::PolicyValidation);
+        assert!(
+            err.message.contains("enforcementMode"),
+            "expected the enforcement-mode rejection, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn validate_start_still_accepts_an_enforceable_restriction() {
+        // The negative control for the test above: the same host restriction
+        // under `firewall` mode is exactly what this backend can enforce, so
+        // validation must not reject it. Without this, "reject everything"
+        // would pass.
+        let runner = LxcStateAwareRunner::new();
+        let req = ExecutionRequest {
+            policy: ContainerPolicy {
+                network_enforcement_mode: NetworkEnforcementMode::Firewall,
+                ..restrictive_policy()
             },
             ..Default::default()
         };
