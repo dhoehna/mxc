@@ -14,7 +14,7 @@ microvm = ["dep:nanvix_binaries", "nanvix_binaries/microvm", "mxc_engine/microvm
 
 [build-dependencies]
 mxc_build_common.workspace = true
-nanvix_build_common = { path = "../../backends/nanvix/build_common" }
+nanvix_build_common = { path = "../../backends/nanvix/build_common", version = "0.7.0" }
 
 [dependencies]
 wxc_common = { workspace = true }
@@ -22,7 +22,7 @@ mxc_engine = { workspace = true }
 lxc_common = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-nanvix_binaries = { path = "../../backends/nanvix/binaries", optional = true }
+nanvix_binaries = { path = "../../backends/nanvix/binaries", version = "0.7.0", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 hyperlight_common = { workspace = true, optional = true }

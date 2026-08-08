@@ -109,7 +109,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 quick-xml = "0.41"
 wxc_common = { path = "core/wxc_common", version = "0.7.0" }
 mxc_engine = { path = "core/mxc_engine", version = "0.7.0" }
-mxc-sdk = { path = "core/mxc-sdk" }
+mxc-sdk = { path = "core/mxc-sdk", version = "0.7.0" }
 appcontainer_common = { path = "backends/appcontainer/common", version = "0.7.0" }
 windows_sandbox_common = { path = "backends/windows_sandbox/common", version = "0.7.0" }
 windows_sandbox_lifecycle = { path = "backends/windows_sandbox/lifecycle", version = "0.7.0" }
@@ -137,4 +137,4 @@ widestring = "1"
 url = "2"
 winreg = "0.55"
 tempfile = "3"
-mxc_build_common = { path = "core/mxc_build_common" }
+mxc_build_common = { path = "core/mxc_build_common", version = "0.7.0" }

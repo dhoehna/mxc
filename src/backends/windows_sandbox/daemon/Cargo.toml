@@ -9,7 +9,7 @@ name = "wxc-windows-sandbox-daemon"
 path = "src/main.rs"
 
 [dependencies]
-wxc_common = { path = "../../../core/wxc_common" }
+wxc_common = { path = "../../../core/wxc_common", version = "0.7.0" }
 windows_sandbox_common = { workspace = true }
 windows_sandbox_lifecycle = { workspace = true }
 tokio.workspace = true
