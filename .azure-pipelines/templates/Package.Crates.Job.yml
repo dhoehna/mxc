@@ -26,31 +26,37 @@ parameters:
       - name: windows_x64
         os: windows
         triplet: x86_64-pc-windows-msvc
+        poolName: Azure-Pipelines-1ESPT-ExDShared
+        poolImage: windows-2022
+        poolOs: windows
       - name: linux_x64
         os: linux
         triplet: x86_64-unknown-linux-gnu
+        poolName: Azure-Pipelines-1ESPT-ExDShared
+        poolImage: ubuntu-latest
+        poolOs: linux
       - name: macos_arm64
         os: macos
         triplet: aarch64-apple-darwin
+        poolName: Azure Pipelines
+        poolVmImage: macOS-15-arm64
+        poolOs: macOS
 
 jobs:
   - ${{ each item in parameters.matrix }}:
     - job: package_crates_${{ item.name }}
       displayName: Package Crates (${{ item.os }})
 
+      # Microsoft-hosted pools take `vmImage`; 1ES pools take `image`.  The
+      # matrix entry sets whichever one its pool uses, so this picks the key
+      # rather than testing the operating system.
       pool:
-        ${{ if eq(item.os, 'macos') }}:
-          name: Azure Pipelines
-          vmImage: macOS-15-arm64
-          os: macOS
-        ${{ if ne(item.os, 'macos') }}:
-          name: Azure-Pipelines-1ESPT-ExDShared
-          ${{ if eq(item.os, 'windows') }}:
-            image: windows-2022
-            os: windows
-          ${{ if eq(item.os, 'linux') }}:
-            image: ubuntu-latest
-            os: linux
+        name: ${{ item.poolName }}
+        ${{ if item.poolImage }}:
+          image: ${{ item.poolImage }}
+        ${{ if item.poolVmImage }}:
+          vmImage: ${{ item.poolVmImage }}
+        os: ${{ item.poolOs }}
 
       variables:
         outDir: $(Build.SourcesDirectory)/out/crates
