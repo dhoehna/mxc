@@ -98,6 +98,7 @@ CRATES: list[str] = [
     "bwrap_common",
     "seatbelt_common",
     "sandbox_spec",
+    "process_security_environment_spec",
     "learning_mode_core",
     "learning_mode_windows",
     "appcontainer_common",
