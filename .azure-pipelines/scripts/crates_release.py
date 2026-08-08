@@ -189,6 +189,7 @@ def _release_order(metadata: dict) -> list[str]:
             dependency["name"]
             for dependency in packages[name]["dependencies"]
             if dependency.get("path") and dependency["name"] in wanted
+            and _survives_publish(dependency)
         }
         for name in wanted
     }
@@ -205,6 +206,16 @@ def _release_order(metadata: dict) -> list[str]:
         ordered.extend(ready)
         placed.update(ready)
     return ordered
+
+
+def _survives_publish(dependency: dict) -> bool:
+    """Whether a path dependency is still named in the published manifest.
+
+    Cargo rewrites path dependencies into registry dependencies when packaging
+    and drops the ones carrying no version, so a version-less dev-dependency
+    never reaches crates.io and never needs a release slot.
+    """
+    return dependency.get("req") not in (None, "*")
 
 
 def _validate_release_graph(metadata: dict) -> dict[str, list[str]]:
@@ -240,7 +251,9 @@ def _validate_release_graph(metadata: dict) -> dict[str, list[str]]:
             dependency_name = dependency["name"]
             if not dependency.get("path") or dependency_name not in packages:
                 continue
-            if dependency.get("req") in (None, "*"):
+            if not _survives_publish(dependency):
+                if dependency.get("kind") == "dev":
+                    continue
                 errors.append(
                     f"{crate} -> {dependency_name}: local dependency is missing "
                     "a registry version"
