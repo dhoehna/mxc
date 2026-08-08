@@ -46,6 +46,7 @@ parameters:
     - mxc_pty
     - mxc_telemetry
     - nanvix_common
+    - process_security_environment_spec
     - sandbox_spec
     - wxc_common
     - hyperlight_common
