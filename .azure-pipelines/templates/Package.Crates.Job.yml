@@ -39,7 +39,7 @@ parameters:
         os: macos
         triplet: aarch64-apple-darwin
         poolName: Azure Pipelines
-        poolVmImage: macOS-15-arm64
+        poolImage: macOS-15-arm64
         poolOs: macOS
 
 jobs:
@@ -47,15 +47,15 @@ jobs:
     - job: package_crates_${{ item.name }}
       displayName: Package Crates (${{ item.os }})
 
-      # Microsoft-hosted pools take `vmImage`; 1ES pools take `image`.  The
-      # matrix entry sets whichever one its pool uses, so this picks the key
-      # rather than testing the operating system.
+      # macOS is not offered by the 1ES managed pool, so it runs on the
+      # Microsoft-hosted pool, which names the image `vmImage` rather than
+      # `image`.
       pool:
         name: ${{ item.poolName }}
-        ${{ if item.poolImage }}:
+        ${{ if eq(item.os, 'macos') }}:
+          vmImage: ${{ item.poolImage }}
+        ${{ else }}:
           image: ${{ item.poolImage }}
-        ${{ if item.poolVmImage }}:
-          vmImage: ${{ item.poolVmImage }}
         os: ${{ item.poolOs }}
 
       variables:
