@@ -1,76 +1,23 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 #
-# Packages the mxc-sdk crate closure into .crate files, once per operating
-# system, on that system's own agent.  `cargo package` compiles each crate to
-# verify it, so a leg proves the closure builds natively on its OS.
+# Packages the mxc-sdk crate closure into .crate files, once per OS on that
+# OS's own agent.  cargo package compiles every crate, so each leg proves the
+# closure builds natively there.  Only the Windows leg publishes the artifact;
+# the other two are verification.
 #
-# The .crate archive is the crate's source rather than a build output, so the
-# legs are expected to produce equivalent tarballs; nothing here compares them.
-# Only the Windows leg publishes them as the mxc-crates-package artifact; the
-# other two are verification.
-#
-# --registry works around rust-lang/cargo#17196 (still open as of the 1.93
-# toolchain this repo pins), where the overlay holding just-packaged workspace
-# siblings is registered under the pre-replacement source id and looked up
-# under the post-replacement one.  Both feeds below replace crates-io, so the
-# value has to name whichever feed this leg actually configured.  Note the two
-# ways of getting it wrong fail differently: naming crates-io re-triggers the
-# overlay mismatch above, while naming a feed this leg did not configure fails
-# earlier and more obviously with "registry index was not found in any
-# configuration".
-#
-# Packaging itself is plain cargo.  The helper script is still used for the two
-# things cargo does not do: the check-template gate that keeps both copies of
-# the crate list honest, and -- copied into the artifact -- the stage and
-# verify-order subcommands the release job runs without a checkout.
+# The crate list is not written down here.  `crates_release.py order` derives
+# it from cargo metadata, and the steps below ask it.
 
 parameters:
-  # Official builds resolve through the internal Mxc-Azure-Feed, which
-  # Cargo.Setup.Private.yml authenticates to.  Unofficial and fork builds use
-  # the public MxcDependencies mirror instead, which is anonymous-read and needs
-  # no credentials they do not have.  Defaults to true so 1ES.Release.Crates.yml,
-  # which is always official, needs no parameters at its call site.
+  # Official builds resolve through the authenticated Mxc-Azure-Feed; unofficial
+  # and fork builds use the anonymous MxcDependencies mirror.
   - name: isOfficialBuild
     type: boolean
     default: true
   - name: cratesArtifactName
     type: string
     default: mxc-crates-package
-  # Leaf-first crate order, expanded at compile time into the `-p` flags for a
-  # single `cargo package` call and used as the order of release-order.json.
-  #
-  # GENERATED.  Do not hand-edit or hand-sort.  Regenerate with:
-  #   python3 .azure-pipelines/scripts/crates_release.py order
-  #
-  # This is the same list Publish.CratesIo.Job.yml carries.  It has to be
-  # duplicated because an Azure Pipelines template cannot read another
-  # template's parameter defaults, so the check-template step below runs once
-  # per file and fails the build if either copy drifts from the workspace.
-  - name: crateOrder
-    type: object
-    default:
-    - isolation_session_bindings
-    - learning_mode_core
-    - mxc_pty
-    - mxc_telemetry
-    - nanvix_common
-    - process_security_environment_spec
-    - sandbox_spec
-    - wxc_common
-    - hyperlight_common
-    - isolation_session_common
-    - learning_mode_windows
-    - lxc_common
-    - nanvix_runner
-    - seatbelt_common
-    - windows_sandbox_common
-    - wslc_common
-    - appcontainer_common
-    - bwrap_common
-    - windows_sandbox_lifecycle
-    - mxc_engine
-    - mxc-sdk
   - name: matrix
     type: object
     default:
@@ -111,8 +58,9 @@ jobs:
 
       variables:
         outDir: $(Build.SourcesDirectory)/out/crates
-        # Must name the feed that replaced crates-io on this leg -- see the
-        # cargo#17196 note at the top of this file.
+        # Must name the feed that replaced crates-io on this leg: under source
+        # replacement cargo registers the just-packaged sibling overlay under
+        # one source id and looks it up under the other (rust-lang/cargo#17196).
         ${{ if eq(parameters.isOfficialBuild, true) }}:
           cargoRegistry: Mxc-Azure-Feed
         ${{ else }}:
@@ -131,8 +79,6 @@ jobs:
           parameters:
             targetTriple: ${{ item.triplet }}
 
-        # 1ES network isolation blocks crates.io either way, so one of these
-        # two mirrors always has to be configured.
         - ${{ if eq(parameters.isOfficialBuild, true) }}:
           - template: Cargo.Setup.Private.yml@self
         - ${{ else }}:
@@ -143,25 +89,14 @@ jobs:
               $ErrorActionPreference = 'Stop'
               & $(python) .azure-pipelines/scripts/crates_release.py check-template --manifest-path src/Cargo.toml --template-path .azure-pipelines/templates/Publish.CratesIo.Job.yml
               if ($LASTEXITCODE -ne 0) { throw "check-template failed with exit $LASTEXITCODE" }
-              & $(python) .azure-pipelines/scripts/crates_release.py check-template --manifest-path src/Cargo.toml --template-path .azure-pipelines/templates/Package.Crates.Job.yml --require-full
-              if ($LASTEXITCODE -ne 0) { throw "check-template failed with exit $LASTEXITCODE" }
             displayName: Verify crate order matches the workspace
             workingDirectory: $(Build.SourcesDirectory)
 
-        # Cargo builds the sibling overlay it verifies each crate against in
-        # target/package and never prunes it, so .crate files left by an
-        # earlier run with different versions survive there and make this run
-        # fail with "no hash listed for <crate>" (rust-lang/cargo#16011).
-        # Whether a given agent starts clean is a pool property this template
-        # cannot check, so it always removes the directory.
-        #
-        # One cargo call packages the whole closure: cargo resolves the crates
-        # against each other inside that overlay, which is the only way to
-        # package a crate whose path dependencies are not on the registry yet.
-        # --registry has to name the feed that replaced crates-io on this leg,
-        # or cargo looks the overlay up under the wrong source id
-        # (rust-lang/cargo#17196).  Verification stays on, so this really does
-        # build every crate from its packaged form.
+        # Cargo never prunes the sibling overlay it builds in target/package, so
+        # .crate files left by an earlier run with different versions survive
+        # and fail this run with "no hash listed for <crate>"
+        # (rust-lang/cargo#16011).  Whether an agent starts clean is a pool
+        # property this template cannot check, so it always removes it.
         - pwsh: |
             $ErrorActionPreference = 'Stop'
             $targetDir = (cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json).target_directory
@@ -171,25 +106,24 @@ jobs:
                 Write-Host "removing stale $packageDir"
                 Remove-Item -Recurse -Force $packageDir
             }
-            cargo package --manifest-path src/Cargo.toml --registry $(cargoRegistry) -p ${{ join(' -p ', parameters.crateOrder) }}
+            $order = @(& $(python) .azure-pipelines/scripts/crates_release.py order --manifest-path src/Cargo.toml --format plain)
+            if ($LASTEXITCODE -ne 0) { throw "crates_release.py order failed with exit $LASTEXITCODE" }
+            Write-Host "packaging $($order.Count) crates"
+            # One cargo call for the whole closure: cargo resolves the crates
+            # against each other inside the overlay, which is the only way to
+            # package a crate whose path dependencies are not on a registry yet.
+            $packageArgs = @($order | ForEach-Object { '-p', $_ })
+            cargo package --manifest-path src/Cargo.toml --registry $(cargoRegistry) @packageArgs
             if ($LASTEXITCODE -ne 0) { throw "cargo package failed with exit $LASTEXITCODE" }
           displayName: Package crate closure
           workingDirectory: $(Build.SourcesDirectory)
 
         - ${{ if eq(item.os, 'windows') }}:
-          # release-order.json is the hand-off to the publish stage.  It pins
-          # the order ESRP uploads in, the sha256 of every file so staging can
-          # fail closed if the artifact does not match what this build
-          # produced, and the first-party dependency edges verify-order uses to
-          # prove the published sequence is still leaf-first.
-          #
-          # The edges come straight out of `cargo metadata`: a dependency
-          # counts when it is a path dependency, is itself in crateOrder, and
-          # is not dev-only.  That is set membership, not a second copy of the
-          # script's release-graph logic -- the validation it does (every local
-          # dependency carries a registry version, and none is missing from
-          # CRATES) already ran in the check-template step above, which fails
-          # the build before anything is packaged.
+          # release-order.json hands the publish stage the upload order, the
+          # sha256 of every file so staging fails closed on a mismatched
+          # artifact, and the first-party dependency edges verify-order uses to
+          # prove the published sequence is leaf-first.  An edge is a path
+          # dependency that is itself in the closure and is not dev-only.
           - pwsh: |
               $ErrorActionPreference = 'Stop'
               $metadata = cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json
@@ -198,7 +132,8 @@ jobs:
               $outDir = '$(outDir)'
               New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-              $order = '${{ join(',', parameters.crateOrder) }}' -split ','
+              $order = @(& $(python) .azure-pipelines/scripts/crates_release.py order --manifest-path src/Cargo.toml --format plain)
+              if ($LASTEXITCODE -ne 0) { throw "crates_release.py order failed with exit $LASTEXITCODE" }
               $position = @{}
               for ($i = 0; $i -lt $order.Count; $i++) { $position[$order[$i]] = $i }
 

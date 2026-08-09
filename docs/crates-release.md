@@ -88,22 +88,20 @@ caught before the release, at PR time, which is what `check-template` does.
 python3 .azure-pipelines/scripts/crates_release.py order
 ```
 
-That prints the list ready to paste over the `crateOrder` default. **Two
-templates carry that list** — `.azure-pipelines/templates/Publish.CratesIo.Job.yml`
-and `.azure-pipelines/templates/Package.Crates.Job.yml` — because an Azure
-Pipelines template cannot read another template's parameter defaults. Paste the
-same output over both. The command validates the graph before printing, so a
-broken workspace produces a named error rather than a list that fails halfway
-through a release.
+That prints the list ready to paste over the `crateOrder` default in
+`.azure-pipelines/templates/Publish.CratesIo.Job.yml`, which is the only place
+the order is written down. That template needs the list at compile time, because
+`${{ each }}` generates one ESRP task per crate and cannot read runtime data.
+`Package.Crates.Job.yml` calls `order` at run time instead and carries no copy.
+The command validates the graph before printing, so a broken workspace produces
+a named error rather than a list that fails halfway through a release.
 
 To add a crate, put the package name anywhere in the `CRATES` list in
 `.azure-pipelines/scripts/crates_release.py` — that list is an unordered *set*
 of what to publish, not an ordering — then run the command above and paste the
-result over both copies of `crateOrder`. All three steps are required, and
-`check-template` is what catches doing only some of them: the packaging job
-runs it once per template. `verify-order` does **not**: it accepts an ordered
-subset by design, so a stale `crateOrder` passes it and the new crate is simply
-never published.
+result over `crateOrder`. `check-template` catches doing only the first step.
+`verify-order` does **not**: it accepts an ordered subset by design, so a stale
+`crateOrder` passes it and the new crate is simply never published.
 
 ## How versions are determined
 
@@ -308,11 +306,10 @@ To resume:
    back, which crates.io then rejects. Do not bump the crate version; the
    remaining crates still need to publish at the version that failed.
 
-   **Leave the copy in `Package.Crates.Job.yml` alone.** A resume trims what
-   gets *published*, not what gets *packaged*: the publish stage can only
-   upload a crate the package stage produced. `check-template --require-full`
-   enforces this — a `RESUME-SUBSET` marker in that template fails the build.
-   Packaging a crate that is already live is harmless; nothing uploads it.
+   Packaging is unaffected: `Package.Crates.Job.yml` derives its list from the
+   workspace, so it repackages the full closure. That is intended — a resume
+   trims what gets *published*, not what gets *packaged*, and packaging a crate
+   that is already live is harmless because nothing uploads it.
 
    Add a `RESUME-SUBSET` marker line directly above `default:`, naming the run
    this is resuming:
@@ -357,14 +354,12 @@ The `verify-order` guard accepts a subset of the original order as long as it
 is still in correct leaf-first sequence. It logs a warning naming every
 dependency it assumes is already live.
 
-`check-template` is invoked from two places in the tree, and each of them now
-runs it twice — once per template that carries a `crateOrder` — so a resume has
-to satisfy every pipeline that reaches them. The GitHub `Versioning Checks`
-workflow runs it directly, and the shared ADO packaging job runs it before any
-artifact is produced — which means it also runs inside the release pipeline,
-because a release ref can be pushed straight to `microsoft/mxc` without ever
-opening a pull request, and the pull-request checks alone would leave the
-irreversible path unguarded.
+`check-template` is invoked from two places in the tree. The GitHub
+`Versioning Checks` workflow runs it directly, and the shared ADO packaging job
+runs it before any artifact is produced — which means it also runs inside the
+release pipeline, because a release ref can be pushed straight to
+`microsoft/mxc` without ever opening a pull request, and the pull-request checks
+alone would leave the irreversible path unguarded.
 
 That is why step 3 requires the `RESUME-SUBSET` marker. Without it the release
 pipeline refuses to publish a short list at all, which is the point: a trimmed
@@ -444,7 +439,7 @@ These must be resolved before the first real (non-dry-run) publish:
 | File | Purpose |
 |------|---------|
 | `.azure-pipelines/1ES.Release.Crates.yml` | Top-level release pipeline (parameters, release-ref gate, stage wiring) |
-| `.azure-pipelines/templates/Package.Crates.Job.yml` | Packaging job — carries `crateOrder`, calls `cargo package` directly, writes `release-order.json`, produces the artifact |
+| `.azure-pipelines/templates/Package.Crates.Job.yml` | Packaging job — derives the crate list from the workspace, calls `cargo package` directly, writes `release-order.json`, produces the artifact |
 | `.azure-pipelines/templates/Publish.CratesIo.Job.yml` | ESRP publish job — carries `crateOrder`, runs `verify-order`, stage, publish loop |
 | `.azure-pipelines/scripts/crates_release.py` | Source of truth for `CRATES`, and the `order`, `check-template`, `verify-order`, and `stage` subcommands the pipeline runs. Its `package` subcommand is a local-reproduction convenience; the pipeline calls `cargo package` itself |
 | `src/Cargo.toml` | Workspace version (single source of truth for all crate versions) |

@@ -15,34 +15,24 @@
 #
 # Resuming a failed release: re-queue with the already-published crates
 # removed from crateOrder.  verify-order accepts that subset only if it is
-# still in packaged leaf-first order, and check-template additionally requires
-# a RESUME-SUBSET marker in this file declaring the intent -- without it, a
-# short list is treated as a stale template and fails the build.
+# still in packaged leaf-first order, and check-template requires a
+# RESUME-SUBSET marker in this file declaring the intent.
 
 parameters:
   - name: ESRPInfo
     type: object
   # Leaf-first crate order, a topological sort of the workspace dependency
-  # graph.
-  #
-  # GENERATED.  Do not hand-edit or hand-sort.  Regenerate with:
+  # graph.  GENERATED -- do not hand-edit or hand-sort.  Regenerate with:
   #
   #   python3 .azure-pipelines/scripts/crates_release.py order
   #
-  # and paste the output over every line below.
+  # Static YAML because ${{ each }} expands at compile time and cannot read
+  # runtime data.  This is the only hand-maintained copy: Package.Crates.Job.yml
+  # derives the same list at run time.
   #
-  # Static YAML because ${{ each }} expands at compile time.  verify-order
-  # catches a stale copy at run time, before anything is published.
-  #
-  # ADDING A CRATE: add the package name to the CRATES list in
-  # scripts/crates_release.py, then run the command above and paste the result
-  # here AND over the identical crateOrder in Package.Crates.Job.yml.  All
-  # three steps are required; check-template runs once per template.
-  #
-  # Drop already-published crates from this list to resume a failed release,
-  # keeping the survivors in their existing relative order.  Leave the copy in
-  # Package.Crates.Job.yml complete -- a resume trims what is published, not
-  # what is packaged.
+  # ADDING A CRATE: add the name to CRATES in scripts/crates_release.py, then
+  # regenerate and paste here.  To resume a failed release, drop the
+  # already-published crates, keeping the survivors in relative order.
   - name: crateOrder
     type: object
     default:

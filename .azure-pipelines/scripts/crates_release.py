@@ -11,16 +11,10 @@ crate at a time in leaf-first order, an order this helper validates offline
 against the workspace's real dependency edges.
 
 The release pool enforces 1ES network isolation (CFSClean), which blocks
-crates.io. This helper therefore performs NO crates.io reads. The guarantees
-that used to depend on them are covered earlier or elsewhere:
-
-  * a dependency's version requirement matching its real version is enforced by
-    `cargo package` itself at packaging time (it fails the build);
-  * leaf-first ordering is enforced offline by `_validate_release_graph`;
-  * a dependency crate existing at all is enforced server-side by crates.io,
-    which rejects a publish naming an unknown crate;
-  * yank detection and the published-checksum audit are out-of-band concerns
-    and do not belong in the isolated release job.
+crates.io, so this helper performs no crates.io reads. `cargo package` already
+fails the build on a version requirement that does not match, crates.io itself
+rejects a publish naming an unknown crate, and `_validate_release_graph`
+enforces leaf-first ordering offline.
 
 Subcommands
 -----------
@@ -30,9 +24,10 @@ package       Package the complete first-party closure locally, writing `.crate`
               directly and writes release-order.json in PowerShell.
 
 order         Print the leaf-first publish order, derived from `cargo metadata`.
-              Developer-facing: paste its output over the `crateOrder` default
-              in BOTH templates/Publish.CratesIo.Job.yml and
-              templates/Package.Crates.Job.yml. Not used by the pipeline.
+              The packaging job calls this to build its `cargo package -p` list.
+              Paste its output over the `crateOrder` default in
+              templates/Publish.CratesIo.Job.yml, which needs the list at
+              template-compile time and so cannot call it.
 
 verify-order  Assert that the crates the pipeline is about to publish are a
               correctly-ordered subset of what was packaged. A partial subset is
@@ -67,28 +62,18 @@ import sys
 # pipeline (.azure-pipelines/1ES.Release.Crates.yml) is manual-trigger only and
 # defaults to a dry run, so nothing reaches crates.io until that is settled.
 #
-# ORDER HERE IS NOT MEANINGFUL.  This is the SET of packages to publish.  The
-# publish order is a topological sort of the dependency graph computed by
-# _release_order() from `cargo metadata`, so no one maintains a leaf-first
-# ordering by hand.  The list is kept in dependency order below purely because
-# it reads well next to the pipeline logs.
+# ORDER HERE IS NOT MEANINGFUL.  This is the SET of packages to publish;
+# _release_order() topologically sorts it from `cargo metadata`.
 #
-# ADDING A CRATE:
+# ADDING A CRATE: add the name here, anywhere, then regenerate the one
+# hand-maintained copy of the order:
 #
-#   1. Add the package name to this list.  Anywhere.
-#   2. Regenerate crateOrder and paste the output over BOTH copies of it:
-#        python3 .azure-pipelines/scripts/crates_release.py order
-#      (writes YAML lines for the `crateOrder` default in
-#      .azure-pipelines/templates/Publish.CratesIo.Job.yml and in
-#      .azure-pipelines/templates/Package.Crates.Job.yml -- the list is
-#      duplicated because an Azure Pipelines template cannot read another
-#      template's parameter defaults, and check-template runs once per file)
+#   python3 .azure-pipelines/scripts/crates_release.py order
 #
-# That is the whole procedure.  `order` validates the graph before printing,
-# so a bad edit produces a named error rather than a list that fails mid
-# release.  Forgetting step 1 is caught too: check-template runs
-# _validate_release_graph, which fails with "local dependency is missing from
-# CRATES" as soon as any published crate depends on the new one.
+# and paste it over the `crateOrder` default in
+# .azure-pipelines/templates/Publish.CratesIo.Job.yml.  Forgetting either step
+# is caught: `order` validates the graph before printing, and check-template
+# fails with "local dependency is missing from CRATES".
 #
 # The pipeline cannot use `cargo publish --workspace` (which would order the
 # publish itself) because ESRP performs the upload, one .crate file at a time,
@@ -621,26 +606,19 @@ def cmd_check_template(args: argparse.Namespace) -> int:
     """Assert the template's crateOrder equals the computed order.
 
     Without this, forgetting to regenerate the template fails OPEN rather than
-    closed. `verify-order` accepts a subset on purpose, because that is how an
-    operator resumes a part-published release -- so a template that is missing a
-    newly-added crate passes it, and the crate is silently never published. That
-    is only visible as a PARTIAL RELEASE warning in a release log nobody reads
-    until afterwards, and a missed publish is not fixable by re-running: the
-    crates that did land cannot be republished.
+    closed: `verify-order` accepts a subset on purpose (that is how an operator
+    resumes a part-published release), so a template missing a newly-added crate
+    passes it and the crate is silently never published. That is only visible as
+    a PARTIAL RELEASE warning after the fact, and it is not fixable by
+    re-running, because the crates that did land cannot be republished.
 
-    There are two call sites, and they cover different moments. The GitHub
-    Versioning Checks workflow calls it at PR time, which is where drift is
-    cheap to fix. The shared ADO packaging job calls it too, which means every
-    pipeline that packages -- including the release pipeline -- rechecks at
-    release time, where drift is irreversible. PR-time checks alone cannot
-    cover that, because a release ref can be pushed straight to the remote
-    without ever opening a pull request.
+    Two call sites: the GitHub Versioning Checks workflow catches drift at PR
+    time, and the ADO packaging job rechecks at release time, which a PR-time
+    check cannot cover because a release ref can be pushed without a PR.
 
-    A deliberate resume is the one legitimate reason for the template to hold a
-    short list, and it is declared in the template itself with a RESUME-SUBSET
-    marker rather than a pipeline parameter, so the release ref carries the
-    intent. A resume list still has to be an ordered subsequence of the computed
-    order; trimming is allowed, reordering is not.
+    A deliberate resume is declared in the template with a RESUME-SUBSET marker,
+    so the release ref carries the intent. Trimming is allowed; reordering is
+    not.
     """
     metadata = _cargo_metadata(args.manifest_path)
     _validate_release_graph(metadata)
@@ -648,18 +626,6 @@ def cmd_check_template(args: argparse.Namespace) -> int:
     actual, resume_reason = _template_crate_order(args.template_path)
 
     if resume_reason is not None:
-        # A resume trims what gets published.  It must never trim what gets
-        # packaged: the publish stage can only upload a crate the package stage
-        # produced, and verify-order resolves every crate through
-        # release-order.json.  Packaging a crate that is already live costs one
-        # `cargo package` and uploads nothing, so the packaging template always
-        # carries the full closure.
-        if args.require_full:
-            print(f"FAIL  {args.template_path} declares a RESUME-SUBSET marker, which is not allowed in this template.")
-            print(f"    reason given : {resume_reason}")
-            print("    A resume trims the publish list only.  Restore the full crateOrder here and")
-            print("    trim Publish.CratesIo.Job.yml instead.")
-            return 1
         unknown = [name for name in actual if name not in expected]
         if unknown:
             print(f"FAIL  {args.template_path} declares a resume subset naming unknown crates: {unknown}")
@@ -767,14 +733,6 @@ def main() -> int:
         help="CI guard: assert the template's crateOrder equals the computed order",
     )
     check_template.add_argument("--manifest-path", default="src/Cargo.toml")
-    check_template.add_argument(
-        "--require-full",
-        action="store_true",
-        help=(
-            "reject a RESUME-SUBSET marker; use for templates that must always "
-            "carry the whole closure, such as Package.Crates.Job.yml"
-        ),
-    )
     check_template.add_argument(
         "--template-path",
         default=".azure-pipelines/templates/Publish.CratesIo.Job.yml",
