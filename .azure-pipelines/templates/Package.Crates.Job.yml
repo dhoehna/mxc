@@ -6,8 +6,8 @@
 # closure builds natively there.  Only the Windows leg publishes the artifact;
 # the other two are verification.
 #
-# The crate list is not written down here.  `crates_release.py order` derives
-# it from cargo metadata, and the steps below ask it.
+# The crate list is not written down here.  The steps derive it from
+# cargo metadata: everything mxc-sdk needs, transitively.
 
 parameters:
   # Official builds resolve through the authenticated Mxc-Azure-Feed; unofficial
@@ -65,12 +65,6 @@ jobs:
           cargoRegistry: Mxc-Azure-Feed
         ${{ else }}:
           cargoRegistry: MxcDependencies
-        # python3 on Windows is often an App Execution Alias stub that opens
-        # the Store.
-        ${{ if eq(item.os, 'windows') }}:
-          python: python
-        ${{ if ne(item.os, 'windows') }}:
-          python: python3
 
       steps:
         - checkout: self
@@ -84,14 +78,6 @@ jobs:
         - ${{ else }}:
           - template: Cargo.Setup.Public.yml@self
 
-        - ${{ if eq(item.os, 'windows') }}:
-          - pwsh: |
-              $ErrorActionPreference = 'Stop'
-              & $(python) .azure-pipelines/scripts/crates_release.py check-template --manifest-path src/Cargo.toml --template-path .azure-pipelines/templates/Publish.CratesIo.Job.yml
-              if ($LASTEXITCODE -ne 0) { throw "check-template failed with exit $LASTEXITCODE" }
-            displayName: Verify crate order matches the workspace
-            workingDirectory: $(Build.SourcesDirectory)
-
         # Cargo never prunes the sibling overlay it builds in target/package, so
         # .crate files left by an earlier run with different versions survive
         # and fail this run with "no hash listed for <crate>"
@@ -99,20 +85,42 @@ jobs:
         # property this template cannot check, so it always removes it.
         - pwsh: |
             $ErrorActionPreference = 'Stop'
-            $targetDir = (cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json).target_directory
-            $packageDir = Join-Path $targetDir 'package'
+            $metadata = cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit $LASTEXITCODE" }
+            $byName = @{}
+            foreach ($package in $metadata.packages) { $byName[$package.name] = $package }
+
+            # Everything mxc-sdk needs, transitively.  Read from the manifests
+            # rather than a resolved tree: `cargo tree` resolves for the current
+            # platform and would drop the crates gated to another OS, so the
+            # three legs would package different sets.
+            $wanted = New-Object 'System.Collections.Generic.HashSet[string]'
+            $stack = [System.Collections.Stack]::new()
+            $null = $stack.Push('mxc-sdk')
+            while ($stack.Count -gt 0)
+            {
+                $name = $stack.Pop()
+                if (-not $wanted.Add($name)) { continue }
+                foreach ($dep in $byName[$name].dependencies)
+                {
+                    if ($dep.path -and $dep.kind -ne 'dev' -and $byName.ContainsKey($dep.name)) { $null = $stack.Push($dep.name) }
+                }
+            }
+            Write-Host "packaging $($wanted.Count) crates"
+            Write-Host "##vso[task.setvariable variable=packagedCrates]$(@($wanted) -join ',')"
+
+            $packageDir = Join-Path $metadata.target_directory 'package'
             if (Test-Path $packageDir)
             {
                 Write-Host "removing stale $packageDir"
                 Remove-Item -Recurse -Force $packageDir
             }
-            $order = @(& $(python) .azure-pipelines/scripts/crates_release.py order --manifest-path src/Cargo.toml --format plain)
-            if ($LASTEXITCODE -ne 0) { throw "crates_release.py order failed with exit $LASTEXITCODE" }
-            Write-Host "packaging $($order.Count) crates"
             # One cargo call for the whole closure: cargo resolves the crates
             # against each other inside the overlay, which is the only way to
             # package a crate whose path dependencies are not on a registry yet.
-            $packageArgs = @($order | ForEach-Object { '-p', $_ })
+            # The order of -p flags does not matter; cargo packages them in its
+            # own leaf-first order.
+            $packageArgs = @(@($wanted) | ForEach-Object { '-p', $_ })
             cargo package --manifest-path src/Cargo.toml --registry $(cargoRegistry) @packageArgs
             if ($LASTEXITCODE -ne 0) { throw "cargo package failed with exit $LASTEXITCODE" }
           displayName: Package crate closure
@@ -123,7 +131,8 @@ jobs:
           # sha256 of every file so staging fails closed on a mismatched
           # artifact, and the first-party dependency edges verify-order uses to
           # prove the published sequence is leaf-first.  An edge is a path
-          # dependency that is itself in the closure and is not dev-only.
+          # dependency that is itself in the closure and is not dev-only, which
+          # is what cargo metadata reports directly.
           - pwsh: |
               $ErrorActionPreference = 'Stop'
               $metadata = cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json
@@ -132,8 +141,40 @@ jobs:
               $outDir = '$(outDir)'
               New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-              $order = @(& $(python) .azure-pipelines/scripts/crates_release.py order --manifest-path src/Cargo.toml --format plain)
-              if ($LASTEXITCODE -ne 0) { throw "crates_release.py order failed with exit $LASTEXITCODE" }
+              $wanted = New-Object 'System.Collections.Generic.HashSet[string]'
+              foreach ($name in ('$(packagedCrates)' -split ',')) { $null = $wanted.Add($name) }
+              $byName = @{}
+              foreach ($package in $metadata.packages) { $byName[$package.name] = $package }
+
+              $edges = @{}
+              foreach ($name in $wanted)
+              {
+                  $edges[$name] = @($byName[$name].dependencies |
+                      Where-Object { $_.path -and $_.kind -ne 'dev' -and $wanted.Contains($_.name) } |
+                      ForEach-Object { $_.name } |
+                      Sort-Object -Unique)
+              }
+
+              # Leaf-first order: repeatedly emit every crate whose dependencies
+              # are already placed.  Ties broken ordinally so the output is
+              # stable and matches what crates_release.py computes for the
+              # publish template.
+              $placed = New-Object 'System.Collections.Generic.HashSet[string]'
+              $order = New-Object 'System.Collections.Generic.List[string]'
+              while ($order.Count -lt $wanted.Count)
+              {
+                  $ready = @(foreach ($name in $wanted)
+                  {
+                      if ($placed.Contains($name)) { continue }
+                      $blocked = $false
+                      foreach ($dep in $edges[$name]) { if (-not $placed.Contains($dep)) { $blocked = $true; break } }
+                      if (-not $blocked) { $name }
+                  })
+                  if ($ready.Count -eq 0) { throw "dependency cycle among: $(@($wanted | Where-Object { -not $placed.Contains($_) }) -join ', ')" }
+                  [Array]::Sort($ready, [System.StringComparer]::Ordinal)
+                  foreach ($name in $ready) { $order.Add($name); $null = $placed.Add($name) }
+              }
+
               $position = @{}
               for ($i = 0; $i -lt $order.Count; $i++) { $position[$order[$i]] = $i }
 
@@ -151,18 +192,14 @@ jobs:
                   {
                       throw "expected exactly one workspace package named $name, found $($package.Count)"
                   }
-                  $edges = @($package[0].dependencies |
-                      Where-Object { $_.path -and $position.ContainsKey($_.name) -and $_.kind -ne 'dev' } |
-                      ForEach-Object { $_.name } |
-                      Sort-Object -Unique |
-                      Sort-Object { $position[$_] })
+                  $deps = @($edges[$name] | Sort-Object { $position[$_] })
                   Copy-Item $found[0].FullName -Destination $outDir
                   $entries += [ordered]@{
                       name         = $name
                       version      = $found[0].BaseName.Substring($prefix.Length)
                       file         = $found[0].Name
                       sha256       = (Get-FileHash $found[0].FullName -Algorithm SHA256).Hash.ToLower()
-                      dependencies = @($edges)
+                      dependencies = @($deps)
                   }
                   Write-Host "OK    packaged $($found[0].Name)"
               }

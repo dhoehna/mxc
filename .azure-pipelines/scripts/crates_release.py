@@ -30,8 +30,8 @@ order         Print the leaf-first publish order, derived from `cargo metadata`.
               template-compile time and so cannot call it.
 
 verify-order  Assert that the crates the pipeline is about to publish are a
-              correctly-ordered subset of what was packaged. A partial subset is
-              allowed so an operator can resume a release that failed partway.
+              correctly-ordered subset of what was packaged. Omitting a crate
+              requires --allow-subset, so resuming a release is deliberate.
 
 stage         Copy one `.crate` file into a clean directory for an ESRP task,
               re-checking its recorded SHA-256 first.
@@ -439,6 +439,20 @@ def cmd_verify_order(args: argparse.Namespace) -> int:
         return 0
 
     skipped = [name for name in packaged if name not in positions]
+    if not args.allow_subset:
+        print(
+            f"crateOrder lists {len(requested)} of the {len(packaged)} packaged "
+            "crates, so the following would never be published, and their "
+            "version can never be published again once the rest of the release "
+            "lands:"
+        )
+        print(f"  missing : {skipped}")
+        print(
+            "If this is a deliberate resume of a partly-finished release, set "
+            "the allowPartialRelease parameter on the publish job to true."
+        )
+        return 1
+
     print(
         f"Crate order verified ({len(requested)} of {len(packaged)} crates, "
         "leaf-first)."
@@ -605,16 +619,10 @@ def _template_crate_order(template_path: str) -> tuple[list[str], str | None]:
 def cmd_check_template(args: argparse.Namespace) -> int:
     """Assert the template's crateOrder equals the computed order.
 
-    Without this, forgetting to regenerate the template fails OPEN rather than
-    closed: `verify-order` accepts a subset on purpose (that is how an operator
-    resumes a part-published release), so a template missing a newly-added crate
-    passes it and the crate is silently never published. That is only visible as
-    a PARTIAL RELEASE warning after the fact, and it is not fixable by
-    re-running, because the crates that did land cannot be republished.
-
-    Two call sites: the GitHub Versioning Checks workflow catches drift at PR
-    time, and the ADO packaging job rechecks at release time, which a PR-time
-    check cannot cover because a release ref can be pushed without a PR.
+    This catches drift at PR time, before a release is ever queued. It is not
+    the only backstop: `verify-order` now refuses a short crateOrder at release
+    time unless the operator opts in with --allow-subset, which covers a release
+    ref pushed straight to release/* without a pull request.
 
     A deliberate resume is declared in the template with a RESUME-SUBSET marker,
     so the release ref carries the intent. Trimming is allowed; reordering is
@@ -699,6 +707,11 @@ def main() -> int:
     )
     verify_order.add_argument("--order-file", required=True)
     verify_order.add_argument("--expected", required=True)
+    verify_order.add_argument(
+        "--allow-subset",
+        action="store_true",
+        help="permit crateOrder to omit packaged crates (resuming a release)",
+    )
     verify_order.set_defaults(func=cmd_verify_order)
 
     stage = sub.add_parser(

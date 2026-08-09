@@ -73,14 +73,12 @@ Editing `CRATES` and forgetting to regenerate is a red build, not a bad
 release. The one accepted deviation is a declared `RESUME-SUBSET`, covered
 under "Resuming a failed release" below.
 
-That check exists because the run-time check cannot catch this case.
-`verify-order` accepts an ordered *subset* of the packaged closure — that is
-deliberate, and it is what makes a partial resume possible — so a `crateOrder`
-missing a newly-added crate **passes** it, and the crate is silently never
-published. Nothing fails; the only trace is a `PARTIAL RELEASE` warning in a
-log read after the fact. A missed publish is also not repairable by re-running,
-since the crates that did land cannot be republished. So the drift has to be
-caught before the release, at PR time, which is what `check-template` does.
+That check catches drift at PR time, before a release is ever queued.
+`verify-order` covers the same drift at release time: it refuses a `crateOrder`
+that omits a packaged crate unless the publish job's `allowPartialRelease`
+parameter is set, which is how a deliberate resume is declared. Both matter,
+because a silently skipped crate is not repairable by re-running — the crates
+that did land cannot be republished at that version.
 
 **You do not work the order out by hand.** One command produces it:
 
@@ -92,16 +90,16 @@ That prints the list ready to paste over the `crateOrder` default in
 `.azure-pipelines/templates/Publish.CratesIo.Job.yml`, which is the only place
 the order is written down. That template needs the list at compile time, because
 `${{ each }}` generates one ESRP task per crate and cannot read runtime data.
-`Package.Crates.Job.yml` calls `order` at run time instead and carries no copy.
-The command validates the graph before printing, so a broken workspace produces
-a named error rather than a list that fails halfway through a release.
+`Package.Crates.Job.yml` derives the same closure from `cargo metadata` at run
+time and carries no copy. The command validates the graph before printing, so a
+broken workspace produces a named error rather than a list that fails halfway
+through a release.
 
 To add a crate, put the package name anywhere in the `CRATES` list in
 `.azure-pipelines/scripts/crates_release.py` — that list is an unordered *set*
 of what to publish, not an ordering — then run the command above and paste the
-result over `crateOrder`. `check-template` catches doing only the first step.
-`verify-order` does **not**: it accepts an ordered subset by design, so a stale
-`crateOrder` passes it and the new crate is simply never published.
+result over `crateOrder`. `check-template` catches doing only the first step at
+PR time; `verify-order` catches it again at release time.
 
 ## How versions are determined
 
@@ -199,12 +197,10 @@ means cutting a new release ref.
    template — see [Resuming a failed release](#resuming-a-failed-release).
 
 5. Click **Run**.
-6. Confirm the package stage succeeds and its `check-template` step passes.
-   The **Publish Crates.io Packages** stage stays visible and is reported as
-   **Skipped** — on a dry run that is the expected result, not a failure. A
-   dry run deliberately does not execute the publish job, so there are no
-   per-crate `DRY RUN:` lines to look for; the publish order is checked in the
-   package stage instead, against `cargo metadata`.
+6. Confirm the package stage succeeds. The **Publish Crates.io Packages** stage
+   stays visible and is reported as **Skipped** — on a dry run that is the
+   expected result, not a failure. A dry run deliberately does not execute the
+   publish job, so there are no per-crate `DRY RUN:` lines to look for.
 
    **What a dry run does not cover.** Because the publish job does not run at
    all, a dry run proves the crates build, package, and are ordered correctly —
@@ -326,54 +322,46 @@ To resume:
    ```
 
    The subset must list **every** crate that has not yet published, in its
-   original relative order. Nothing checks completeness: both `check-template`
-   and `verify-order` accept any correctly-ordered subset, so a crate dropped
-   from this list is silently never published. That is recoverable — the crate
-   is still free on crates.io, so a later run can publish it — but until then
-   any already-published dependent names a version crates.io cannot resolve,
-   and consumers see the breakage. Getting the list right the first time is
-   much cheaper than explaining the gap.
+   original relative order. Completeness is asserted by the operator, not
+   checked: a crate dropped from this list is never published. That is
+   recoverable — the crate is still free on crates.io, so a later run can
+   publish it — but until then any already-published dependent names a version
+   crates.io cannot resolve, and consumers see the breakage. Getting the list
+   right the first time is much cheaper than explaining the gap.
 
-   The marker is **required**. Without it the packaging job fails the run,
-   because a short `crateOrder` with nothing declaring intent is
-   indistinguishable from one somebody forgot to regenerate. With it, the run
-   still verifies the remaining crates are in valid dependency order and logs
-   every crate it is assuming is already published.
-4. Push that branch to `microsoft/mxc` and run the pipeline against it. The ref
+   The marker keeps `check-template` green on a pull request into `main`, so a
+   resume branch is not blocked by the PR-time drift gate.
+4. Set `allowPartialRelease: true` where the release pipeline instantiates
+   `Publish.CratesIo.Job.yml`. This is what actually permits the short list:
+   `verify-order` fails the release otherwise, because a trimmed `crateOrder`
+   with nothing declaring intent is indistinguishable from one somebody forgot
+   to regenerate. With it, the run still proves the remaining crates are in
+   valid dependency order and logs every crate it assumes is already live.
+5. Push that branch to `microsoft/mxc` and run the pipeline against it. The ref
    supplies the pipeline definition as well as the source, so the edited
    `crateOrder` only takes effect once it is on the release branch.
-5. Merge the `crateOrder` edit to `main` separately, or revert it there once
+6. Merge the `crateOrder` edit to `main` separately, or revert it there once
    the release completes — `main` should end up carrying the full list again,
-   with the `RESUME-SUBSET` marker removed, so the next release publishes the
-   whole closure. Note this step is **not** enforced: `check-template` accepts a
-   marked resume subset and exits 0, so a pull request into `main` that still
-   carries the marker and the short list passes. Restoring the full list is
-   currently a manual responsibility with no automated backstop.
+   with the `RESUME-SUBSET` marker removed and `allowPartialRelease` back to
+   `false`, so the next release publishes the whole closure. Note this step is
+   **not** enforced: `check-template` accepts a marked resume subset and exits
+   0, so a pull request into `main` that still carries the marker and the short
+   list passes. Restoring the full list is currently a manual responsibility
+   with no automated backstop.
 
-The `verify-order` guard accepts a subset of the original order as long as it
-is still in correct leaf-first sequence. It logs a warning naming every
-dependency it assumes is already live.
-
-`check-template` is invoked from two places in the tree. The GitHub
-`Versioning Checks` workflow runs it directly, and the shared ADO packaging job
-runs it before any artifact is produced — which means it also runs inside the
-release pipeline, because a release ref can be pushed straight to
-`microsoft/mxc` without ever opening a pull request, and the pull-request checks
-alone would leave the irreversible path unguarded.
-
-That is why step 3 requires the `RESUME-SUBSET` marker. Without it the release
-pipeline refuses to publish a short list at all, which is the point: a trimmed
-`crateOrder` is either a deliberate resume or a forgotten regeneration, and
-nothing in the file distinguishes them unless the operator says so. With the
-marker, the pipeline still proves the remaining crates are in valid dependency
-order and prints exactly which crates it is assuming are already live.
+`check-template` is invoked from one place: the GitHub `Versioning Checks`
+workflow. It catches drift at pull-request time. It cannot cover the whole
+irreversible path on its own, because a release ref can be pushed straight to
+`microsoft/mxc` without ever opening a pull request — that gap is closed by
+`verify-order`, which runs inside the release itself and refuses a short
+`crateOrder` unless `allowPartialRelease` is set.
 
 Note that GitHub's `pull_request: branches:` filter matches the **base** branch,
 not the source branch, so a pull request *from* a `release/*` branch *into*
 `main` does run `check-template` — and should, since `main` must carry the full
 list. A direct push to `release/*` skips the CI run, as does any pull request
 whose base branch is outside `main`, `feature/*`, and `user/*` — precisely the
-cases the release pipeline's own copy of the check covers.
+cases `verify-order` covers at release time.
 
 There is no automated resume. The operator asserts what landed by editing
 `crateOrder`.

@@ -32,7 +32,8 @@ parameters:
   #
   # ADDING A CRATE: add the name to CRATES in scripts/crates_release.py, then
   # regenerate and paste here.  To resume a failed release, drop the
-  # already-published crates, keeping the survivors in relative order.
+  # already-published crates, keeping the survivors in relative order, and set
+  # allowPartialRelease below.
   - name: crateOrder
     type: object
     default:
@@ -66,6 +67,13 @@ parameters:
   - name: dryRun
     type: boolean
     default: true
+  # Resuming a part-published release is the only reason crateOrder may omit
+  # a packaged crate.  Off by default so a stale crateOrder fails the release
+  # instead of silently skipping a crate at a version that can never be
+  # published again.
+  - name: allowPartialRelease
+    type: boolean
+    default: false
 
 jobs:
   - job: publish_crates
@@ -86,6 +94,10 @@ jobs:
       esrpDir: $(Pipeline.Workspace)/esrp-one
       orderFile: $(Pipeline.Workspace)/crates/release-order.json
       script: $(Pipeline.Workspace)/crates/crates_release.py
+      ${{ if eq(parameters.allowPartialRelease, true) }}:
+        allowSubsetFlag: --allow-subset
+      ${{ else }}:
+        allowSubsetFlag: ''
     steps:
       # python3 is frequently absent on Windows agents.
       - pwsh: |
@@ -105,10 +117,9 @@ jobs:
           Write-Host "##vso[task.setvariable variable=pythonExe]$exe"
         displayName: Resolve Python interpreter
 
-      # A strict subset is allowed, for resuming a failed release.
       - pwsh: |
           $ErrorActionPreference = 'Stop'
-          & "$(pythonExe)" "$(script)" verify-order --order-file "$(orderFile)" --expected "$env:EXPECTED_ORDER"
+          & "$(pythonExe)" "$(script)" verify-order --order-file "$(orderFile)" --expected "$env:EXPECTED_ORDER" $(allowSubsetFlag)
           if ($LASTEXITCODE -ne 0) { throw "verify-order failed with exit $LASTEXITCODE" }
         displayName: Verify crate order matches package
         env:
