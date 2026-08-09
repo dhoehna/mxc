@@ -648,6 +648,18 @@ def cmd_check_template(args: argparse.Namespace) -> int:
     actual, resume_reason = _template_crate_order(args.template_path)
 
     if resume_reason is not None:
+        # A resume trims what gets published.  It must never trim what gets
+        # packaged: the publish stage can only upload a crate the package stage
+        # produced, and verify-order resolves every crate through
+        # release-order.json.  Packaging a crate that is already live costs one
+        # `cargo package` and uploads nothing, so the packaging template always
+        # carries the full closure.
+        if args.require_full:
+            print(f"FAIL  {args.template_path} declares a RESUME-SUBSET marker, which is not allowed in this template.")
+            print(f"    reason given : {resume_reason}")
+            print("    A resume trims the publish list only.  Restore the full crateOrder here and")
+            print("    trim Publish.CratesIo.Job.yml instead.")
+            return 1
         unknown = [name for name in actual if name not in expected]
         if unknown:
             print(f"FAIL  {args.template_path} declares a resume subset naming unknown crates: {unknown}")
@@ -755,6 +767,14 @@ def main() -> int:
         help="CI guard: assert the template's crateOrder equals the computed order",
     )
     check_template.add_argument("--manifest-path", default="src/Cargo.toml")
+    check_template.add_argument(
+        "--require-full",
+        action="store_true",
+        help=(
+            "reject a RESUME-SUBSET marker; use for templates that must always "
+            "carry the whole closure, such as Package.Crates.Job.yml"
+        ),
+    )
     check_template.add_argument(
         "--template-path",
         default=".azure-pipelines/templates/Publish.CratesIo.Job.yml",

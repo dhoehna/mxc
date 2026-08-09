@@ -38,7 +38,8 @@ jobs:
           python3 .azure-pipelines/scripts/crates_release.py check-template \
             --template-path .azure-pipelines/templates/Publish.CratesIo.Job.yml
           python3 .azure-pipelines/scripts/crates_release.py check-template \
-            --template-path .azure-pipelines/templates/Package.Crates.Job.yml
+            --template-path .azure-pipelines/templates/Package.Crates.Job.yml \
+            --require-full
 
       - name: Check PSEC generated contract (provenance + drift)
         run: node scripts/versioning/check-psec-codegen.js

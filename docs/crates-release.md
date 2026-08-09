@@ -309,9 +309,10 @@ To resume:
    remaining crates still need to publish at the version that failed.
 
    **Leave the copy in `Package.Crates.Job.yml` alone.** A resume trims what
-   gets *published*, not what gets *packaged*: the packaging job always builds
-   the full closure, and `check-template` requires that copy to stay complete.
-   Packaging a crate that is already live is harmless — nothing uploads it.
+   gets *published*, not what gets *packaged*: the publish stage can only
+   upload a crate the package stage produced. `check-template --require-full`
+   enforces this — a `RESUME-SUBSET` marker in that template fails the build.
+   Packaging a crate that is already live is harmless; nothing uploads it.
 
    Add a `RESUME-SUBSET` marker line directly above `default:`, naming the run
    this is resuming:
@@ -321,17 +322,20 @@ To resume:
        type: object
        # RESUME-SUBSET: run 4821 failed after appcontainer_common
        default:
-         - bwrap_common
-         - windows_sandbox_lifecycle
-         - mxc_engine
-         - mxc-sdk
+       - bwrap_common
+       - windows_sandbox_lifecycle
+       - mxc_engine
+       - mxc-sdk
    ```
 
    The subset must list **every** crate that has not yet published, in its
    original relative order. Nothing checks completeness: both `check-template`
    and `verify-order` accept any correctly-ordered subset, so a crate dropped
-   from this list is silently never published and cannot be recovered by
-   re-running.
+   from this list is silently never published. That is recoverable — the crate
+   is still free on crates.io, so a later run can publish it — but until then
+   any already-published dependent names a version crates.io cannot resolve,
+   and consumers see the breakage. Getting the list right the first time is
+   much cheaper than explaining the gap.
 
    The marker is **required**. Without it the packaging job fails the run,
    because a short `crateOrder` with nothing declaring intent is

@@ -143,7 +143,7 @@ jobs:
               $ErrorActionPreference = 'Stop'
               & $(python) .azure-pipelines/scripts/crates_release.py check-template --manifest-path src/Cargo.toml --template-path .azure-pipelines/templates/Publish.CratesIo.Job.yml
               if ($LASTEXITCODE -ne 0) { throw "check-template failed with exit $LASTEXITCODE" }
-              & $(python) .azure-pipelines/scripts/crates_release.py check-template --manifest-path src/Cargo.toml --template-path .azure-pipelines/templates/Package.Crates.Job.yml
+              & $(python) .azure-pipelines/scripts/crates_release.py check-template --manifest-path src/Cargo.toml --template-path .azure-pipelines/templates/Package.Crates.Job.yml --require-full
               if ($LASTEXITCODE -ne 0) { throw "check-template failed with exit $LASTEXITCODE" }
             displayName: Verify crate order matches the workspace
             workingDirectory: $(Build.SourcesDirectory)
@@ -178,17 +178,32 @@ jobs:
 
         - ${{ if eq(item.os, 'windows') }}:
           # release-order.json is the hand-off to the publish stage.  It pins
-          # the order ESRP uploads in, and the sha256 of every file so staging
-          # can fail closed if the artifact does not match what this build
-          # produced.
+          # the order ESRP uploads in, the sha256 of every file so staging can
+          # fail closed if the artifact does not match what this build
+          # produced, and the first-party dependency edges verify-order uses to
+          # prove the published sequence is still leaf-first.
+          #
+          # The edges come straight out of `cargo metadata`: a dependency
+          # counts when it is a path dependency, is itself in crateOrder, and
+          # is not dev-only.  That is set membership, not a second copy of the
+          # script's release-graph logic -- the validation it does (every local
+          # dependency carries a registry version, and none is missing from
+          # CRATES) already ran in the check-template step above, which fails
+          # the build before anything is packaged.
           - pwsh: |
               $ErrorActionPreference = 'Stop'
-              $targetDir = (cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json).target_directory
-              $packageDir = Join-Path $targetDir 'package'
+              $metadata = cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json
+              if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit $LASTEXITCODE" }
+              $packageDir = Join-Path $metadata.target_directory 'package'
               $outDir = '$(outDir)'
               New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+              $order = '${{ join(',', parameters.crateOrder) }}' -split ','
+              $position = @{}
+              for ($i = 0; $i -lt $order.Count; $i++) { $position[$order[$i]] = $i }
+
               $entries = @()
-              foreach ($name in ('${{ join(',', parameters.crateOrder) }}' -split ','))
+              foreach ($name in $order)
               {
                   $prefix = "$name-"
                   $found = @(Get-ChildItem -Path $packageDir -Filter "$prefix*.crate" -File)
@@ -196,16 +211,27 @@ jobs:
                   {
                       throw "expected exactly one .crate for $name, found $($found.Count)"
                   }
+                  $package = @($metadata.packages | Where-Object { $_.name -eq $name })
+                  if ($package.Count -ne 1)
+                  {
+                      throw "expected exactly one workspace package named $name, found $($package.Count)"
+                  }
+                  $edges = @($package[0].dependencies |
+                      Where-Object { $_.path -and $position.ContainsKey($_.name) -and $_.kind -ne 'dev' } |
+                      ForEach-Object { $_.name } |
+                      Sort-Object -Unique |
+                      Sort-Object { $position[$_] })
                   Copy-Item $found[0].FullName -Destination $outDir
                   $entries += [ordered]@{
-                      name    = $name
-                      version = $found[0].BaseName.Substring($prefix.Length)
-                      file    = $found[0].Name
-                      sha256  = (Get-FileHash $found[0].FullName -Algorithm SHA256).Hash.ToLower()
+                      name         = $name
+                      version      = $found[0].BaseName.Substring($prefix.Length)
+                      file         = $found[0].Name
+                      sha256       = (Get-FileHash $found[0].FullName -Algorithm SHA256).Hash.ToLower()
+                      dependencies = @($edges)
                   }
                   Write-Host "OK    packaged $($found[0].Name)"
               }
-              @{ crates = $entries } | ConvertTo-Json -Depth 4 |
+              @{ crates = $entries } | ConvertTo-Json -Depth 6 |
                   Set-Content -Path (Join-Path $outDir 'release-order.json') -Encoding utf8NoBOM
             displayName: Collect crates and write release-order.json
             workingDirectory: $(Build.SourcesDirectory)
