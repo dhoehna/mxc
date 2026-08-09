@@ -107,6 +107,34 @@ stages:
     - template: Package.Crates.Job.yml
       parameters:
         isOfficialBuild: ${{ parameters.isOfficialBuild }}
+        # The release pipeline declares this list in 1ES.Release.Crates.yml,
+        # where one copy drives both packaging and publishing.  A template
+        # parameter cannot be shared across pipelines, so the verification leg
+        # carries its own copy.  Drift here weakens this check; it cannot
+        # produce a bad release, which is driven entirely by the release
+        # pipeline's copy.
+        crateOrder:
+        - isolation_session_bindings
+        - learning_mode_core
+        - mxc_pty
+        - mxc_telemetry
+        - nanvix_common
+        - process_security_environment_spec
+        - sandbox_spec
+        - wxc_common
+        - hyperlight_common
+        - isolation_session_common
+        - learning_mode_windows
+        - lxc_common
+        - nanvix_runner
+        - seatbelt_common
+        - windows_sandbox_common
+        - wslc_common
+        - appcontainer_common
+        - bwrap_common
+        - windows_sandbox_lifecycle
+        - mxc_engine
+        - mxc-sdk
 
 - stage: Lint
   displayName: 'Lint'

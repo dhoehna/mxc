@@ -17,8 +17,7 @@
 #
 # Crate versions come from src/Cargo.toml at that ref.
 #
-# Setup, prerequisites, known blockers, and how to resume a failed release:
-# docs/crates-release.md
+# Setup, prerequisites, and known blockers: docs/crates-release.md
 
 trigger: none
 pr: none
@@ -34,9 +33,43 @@ resources:
 
 parameters:
   - name: dryRun
-    displayName: 'Dry run — package and check order; publish stage is skipped'
+    displayName: 'Dry run — package only; publish stage is skipped'
     type: boolean
     default: true
+  # The crates to publish, leaf-first: every crate must appear after the
+  # crates it depends on, because crates.io rejects an upload whose
+  # dependencies are not live yet.
+  #
+  # Declared here, once, and passed to both stages.  It has to be literal YAML
+  # rather than something derived at run time, because ${{ each }} expands when
+  # the pipeline compiles and cannot read anything a step produced.
+  #
+  # ADDING A CRATE: add it after its dependencies.  Getting this wrong fails
+  # the release at the crates.io upload, naming the unresolved dependency.
+  - name: crateOrder
+    type: object
+    default:
+    - isolation_session_bindings
+    - learning_mode_core
+    - mxc_pty
+    - mxc_telemetry
+    - nanvix_common
+    - process_security_environment_spec
+    - sandbox_spec
+    - wxc_common
+    - hyperlight_common
+    - isolation_session_common
+    - learning_mode_windows
+    - lxc_common
+    - nanvix_runner
+    - seatbelt_common
+    - windows_sandbox_common
+    - wslc_common
+    - appcontainer_common
+    - bwrap_common
+    - windows_sandbox_lifecycle
+    - mxc_engine
+    - mxc-sdk
 
 variables:
   - group: MXC-ESRP-Signing
@@ -116,6 +149,8 @@ extends:
       dependsOn: Validate_Release_Ref
       jobs:
       - template: .azure-pipelines/templates/Package.Crates.Job.yml@self
+        parameters:
+          crateOrder: ${{ parameters.crateOrder }}
 
     - stage: Publish_to_CratesIo
       displayName: 'Publish Crates.io Packages'
@@ -133,5 +168,6 @@ extends:
             clientId: $(clientId)
             OwnersEmail: $(Build.RequestedForEmail)
             ApproversEmail: $(Build.RequestedForEmail)
-          # crateOrder lives in Publish.CratesIo.Job.yml, not here.
+          # crateOrder is declared once at the top of this file.
+          crateOrder: ${{ parameters.crateOrder }}
           dryRun: ${{ parameters.dryRun }}

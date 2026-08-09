@@ -11,9 +11,9 @@ in a single pipeline run:
 
 1. **Package stage** — checks out the release ref the run was queued against and
    runs `cargo package` on a Windows, a Linux, and a macOS agent, each carrying a
-   `-p` flag per crate. The Windows leg uploads the `.crate` files plus a
-   `release-order.json` manifest as the `mxc-crates-package` artifact; the other
-   two legs are verification that the closure builds natively on those systems.
+   `-p` flag per crate. The Windows leg uploads the `.crate` files as the
+   `mxc-crates-package` artifact; the other two legs are verification that the
+   closure builds natively on those systems.
 2. **Publish stage** — downloads that artifact and publishes each `.crate` to
    crates.io through ESRP, one `EsrpRelease@12` task per crate, leaf-first.
 
@@ -22,9 +22,11 @@ credentials and publishes under the `microsoft-oss-releases` account.
 
 ## Crate list
 
-The set of packages to publish is the `CRATES` list in
-`.azure-pipelines/scripts/crates_release.py`. Listed alphabetically here — the
-publish order is *not* a property of this list, see below.
+The crates to publish are the `crateOrder` parameter in
+`.azure-pipelines/1ES.Release.Crates.yml`, which is the only place the list is
+written down. It is passed to both the packaging job and the publish job, so
+there is no second copy to keep in sync. Listed alphabetically here; the
+declared order is leaf-first, see below.
 
 - `appcontainer_common`
 - `bwrap_common`
@@ -52,54 +54,38 @@ These names are provisional until the public naming scheme is approved.
 
 ## Publish order
 
-Leaf-first, because each crate must already be on crates.io before anything
-that depends on it can publish. The order is a topological sort of the
-workspace dependency graph, computed from `cargo metadata` — nobody works it
-out by hand. `package` orders the `.crate` files it builds by that sort, and
-the same sort generates the `crateOrder` default in
-`.azure-pipelines/templates/Publish.CratesIo.Job.yml`, which drives the ESRP
-steps.
+`crateOrder` is leaf-first, because each crate must already be on crates.io
+before anything that depends on it can publish.
 
-`crateOrder` has to be static YAML: `${{ each }}` expands at compile time,
-before any script has run, so the ESRP steps cannot be generated from an order
-computed during the run. It is therefore a **pasted copy** of the command's
-output rather than a live call.
+The list is literal YAML because it has to be. `${{ each }}` expands at compile
+time, before any step has run, so the ESRP tasks cannot be generated from an
+order computed during the run. Anything that computed the order would still
+have to be pasted into YAML afterwards, so the pipeline skips the middleman and
+keeps one hand-maintained list.
 
-Nothing about pasting is trusted, though. The `Versioning Checks` workflow runs
-`crates_release.py check-template` on pull requests into `main`, `feature/*`,
-and `user/*`, and on pushes to `main`. It recomputes the order and fails the
-build if the template does not match it exactly — same crates, same sequence.
-Editing `CRATES` and forgetting to regenerate is a red build, not a bad
-release. The one accepted deviation is a declared `RESUME-SUBSET`, covered
-under "Resuming a failed release" below.
+**To add a crate**, insert its package name into `crateOrder` after every crate
+it depends on.
 
-That check catches drift at PR time, before a release is ever queued.
-`verify-order` covers the same drift at release time: it refuses a `crateOrder`
-that omits a packaged crate unless the publish job's `allowPartialRelease`
-parameter is set, which is how a deliberate resume is declared. Both matter,
-because a silently skipped crate is not repairable by re-running — the crates
-that did land cannot be republished at that version.
+Nothing validates the list before the release, and mostly nothing needs to:
 
-**You do not work the order out by hand.** One command produces it:
+- **Wrong order** — crates.io rejects an upload whose dependency is not live
+  yet, naming the dependency it could not resolve. The release stops at the
+  first crate that is out of place.
+- **A missing crate that something else in the list depends on** — packaging
+  fails before the release gets anywhere near crates.io. `cargo package` can
+  only resolve a workspace sibling that is being packaged in the same
+  invocation, so omitting one produces `no matching package named <crate>
+  found` and a non-zero exit.
+- **A missing crate that nothing else depends on** — this is the one gap.
+  A root crate such as `mxc-sdk`, or a new leaf nothing has adopted yet,
+  generates no `-p` flag and no ESRP task, so nothing fails: it is simply
+  never published. Adding a crate to the workspace and forgetting to add it
+  here is silent.
 
-```bash
-python3 .azure-pipelines/scripts/crates_release.py order
-```
-
-That prints the list ready to paste over the `crateOrder` default in
-`.azure-pipelines/templates/Publish.CratesIo.Job.yml`, which is the only place
-the order is written down. That template needs the list at compile time, because
-`${{ each }}` generates one ESRP task per crate and cannot read runtime data.
-`Package.Crates.Job.yml` derives the same closure from `cargo metadata` at run
-time and carries no copy. The command validates the graph before printing, so a
-broken workspace produces a named error rather than a list that fails halfway
-through a release.
-
-To add a crate, put the package name anywhere in the `CRATES` list in
-`.azure-pipelines/scripts/crates_release.py` — that list is an unordered *set*
-of what to publish, not an ordering — then run the command above and paste the
-result over `crateOrder`. `check-template` catches doing only the first step at
-PR time; `verify-order` catches it again at release time.
+`cargo package` emits its `.crate` files in its own dependency order
+regardless of the `-p` order it was given, so packaging succeeding proves
+nothing about `crateOrder` being correctly sorted. Only the publish stage
+exercises the order.
 
 ## How versions are determined
 
@@ -118,8 +104,7 @@ version:
 4. Run the pipeline against that branch.
 
 Re-running against the same ref re-packages the same version, which crates.io
-rejects (duplicate version). See [Resuming a failed release](#resuming-a-failed-release)
-for what to do when only some crates landed.
+rejects (duplicate version).
 
 ## Choosing the release ref
 
@@ -190,11 +175,9 @@ means cutting a new release ref.
    by *which ref you picked*, not by what you type. Everything else is derived
    or fixed. The ESRP owner and approver are not fields — they are fixed to
    the identity that queued the run; see [ESRP identity](#esrp-identity).
-   `crateOrder` is not a field either — it is a dependency-derived topological
-   order, not an operator choice, so it lives in
-   `.azure-pipelines/templates/Publish.CratesIo.Job.yml` where the dialog
-   cannot render it. To change it (to resume a partial release), edit that
-   template — see [Resuming a failed release](#resuming-a-failed-release).
+   `crateOrder` is not a field either — it is a dependency order, not an
+   operator choice. It has a default in `1ES.Release.Crates.yml`; to change
+   it, edit that file on the release ref.
 
 5. Click **Run**.
 6. Confirm the package stage succeeds. The **Publish Crates.io Packages** stage
@@ -203,12 +186,12 @@ means cutting a new release ref.
    publish job, so there are no per-crate `DRY RUN:` lines to look for.
 
    **What a dry run does not cover.** Because the publish job does not run at
-   all, a dry run proves the crates build, package, and are ordered correctly —
-   and nothing beyond that. It does *not* exercise the pipeline artifact
-   round-trip, `verify-order` against the packaged `release-order.json`, the
-   per-crate SHA-256 check in `stage`, the ESRP staging directory, or ESRP
-   itself. Those first execute during a real release. A green dry run is
-   evidence about the crates, not about the publish path.
+   all, a dry run proves the crates build and package on all three OSes — and
+   nothing beyond that. In particular it does *not* validate `crateOrder`:
+   packaging ignores the order it is given, so only a real release exercises
+   it. It also does not exercise the pipeline artifact round-trip, the ESRP
+   staging directory, or ESRP itself. A green dry run is evidence about the
+   crates, not about the publish path.
 
 ### ESRP identity
 
@@ -272,100 +255,6 @@ crates.io public. Do not clear `dryRun` until crate naming is settled and ESRP
 `Rust` content type is enabled — see
 [Prerequisites / known blockers](#prerequisites--known-blockers).
 
-## Resuming a failed release
-
-crates.io rejects duplicate versions. If the pipeline fails partway through
-(e.g. crate 7 of 21 fails for a transient reason), crates 1–6 are already
-published and cannot be republished.
-
-To resume:
-
-1. Identify which crates were already published (check the pipeline logs — each
-   successful `EsrpRelease@12` task confirms its crate).
-2. Branch from **the exact commit the failed run used**, not from `main`:
-
-   ```bash
-   git switch --detach <sha-of-failed-release-ref>
-   git switch -c release/v0.8.0-resume1
-   ```
-
-   The already-published crates were built from that commit. Cutting the resume
-   branch from `main` instead would package whatever `main` has become since,
-   so the second half of the release would be built from different source than
-   the first — and if the workspace version has moved, `cargo package` produces
-   versions that no longer match what is on crates.io.
-3. On that branch, edit the `crateOrder` default in
-   `.azure-pipelines/templates/Publish.CratesIo.Job.yml`, removing the
-   already-published crates. Keep the remaining entries in their existing
-   relative order, and **do not** rerun `crates_release.py order` — that
-   regenerates the full closure and would put the already-published crates
-   back, which crates.io then rejects. Do not bump the crate version; the
-   remaining crates still need to publish at the version that failed.
-
-   Packaging is unaffected: `Package.Crates.Job.yml` derives its list from the
-   workspace, so it repackages the full closure. That is intended — a resume
-   trims what gets *published*, not what gets *packaged*, and packaging a crate
-   that is already live is harmless because nothing uploads it.
-
-   Add a `RESUME-SUBSET` marker line directly above `default:`, naming the run
-   this is resuming:
-
-   ```yaml
-     - name: crateOrder
-       type: object
-       # RESUME-SUBSET: run 4821 failed after appcontainer_common
-       default:
-       - bwrap_common
-       - windows_sandbox_lifecycle
-       - mxc_engine
-       - mxc-sdk
-   ```
-
-   The subset must list **every** crate that has not yet published, in its
-   original relative order. Completeness is asserted by the operator, not
-   checked: a crate dropped from this list is never published. That is
-   recoverable — the crate is still free on crates.io, so a later run can
-   publish it — but until then any already-published dependent names a version
-   crates.io cannot resolve, and consumers see the breakage. Getting the list
-   right the first time is much cheaper than explaining the gap.
-
-   The marker keeps `check-template` green on a pull request into `main`, so a
-   resume branch is not blocked by the PR-time drift gate.
-4. Set `allowPartialRelease: true` where the release pipeline instantiates
-   `Publish.CratesIo.Job.yml`. This is what actually permits the short list:
-   `verify-order` fails the release otherwise, because a trimmed `crateOrder`
-   with nothing declaring intent is indistinguishable from one somebody forgot
-   to regenerate. With it, the run still proves the remaining crates are in
-   valid dependency order and logs every crate it assumes is already live.
-5. Push that branch to `microsoft/mxc` and run the pipeline against it. The ref
-   supplies the pipeline definition as well as the source, so the edited
-   `crateOrder` only takes effect once it is on the release branch.
-6. Merge the `crateOrder` edit to `main` separately, or revert it there once
-   the release completes — `main` should end up carrying the full list again,
-   with the `RESUME-SUBSET` marker removed and `allowPartialRelease` back to
-   `false`, so the next release publishes the whole closure. Note this step is
-   **not** enforced: `check-template` accepts a marked resume subset and exits
-   0, so a pull request into `main` that still carries the marker and the short
-   list passes. Restoring the full list is currently a manual responsibility
-   with no automated backstop.
-
-`check-template` is invoked from one place: the GitHub `Versioning Checks`
-workflow. It catches drift at pull-request time. It cannot cover the whole
-irreversible path on its own, because a release ref can be pushed straight to
-`microsoft/mxc` without ever opening a pull request — that gap is closed by
-`verify-order`, which runs inside the release itself and refuses a short
-`crateOrder` unless `allowPartialRelease` is set.
-
-Note that GitHub's `pull_request: branches:` filter matches the **base** branch,
-not the source branch, so a pull request *from* a `release/*` branch *into*
-`main` does run `check-template` — and should, since `main` must carry the full
-list. A direct push to `release/*` skips the CI run, as does any pull request
-whose base branch is outside `main`, `feature/*`, and `user/*` — precisely the
-cases `verify-order` covers at release time.
-
-There is no automated resume. The operator asserts what landed by editing
-`crateOrder`.
-
 ## Network isolation
 
 The publish job runs on a 1ES pool with CFSClean network isolation — crates.io
@@ -426,10 +315,9 @@ These must be resolved before the first real (non-dry-run) publish:
 
 | File | Purpose |
 |------|---------|
-| `.azure-pipelines/1ES.Release.Crates.yml` | Top-level release pipeline (parameters, release-ref gate, stage wiring) |
-| `.azure-pipelines/templates/Package.Crates.Job.yml` | Packaging job — derives the crate list from the workspace, calls `cargo package` directly, writes `release-order.json`, produces the artifact |
-| `.azure-pipelines/templates/Publish.CratesIo.Job.yml` | ESRP publish job — carries `crateOrder`, runs `verify-order`, stage, publish loop |
-| `.azure-pipelines/scripts/crates_release.py` | Source of truth for `CRATES`, and the `order`, `check-template`, `verify-order`, and `stage` subcommands the pipeline runs. Its `package` subcommand is a local-reproduction convenience; the pipeline calls `cargo package` itself |
+| `.azure-pipelines/1ES.Release.Crates.yml` | Top-level release pipeline — declares `crateOrder`, the release-ref gate, and the stage wiring |
+| `.azure-pipelines/templates/Package.Crates.Job.yml` | Packaging job — runs `cargo package` over `crateOrder` and produces the artifact |
+| `.azure-pipelines/templates/Publish.CratesIo.Job.yml` | ESRP publish job — one staging step and one `EsrpRelease@12` task per crate in `crateOrder` |
 | `src/Cargo.toml` | Workspace version (single source of truth for all crate versions) |
 
 ## Comparison with the npm release

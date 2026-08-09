@@ -6,58 +6,20 @@
 # artifact.
 #
 # Emits one EsrpRelease task per crate, leaf-first, since the crates.io API
-# does not enforce dependency order.  A runtime guard asserts crateOrder is an
-# ordered subset of what was packaged.
+# does not enforce dependency order.
 #
 # The pool enforces 1ES network isolation (CFSClean), so this job performs no
 # crates.io reads.  A publish that crates.io rejects fails its task and skips
 # every later crate.
-#
-# Resuming a failed release: re-queue with the already-published crates
-# removed from crateOrder.  verify-order accepts that subset only if it is
-# still in packaged leaf-first order, and check-template requires a
-# RESUME-SUBSET marker in this file declaring the intent.
 
 parameters:
   - name: ESRPInfo
     type: object
-  # Leaf-first crate order, a topological sort of the workspace dependency
-  # graph.  GENERATED -- do not hand-edit or hand-sort.  Regenerate with:
-  #
-  #   python3 .azure-pipelines/scripts/crates_release.py order
-  #
-  # Static YAML because ${{ each }} expands at compile time and cannot read
-  # runtime data.  This is the only hand-maintained copy: Package.Crates.Job.yml
-  # derives the same list at run time.
-  #
-  # ADDING A CRATE: add the name to CRATES in scripts/crates_release.py, then
-  # regenerate and paste here.  To resume a failed release, drop the
-  # already-published crates, keeping the survivors in relative order, and set
-  # allowPartialRelease below.
+  # Leaf-first crate list, supplied by the caller and declared once in
+  # 1ES.Release.Crates.yml.  Order matters here: crates.io rejects an upload
+  # whose dependencies are not live yet.
   - name: crateOrder
     type: object
-    default:
-    - isolation_session_bindings
-    - learning_mode_core
-    - mxc_pty
-    - mxc_telemetry
-    - nanvix_common
-    - process_security_environment_spec
-    - sandbox_spec
-    - wxc_common
-    - hyperlight_common
-    - isolation_session_common
-    - learning_mode_windows
-    - lxc_common
-    - nanvix_runner
-    - seatbelt_common
-    - windows_sandbox_common
-    - wslc_common
-    - appcontainer_common
-    - bwrap_common
-    - windows_sandbox_lifecycle
-    - mxc_engine
-    - mxc-sdk
   - name: cratesArtifactName
     type: string
     default: mxc-crates-package
@@ -67,13 +29,6 @@ parameters:
   - name: dryRun
     type: boolean
     default: true
-  # Resuming a part-published release is the only reason crateOrder may omit
-  # a packaged crate.  Off by default so a stale crateOrder fails the release
-  # instead of silently skipping a crate at a version that can never be
-  # published again.
-  - name: allowPartialRelease
-    type: boolean
-    default: false
 
 jobs:
   - job: publish_crates
@@ -92,44 +47,17 @@ jobs:
     variables:
       cratesDir: $(Pipeline.Workspace)/crates
       esrpDir: $(Pipeline.Workspace)/esrp-one
-      orderFile: $(Pipeline.Workspace)/crates/release-order.json
-      script: $(Pipeline.Workspace)/crates/crates_release.py
-      ${{ if eq(parameters.allowPartialRelease, true) }}:
-        allowSubsetFlag: --allow-subset
-      ${{ else }}:
-        allowSubsetFlag: ''
     steps:
-      # python3 is frequently absent on Windows agents.
-      - pwsh: |
-          $ErrorActionPreference = 'Stop'
-          $exe = $null
-          foreach ($candidate in @('python', 'python3'))
-          {
-            $found = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found -and (& $found.Source --version) -match 'Python 3')
-            {
-              $exe = $found.Source
-              break
-            }
-          }
-          if (-not $exe) { throw 'No Python 3 interpreter found on PATH (tried python, python3).' }
-          Write-Host "Using Python interpreter: $exe"
-          Write-Host "##vso[task.setvariable variable=pythonExe]$exe"
-        displayName: Resolve Python interpreter
-
-      - pwsh: |
-          $ErrorActionPreference = 'Stop'
-          & "$(pythonExe)" "$(script)" verify-order --order-file "$(orderFile)" --expected "$env:EXPECTED_ORDER" $(allowSubsetFlag)
-          if ($LASTEXITCODE -ne 0) { throw "verify-order failed with exit $LASTEXITCODE" }
-        displayName: Verify crate order matches package
-        env:
-          EXPECTED_ORDER: ${{ convertToJson(parameters.crateOrder) }}
-
       - ${{ each crate in parameters.crateOrder }}:
+          # ESRP uploads a folder, so each crate gets a clean one to itself.
           - pwsh: |
               $ErrorActionPreference = 'Stop'
-              & "$(pythonExe)" "$(script)" stage --order-file "$(orderFile)" --crate "${{ crate }}" --out-dir "$(esrpDir)"
-              if ($LASTEXITCODE -ne 0) { throw "stage ${{ crate }} failed with exit $LASTEXITCODE" }
+              if (Test-Path '$(esrpDir)') { Remove-Item -Recurse -Force '$(esrpDir)' }
+              New-Item -ItemType Directory -Force -Path '$(esrpDir)' | Out-Null
+              $found = @(Get-ChildItem -Path '$(cratesDir)' -Filter '${{ crate }}-*.crate' -File)
+              if ($found.Count -ne 1) { throw "expected exactly one .crate for ${{ crate }}, found $($found.Count)" }
+              Copy-Item $found[0].FullName -Destination '$(esrpDir)'
+              Write-Host "staged $($found[0].Name)"
             displayName: "Stage ${{ crate }} for ESRP"
 
           - ${{ if parameters.dryRun }}:

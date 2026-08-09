@@ -6,10 +6,17 @@
 # closure builds natively there.  Only the Windows leg publishes the artifact;
 # the other two are verification.
 #
-# The crate list is not written down here.  The steps derive it from
-# cargo metadata: everything mxc-sdk needs, transitively.
+# The crate list is not written down here.  Callers pass it in:
+# 1ES.Release.Crates.yml for the release, 1ES.Build.Stages.yml for the
+# per-OS verification leg.
 
 parameters:
+  # Leaf-first crate list, supplied by the caller.  Packaging does not care
+  # about the order -- cargo packages the closure in its own dependency order
+  # regardless of the order of -p flags -- but the same list drives the publish
+  # stage, where the order does matter.
+  - name: crateOrder
+    type: object
   # Official builds resolve through the authenticated Mxc-Azure-Feed; unofficial
   # and fork builds use the anonymous MxcDependencies mirror.
   - name: isOfficialBuild
@@ -85,31 +92,7 @@ jobs:
         # property this template cannot check, so it always removes it.
         - pwsh: |
             $ErrorActionPreference = 'Stop'
-            $metadata = cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json
-            if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit $LASTEXITCODE" }
-            $byName = @{}
-            foreach ($package in $metadata.packages) { $byName[$package.name] = $package }
-
-            # Everything mxc-sdk needs, transitively.  Read from the manifests
-            # rather than a resolved tree: `cargo tree` resolves for the current
-            # platform and would drop the crates gated to another OS, so the
-            # three legs would package different sets.
-            $wanted = New-Object 'System.Collections.Generic.HashSet[string]'
-            $stack = [System.Collections.Stack]::new()
-            $null = $stack.Push('mxc-sdk')
-            while ($stack.Count -gt 0)
-            {
-                $name = $stack.Pop()
-                if (-not $wanted.Add($name)) { continue }
-                foreach ($dep in $byName[$name].dependencies)
-                {
-                    if ($dep.path -and $dep.kind -ne 'dev' -and $byName.ContainsKey($dep.name)) { $null = $stack.Push($dep.name) }
-                }
-            }
-            Write-Host "packaging $($wanted.Count) crates"
-            Write-Host "##vso[task.setvariable variable=packagedCrates]$(@($wanted) -join ',')"
-
-            $packageDir = Join-Path $metadata.target_directory 'package'
+            $packageDir = Join-Path (cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json).target_directory 'package'
             if (Test-Path $packageDir)
             {
                 Write-Host "removing stale $packageDir"
@@ -118,100 +101,26 @@ jobs:
             # One cargo call for the whole closure: cargo resolves the crates
             # against each other inside the overlay, which is the only way to
             # package a crate whose path dependencies are not on a registry yet.
-            # The order of -p flags does not matter; cargo packages them in its
-            # own leaf-first order.
-            $packageArgs = @(@($wanted) | ForEach-Object { '-p', $_ })
-            cargo package --manifest-path src/Cargo.toml --registry $(cargoRegistry) @packageArgs
+            cargo package --manifest-path src/Cargo.toml --registry $(cargoRegistry) -p ${{ join(' -p ', parameters.crateOrder) }}
             if ($LASTEXITCODE -ne 0) { throw "cargo package failed with exit $LASTEXITCODE" }
           displayName: Package crate closure
           workingDirectory: $(Build.SourcesDirectory)
 
         - ${{ if eq(item.os, 'windows') }}:
-          # release-order.json hands the publish stage the upload order, the
-          # sha256 of every file so staging fails closed on a mismatched
-          # artifact, and the first-party dependency edges verify-order uses to
-          # prove the published sequence is leaf-first.  An edge is a path
-          # dependency that is itself in the closure and is not dev-only, which
-          # is what cargo metadata reports directly.
           - pwsh: |
               $ErrorActionPreference = 'Stop'
-              $metadata = cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json
-              if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit $LASTEXITCODE" }
-              $packageDir = Join-Path $metadata.target_directory 'package'
-              $outDir = '$(outDir)'
-              New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-
-              $wanted = New-Object 'System.Collections.Generic.HashSet[string]'
-              foreach ($name in ('$(packagedCrates)' -split ',')) { $null = $wanted.Add($name) }
-              $byName = @{}
-              foreach ($package in $metadata.packages) { $byName[$package.name] = $package }
-
-              $edges = @{}
-              foreach ($name in $wanted)
+              $packageDir = Join-Path (cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json).target_directory 'package'
+              New-Item -ItemType Directory -Force -Path '$(outDir)' | Out-Null
+              foreach ($crate in @('${{ join(''', ''', parameters.crateOrder) }}'))
               {
-                  $edges[$name] = @($byName[$name].dependencies |
-                      Where-Object { $_.path -and $_.kind -ne 'dev' -and $wanted.Contains($_.name) } |
-                      ForEach-Object { $_.name } |
-                      Sort-Object -Unique)
+                  # Anchored on the dash so a crate does not match a longer
+                  # name that starts with it.
+                  $found = @(Get-ChildItem -Path $packageDir -Filter "$crate-*.crate" -File)
+                  if ($found.Count -ne 1) { throw "expected exactly one .crate for $crate, found $($found.Count)" }
+                  Copy-Item $found[0].FullName -Destination '$(outDir)'
+                  Write-Host "OK    $($found[0].Name)"
               }
-
-              # Leaf-first order: repeatedly emit every crate whose dependencies
-              # are already placed.  Ties broken ordinally so the output is
-              # stable and matches what crates_release.py computes for the
-              # publish template.
-              $placed = New-Object 'System.Collections.Generic.HashSet[string]'
-              $order = New-Object 'System.Collections.Generic.List[string]'
-              while ($order.Count -lt $wanted.Count)
-              {
-                  $ready = @(foreach ($name in $wanted)
-                  {
-                      if ($placed.Contains($name)) { continue }
-                      $blocked = $false
-                      foreach ($dep in $edges[$name]) { if (-not $placed.Contains($dep)) { $blocked = $true; break } }
-                      if (-not $blocked) { $name }
-                  })
-                  if ($ready.Count -eq 0) { throw "dependency cycle among: $(@($wanted | Where-Object { -not $placed.Contains($_) }) -join ', ')" }
-                  [Array]::Sort($ready, [System.StringComparer]::Ordinal)
-                  foreach ($name in $ready) { $order.Add($name); $null = $placed.Add($name) }
-              }
-
-              $position = @{}
-              for ($i = 0; $i -lt $order.Count; $i++) { $position[$order[$i]] = $i }
-
-              $entries = @()
-              foreach ($name in $order)
-              {
-                  $prefix = "$name-"
-                  $found = @(Get-ChildItem -Path $packageDir -Filter "$prefix*.crate" -File)
-                  if ($found.Count -ne 1)
-                  {
-                      throw "expected exactly one .crate for $name, found $($found.Count)"
-                  }
-                  $package = @($metadata.packages | Where-Object { $_.name -eq $name })
-                  if ($package.Count -ne 1)
-                  {
-                      throw "expected exactly one workspace package named $name, found $($package.Count)"
-                  }
-                  $deps = @($edges[$name] | Sort-Object { $position[$_] })
-                  Copy-Item $found[0].FullName -Destination $outDir
-                  $entries += [ordered]@{
-                      name         = $name
-                      version      = $found[0].BaseName.Substring($prefix.Length)
-                      file         = $found[0].Name
-                      sha256       = (Get-FileHash $found[0].FullName -Algorithm SHA256).Hash.ToLower()
-                      dependencies = @($deps)
-                  }
-                  Write-Host "OK    packaged $($found[0].Name)"
-              }
-              @{ crates = $entries } | ConvertTo-Json -Depth 6 |
-                  Set-Content -Path (Join-Path $outDir 'release-order.json') -Encoding utf8NoBOM
-            displayName: Collect crates and write release-order.json
-            workingDirectory: $(Build.SourcesDirectory)
-
-          - pwsh: |
-              $ErrorActionPreference = 'Stop'
-              Copy-Item .azure-pipelines/scripts/crates_release.py -Destination "$(outDir)/"
-            displayName: Copy the release script into the artifact
+            displayName: Collect crates into the artifact
             workingDirectory: $(Build.SourcesDirectory)
 
           - task: 1ES.PublishPipelineArtifact@1
