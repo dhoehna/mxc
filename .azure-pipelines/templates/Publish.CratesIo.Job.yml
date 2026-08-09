@@ -15,17 +15,40 @@
 parameters:
   - name: ESRPInfo
     type: object
-  # Leaf-first crate list, supplied by the caller and declared once in
-  # 1ES.Release.Crates.yml.  Order matters here: crates.io rejects an upload
-  # whose dependencies are not live yet.
+  # The crates to publish, leaf-first.  This is the only copy of the list.
+  # It is literal because ${{ each }} expands when the pipeline compiles,
+  # before any step could produce it; the packaging job derives the same order
+  # at run time and needs no copy.
+  #
+  # Regenerate after adding or removing a crate:
+  #   pwsh .azure-pipelines/scripts/Get-CrateOrder.ps1 -Yaml
   - name: crateOrder
     type: object
+    default:
+    - isolation_session_bindings
+    - learning_mode_core
+    - mxc_pty
+    - mxc_telemetry
+    - nanvix_common
+    - process_security_environment_spec
+    - sandbox_spec
+    - wxc_common
+    - hyperlight_common
+    - isolation_session_common
+    - learning_mode_windows
+    - lxc_common
+    - nanvix_runner
+    - seatbelt_common
+    - windows_sandbox_common
+    - wslc_common
+    - appcontainer_common
+    - bwrap_common
+    - windows_sandbox_lifecycle
+    - mxc_engine
+    - mxc-sdk
   - name: cratesArtifactName
     type: string
     default: mxc-crates-package
-  # Compile-time backstop.  The stage condition in 1ES.Release.Crates.yml
-  # skips this job on a dry run; this guard means deleting that condition
-  # still cannot publish.
   - name: dryRun
     type: boolean
     default: true
@@ -60,6 +83,9 @@ jobs:
               Write-Host "staged $($found[0].Name)"
             displayName: "Stage ${{ crate }} for ESRP"
 
+          # Redundant: the stage condition in 1ES.Release.Crates.yml already
+          # skips this job on a dry run.  Kept so that deleting that condition
+          # still cannot publish.
           - ${{ if parameters.dryRun }}:
             - pwsh: |
                 Write-Host "##vso[task.logissue type=warning]DRY RUN: skipping ESRP publish for ${{ crate }} (staged .crate only)."

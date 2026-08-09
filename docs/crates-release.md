@@ -23,69 +23,57 @@ credentials and publishes under the `microsoft-oss-releases` account.
 ## Crate list
 
 The crates to publish are the `crateOrder` parameter in
-`.azure-pipelines/1ES.Release.Crates.yml`, which is the only place the list is
-written down. It is passed to both the packaging job and the publish job, so
-there is no second copy to keep in sync. Listed alphabetically here; the
-declared order is leaf-first, see below.
+`.azure-pipelines/templates/Publish.CratesIo.Job.yml`, which is the only place
+the list is written down. This document deliberately does not repeat it. The
+packaging job derives the same order at run time and holds no copy either, so
+there is nothing to keep in sync.
 
-- `appcontainer_common`
-- `bwrap_common`
-- `hyperlight_common`
-- `isolation_session_bindings`
-- `isolation_session_common`
-- `learning_mode_core`
-- `learning_mode_windows`
-- `lxc_common`
-- `mxc-sdk`
-- `mxc_engine`
-- `mxc_pty`
-- `mxc_telemetry`
-- `nanvix_common`
-- `nanvix_runner`
-- `process_security_environment_spec`
-- `sandbox_spec`
-- `seatbelt_common`
-- `windows_sandbox_common`
-- `windows_sandbox_lifecycle`
-- `wslc_common`
-- `wxc_common`
+To see the current list without opening that file:
 
-These names are provisional until the public naming scheme is approved.
+```pwsh
+pwsh .azure-pipelines/scripts/Get-CrateOrder.ps1
+```
+
+21 crates ship today, but that count is derived, not declared — the script
+above is the authoritative answer.  Their names are provisional until the
+public naming
+scheme is approved.
 
 ## Publish order
 
 `crateOrder` is leaf-first, because each crate must already be on crates.io
 before anything that depends on it can publish.
 
-The list is literal YAML because it has to be. `${{ each }}` expands at compile
-time, before any step has run, so the ESRP tasks cannot be generated from an
-order computed during the run. Anything that computed the order would still
-have to be pasted into YAML afterwards, so the pipeline skips the middleman and
-keeps one hand-maintained list.
+The list is literal YAML because `${{ each }}` expands when the pipeline
+compiles, before any step has run, so the ESRP tasks cannot be generated from
+an order computed during the run.
 
-**To add a crate**, insert its package name into `crateOrder` after every crate
-it depends on.
+`.azure-pipelines/scripts/Get-CrateOrder.ps1` computes that order from
+`cargo metadata`, and is both what the packaging job runs and how the literal
+is regenerated:
 
-Nothing validates the list before the release, and mostly nothing needs to:
+```pwsh
+pwsh .azure-pipelines/scripts/Get-CrateOrder.ps1 -Yaml
+```
+
+`-Yaml` prints paste-ready `- name` lines. Run it after adding or removing a
+crate and replace the `crateOrder` default with its output. Because packaging
+calls the same script, the packaged set is always the true closure of
+`mxc-sdk`, whatever the literal says — the literal only decides what gets
+published.
+
+Nothing validates the literal against the packaged set before the release, and
+mostly nothing needs to:
 
 - **Wrong order** — crates.io rejects an upload whose dependency is not live
   yet, naming the dependency it could not resolve. The release stops at the
   first crate that is out of place.
-- **A missing crate that something else in the list depends on** — packaging
-  fails before the release gets anywhere near crates.io. `cargo package` can
-  only resolve a workspace sibling that is being packaged in the same
-  invocation, so omitting one produces `no matching package named <crate>
-  found` and a non-zero exit.
-- **A missing crate that nothing else depends on** — this is the one gap.
-  A root crate such as `mxc-sdk`, or a new leaf nothing has adopted yet,
-  generates no `-p` flag and no ESRP task, so nothing fails: it is simply
-  never published. Adding a crate to the workspace and forgetting to add it
-  here is silent.
-
-`cargo package` emits its `.crate` files in its own dependency order
-regardless of the `-p` order it was given, so packaging succeeding proves
-nothing about `crateOrder` being correctly sorted. Only the publish stage
-exercises the order.
+- **A name in the list that was not packaged** — a typo, or a crate removed
+  from the workspace. Staging fails on that crate with `expected exactly one
+  .crate for <name>, found 0`, before ESRP is reached.
+- **A packaged crate missing from the list** — this is the one gap. It ships
+  in the artifact but generates no ESRP task, so nothing fails: it is simply
+  never published. Regenerating the list is what prevents this.
 
 ## How versions are determined
 
@@ -176,7 +164,7 @@ means cutting a new release ref.
    or fixed. The ESRP owner and approver are not fields — they are fixed to
    the identity that queued the run; see [ESRP identity](#esrp-identity).
    `crateOrder` is not a field either — it is a dependency order, not an
-   operator choice. It has a default in `1ES.Release.Crates.yml`; to change
+   operator choice. It has a default in `Publish.CratesIo.Job.yml`; to change
    it, edit that file on the release ref.
 
 5. Click **Run**.
@@ -188,10 +176,10 @@ means cutting a new release ref.
    **What a dry run does not cover.** Because the publish job does not run at
    all, a dry run proves the crates build and package on all three OSes — and
    nothing beyond that. In particular it does *not* validate `crateOrder`:
-   packaging ignores the order it is given, so only a real release exercises
-   it. It also does not exercise the pipeline artifact round-trip, the ESRP
-   staging directory, or ESRP itself. A green dry run is evidence about the
-   crates, not about the publish path.
+   packaging derives its own order and ignores the list, so only a real
+   release exercises it. It also does not exercise the pipeline artifact
+   round-trip, the ESRP staging directory, or ESRP itself. A green dry run is
+   evidence about the crates, not about the publish path.
 
 ### ESRP identity
 
@@ -227,11 +215,9 @@ a release reproducible from its ref alone.
 
 `Build.RequestedForEmail` is the queuer's email for a manually queued run, but
 it can resolve empty for a run started by a service identity or a schedule.
-The `Validate_Release_Ref` stage therefore checks it at runtime and fails the
-run immediately if it is empty or space-only, before anything is checked out or
-packaged — an empty value would otherwise submit an ESRP release with no owner
-or no approver.  If this pipeline is ever automated rather than queued by a
-person, set an explicit address in the YAML.
+Nothing checks it up front, so an empty value surfaces at the `EsrpRelease`
+task on a real release rather than before packaging.  If this pipeline is ever
+automated rather than queued by a person, set an explicit address in the YAML.
 
 ### 2. Real release
 
@@ -299,14 +285,15 @@ These must be resolved before the first real (non-dry-run) publish:
 3. **`hyperlight_common` name collision** — crates.io treats `-` and `_` as
    equivalent when checking name collisions, so `hyperlight_common` collides
    with the existing `hyperlight-common` crate, published from
-   github.com/hyperlight-dev/hyperlight.  It is the only one of the 21 names
-   that is taken today; the other 20 are unregistered.  The crate must be
+   github.com/hyperlight-dev/hyperlight.  It is the only name in the release
+   closure that is taken today; the rest are unregistered.  The crate must be
    renamed or co-ownership obtained before it can be published. Note that
    `hyperlight-common` is marked `trustpub_only` on crates.io, so co-ownership
    alone may not permit an ESRP token publish.
 4. **crates.io rate limit** — the default `PublishNew` rate limit is burst-5
-   plus 1 per 10 minutes.  A 21-crate first release will be throttled.  An
-   override must be requested from help@crates.io before the first publish.
+   plus 1 per 10 minutes.  A first release of the whole closure will be
+   throttled.  An override must be requested from help@crates.io before the
+   first publish.
 5. **Pipeline registration** — `.azure-pipelines/1ES.Release.Crates.yml` is new
    and must be registered as a pipeline in Azure DevOps, and that pipeline must
    be authorized to use the `MXC-ESRP-Signing` variable group.
@@ -315,9 +302,10 @@ These must be resolved before the first real (non-dry-run) publish:
 
 | File | Purpose |
 |------|---------|
-| `.azure-pipelines/1ES.Release.Crates.yml` | Top-level release pipeline — declares `crateOrder`, the release-ref gate, and the stage wiring |
-| `.azure-pipelines/templates/Package.Crates.Job.yml` | Packaging job — runs `cargo package` over `crateOrder` and produces the artifact |
-| `.azure-pipelines/templates/Publish.CratesIo.Job.yml` | ESRP publish job — one staging step and one `EsrpRelease@12` task per crate in `crateOrder` |
+| `.azure-pipelines/1ES.Release.Crates.yml` | Top-level release pipeline — the release-ref gate and the stage wiring |
+| `.azure-pipelines/templates/Package.Crates.Job.yml` | Packaging job — runs `cargo package` over the derived order and produces the artifact |
+| `.azure-pipelines/templates/Publish.CratesIo.Job.yml` | ESRP publish job — declares `crateOrder`, and runs one staging step and one `EsrpRelease@12` task per crate |
+| `.azure-pipelines/scripts/Get-CrateOrder.ps1` | Computes the leaf-first order from `cargo metadata` — run by packaging, and by a developer regenerating `crateOrder` |
 | `src/Cargo.toml` | Workspace version (single source of truth for all crate versions) |
 
 ## Comparison with the npm release

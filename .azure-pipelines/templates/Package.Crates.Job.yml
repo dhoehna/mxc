@@ -6,17 +6,10 @@
 # closure builds natively there.  Only the Windows leg publishes the artifact;
 # the other two are verification.
 #
-# The crate list is not written down here.  Callers pass it in:
-# 1ES.Release.Crates.yml for the release, 1ES.Build.Stages.yml for the
-# per-OS verification leg.
+# Get-CrateOrder.ps1 derives the crate list from the workspace at run time, so
+# adding a crate needs no edit here.
 
 parameters:
-  # Leaf-first crate list, supplied by the caller.  Packaging does not care
-  # about the order -- cargo packages the closure in its own dependency order
-  # regardless of the order of -p flags -- but the same list drives the publish
-  # stage, where the order does matter.
-  - name: crateOrder
-    type: object
   # Official builds resolve through the authenticated Mxc-Azure-Feed; unofficial
   # and fork builds use the anonymous MxcDependencies mirror.
   - name: isOfficialBuild
@@ -52,9 +45,8 @@ jobs:
     - job: package_crates_${{ item.name }}
       displayName: Package Crates (${{ item.os }})
 
-      # macOS is not offered by the 1ES managed pool, so it runs on the
-      # Microsoft-hosted pool, which names the image `vmImage` rather than
-      # `image`.
+      # macOS comes from the Microsoft-hosted pool, which names the image
+      # `vmImage`.
       pool:
         name: ${{ item.poolName }}
         ${{ if eq(item.os, 'macos') }}:
@@ -85,41 +77,33 @@ jobs:
         - ${{ else }}:
           - template: Cargo.Setup.Public.yml@self
 
-        # Cargo never prunes the sibling overlay it builds in target/package, so
-        # .crate files left by an earlier run with different versions survive
-        # and fail this run with "no hash listed for <crate>"
-        # (rust-lang/cargo#16011).  Whether an agent starts clean is a pool
-        # property this template cannot check, so it always removes it.
         - pwsh: |
             $ErrorActionPreference = 'Stop'
-            $packageDir = Join-Path (cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json).target_directory 'package'
-            if (Test-Path $packageDir)
-            {
-                Write-Host "removing stale $packageDir"
-                Remove-Item -Recurse -Force $packageDir
-            }
+            $crates = & .azure-pipelines/scripts/Get-CrateOrder.ps1
+            $packageArgs = @()
+            foreach ($crate in $crates) { $packageArgs += '-p'; $packageArgs += $crate }
+            Write-Host "packaging $($crates.Count) crates"
             # One cargo call for the whole closure: cargo resolves the crates
-            # against each other inside the overlay, which is the only way to
-            # package a crate whose path dependencies are not on a registry yet.
-            cargo package --manifest-path src/Cargo.toml --registry $(cargoRegistry) -p ${{ join(' -p ', parameters.crateOrder) }}
+            # against each other inside a temporary overlay, which is the only
+            # way to package a crate whose path dependencies are not on a
+            # registry yet.
+            cargo package --manifest-path src/Cargo.toml --registry $(cargoRegistry) @packageArgs
             if ($LASTEXITCODE -ne 0) { throw "cargo package failed with exit $LASTEXITCODE" }
           displayName: Package crate closure
           workingDirectory: $(Build.SourcesDirectory)
 
+        # Only the Windows leg publishes the artifact.  A .crate is the same
+        # bytes whichever agent produced it, so one copy is all the publish
+        # stage needs; the Linux and macOS legs run to prove the closure
+        # builds natively there.
         - ${{ if eq(item.os, 'windows') }}:
           - pwsh: |
               $ErrorActionPreference = 'Stop'
               $packageDir = Join-Path (cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json).target_directory 'package'
               New-Item -ItemType Directory -Force -Path '$(outDir)' | Out-Null
-              foreach ($crate in @('${{ join(''', ''', parameters.crateOrder) }}'))
-              {
-                  # Anchored on the dash so a crate does not match a longer
-                  # name that starts with it.
-                  $found = @(Get-ChildItem -Path $packageDir -Filter "$crate-*.crate" -File)
-                  if ($found.Count -ne 1) { throw "expected exactly one .crate for $crate, found $($found.Count)" }
-                  Copy-Item $found[0].FullName -Destination '$(outDir)'
-                  Write-Host "OK    $($found[0].Name)"
-              }
+              $found = @(Get-ChildItem -Path $packageDir -Filter '*.crate' -File)
+              Copy-Item $found.FullName -Destination '$(outDir)'
+              Write-Host "collected $($found.Count) crates"
             displayName: Collect crates into the artifact
             workingDirectory: $(Build.SourcesDirectory)
 

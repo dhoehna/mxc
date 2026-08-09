@@ -7,13 +7,8 @@
 # through ESRP, leaf-first.
 #
 # The ref the run is queued against supplies both the source and this
-# definition.  Validate_Release_Ref accepts two shapes and fails anything else:
-#
-#   refs/heads/release/*   release branch, e.g. release/v0.8.0
-#   refs/tags/v*           release tag, e.g. v0.8.0
-#
-# Selecting a commit does not work: a commit-queued run reports its containing
-# branch in Build.SourceBranch, not the SHA.
+# definition.  Queue it against a release branch (release/v0.8.0) or a release
+# tag (v0.8.0).
 #
 # Crate versions come from src/Cargo.toml at that ref.
 #
@@ -36,40 +31,6 @@ parameters:
     displayName: 'Dry run — package only; publish stage is skipped'
     type: boolean
     default: true
-  # The crates to publish, leaf-first: every crate must appear after the
-  # crates it depends on, because crates.io rejects an upload whose
-  # dependencies are not live yet.
-  #
-  # Declared here, once, and passed to both stages.  It has to be literal YAML
-  # rather than something derived at run time, because ${{ each }} expands when
-  # the pipeline compiles and cannot read anything a step produced.
-  #
-  # ADDING A CRATE: add it after its dependencies.  Getting this wrong fails
-  # the release at the crates.io upload, naming the unresolved dependency.
-  - name: crateOrder
-    type: object
-    default:
-    - isolation_session_bindings
-    - learning_mode_core
-    - mxc_pty
-    - mxc_telemetry
-    - nanvix_common
-    - process_security_environment_spec
-    - sandbox_spec
-    - wxc_common
-    - hyperlight_common
-    - isolation_session_common
-    - learning_mode_windows
-    - lxc_common
-    - nanvix_runner
-    - seatbelt_common
-    - windows_sandbox_common
-    - wslc_common
-    - appcontainer_common
-    - bwrap_common
-    - windows_sandbox_lifecycle
-    - mxc_engine
-    - mxc-sdk
 
 variables:
   - group: MXC-ESRP-Signing
@@ -91,8 +52,6 @@ extends:
         os: windows
 
     stages:
-    # Runtime check: Build.SourceBranch is not available to compile-time
-    # ${{ }} expressions.  Every other stage depends on this one.
     - stage: Validate_Release_Ref
       displayName: 'Validate Release Ref'
       dependsOn: []
@@ -104,26 +63,9 @@ extends:
         - checkout: none
         - pwsh: |
             $ErrorActionPreference = 'Stop'
-            if ([string]::IsNullOrWhiteSpace($env:OWNERS))
-            {
-              Write-Host "##vso[task.logissue type=error]ESRP owners email resolved empty. The Build.RequestedForEmail predefined variable is set from the identity that queued the run; queue this pipeline as a signed-in user, or set an explicit address in 1ES.Release.Crates.yml and cut a new release ref."
-              exit 1
-            }
-            if ([string]::IsNullOrWhiteSpace($env:APPROVERS))
-            {
-              Write-Host "##vso[task.logissue type=error]ESRP approvers email resolved empty. The Build.RequestedForEmail predefined variable is set from the identity that queued the run; queue this pipeline as a signed-in user, or set an explicit address in 1ES.Release.Crates.yml and cut a new release ref."
-              exit 1
-            }
-            Write-Host "ESRP owner and approver resolved to: $env:OWNERS / $env:APPROVERS"
-          displayName: 'Require ESRP owner and approver'
-          env:
-            OWNERS: $(Build.RequestedForEmail)
-            APPROVERS: $(Build.RequestedForEmail)
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
             $ref = $env:SOURCE_REF
             Write-Host "Run was queued against: $ref"
-            # -clike, not -like: -like is case-insensitive and git refs are not.
+            # -clike, case-sensitive compare.  Git refs are case-sensitive.
             if ($ref -clike 'refs/heads/release/?*')
             {
               Write-Host "OK: releasing from branch $($ref.Substring('refs/heads/'.Length))"
@@ -135,8 +77,7 @@ extends:
             else
             {
               Write-Host "##vso[task.logissue type=error]This pipeline may only run from a release branch (refs/heads/release/*) or a release tag (refs/tags/v*). It was queued against '$ref'."
-              Write-Host "Cut a branch such as 'release/v0.8.0' from the commit you are releasing, confirm the release/* ruleset has frozen it, then pick it in the ref selector of the Run pipeline dialog."
-              Write-Host "Note: selecting a COMMIT does not work -- a commit-queued run still reports its containing branch here, not the SHA."
+              Write-Host "Cut a branch such as 'release/v0.8.0' from the commit you are releasing, confirm the release/* ruleset has frozen it, then pick that branch in the ref selector of the Run pipeline dialog."
               exit 1
             }
           displayName: 'Require refs/heads/release/* or refs/tags/v*'
@@ -149,8 +90,6 @@ extends:
       dependsOn: Validate_Release_Ref
       jobs:
       - template: .azure-pipelines/templates/Package.Crates.Job.yml@self
-        parameters:
-          crateOrder: ${{ parameters.crateOrder }}
 
     - stage: Publish_to_CratesIo
       displayName: 'Publish Crates.io Packages'
@@ -168,6 +107,4 @@ extends:
             clientId: $(clientId)
             OwnersEmail: $(Build.RequestedForEmail)
             ApproversEmail: $(Build.RequestedForEmail)
-          # crateOrder is declared once at the top of this file.
-          crateOrder: ${{ parameters.crateOrder }}
           dryRun: ${{ parameters.dryRun }}
