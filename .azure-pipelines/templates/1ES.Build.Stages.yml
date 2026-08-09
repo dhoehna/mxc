@@ -14,12 +14,12 @@ parameters:
     type: boolean
     default: false
 
-  # Opt-in until the `--registry Mxc-Azure-Feed` workaround for
-  # https://github.com/rust-lang/cargo/issues/17196 has been validated against
-  # the full crate closure on the official build.
+  # Runs `cargo package` for the crate closure on Windows, Linux, and macOS so
+  # a per-OS packaging break is caught on the build that introduced it.  Kept as
+  # a parameter purely as an escape hatch: set it to false to skip the stage.
   - name: packageCrates
     type: boolean
-    default: false
+    default: true
 
   - name: ESRPInfo
     type: object
@@ -89,18 +89,24 @@ stages:
 
   - template: Mxc.Binary.Packaging.Job.yml
 
-# Crate packaging is official-build-only and explicitly opt-in until the
-# cargo #17196 workaround has been validated against the full crate closure.
-- ${{ if and(parameters.isOfficialBuild, parameters.packageCrates) }}:
+# Runs on official and unofficial builds alike: the point is to prove every
+# supported OS can package the closure, and a PR that breaks packaging on one
+# OS should fail on that PR.  The job picks the internal or public mirror from
+# isOfficialBuild, since an unofficial build cannot authenticate to the
+# internal feed.
+- ${{ if parameters.packageCrates }}:
   - stage: Package_Crates
     displayName: 'Package Crates'
-    # Source-only (no binaries), so it does not depend on Build_Binaries. Produces
-    # the `mxc-crates-package` artifact consumed by 1ES.Release.Crates.yml for ESRP-based
-    # crates.io publishing. Isolated in its own stage so it never gates npm
-    # packaging or the integration tests that depend on Package_MXC.
+    # Source-only (no binaries), so it does not depend on Build_Binaries.
+    # Verification only: 1ES.Release.Crates.yml declares no pipeline resource, so
+    # it repackages from the release ref and publishes that artifact, and the one
+    # produced here is never consumed.  Isolated in its own stage so it never
+    # gates npm packaging or the integration tests that depend on Package_MXC.
     dependsOn: []
     jobs:
     - template: Package.Crates.Job.yml
+      parameters:
+        isOfficialBuild: ${{ parameters.isOfficialBuild }}
 
 - stage: Lint
   displayName: 'Lint'

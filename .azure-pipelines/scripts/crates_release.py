@@ -24,12 +24,15 @@ that used to depend on them are covered earlier or elsewhere:
 
 Subcommands
 -----------
-package       Validate and package the complete first-party closure, then write
-              `.crate` files and release-order.json.
+package       Package the complete first-party closure locally, writing `.crate`
+              files and release-order.json. Developer-facing reproduction of
+              what the packaging job does; the pipeline calls `cargo package`
+              directly and writes release-order.json in PowerShell.
 
 order         Print the leaf-first publish order, derived from `cargo metadata`.
               Developer-facing: paste its output over the `crateOrder` default
-              in templates/Publish.CratesIo.Job.yml. Not used by the pipeline.
+              in BOTH templates/Publish.CratesIo.Job.yml and
+              templates/Package.Crates.Job.yml. Not used by the pipeline.
 
 verify-order  Assert that the crates the pipeline is about to publish are a
               correctly-ordered subset of what was packaged. A partial subset is
@@ -73,16 +76,19 @@ import sys
 # ADDING A CRATE:
 #
 #   1. Add the package name to this list.  Anywhere.
-#   2. Regenerate the template's crateOrder and paste the output over it:
+#   2. Regenerate crateOrder and paste the output over BOTH copies of it:
 #        python3 .azure-pipelines/scripts/crates_release.py order
 #      (writes YAML lines for the `crateOrder` default in
-#      .azure-pipelines/templates/Publish.CratesIo.Job.yml)
+#      .azure-pipelines/templates/Publish.CratesIo.Job.yml and in
+#      .azure-pipelines/templates/Package.Crates.Job.yml -- the list is
+#      duplicated because an Azure Pipelines template cannot read another
+#      template's parameter defaults, and check-template runs once per file)
 #
 # That is the whole procedure.  `order` validates the graph before printing,
 # so a bad edit produces a named error rather than a list that fails mid
-# release.  Forgetting step 1 is caught too: _validate_release_graph fails
-# packaging with "local dependency is missing from CRATES" as soon as any
-# published crate depends on the new one.
+# release.  Forgetting step 1 is caught too: check-template runs
+# _validate_release_graph, which fails with "local dependency is missing from
+# CRATES" as soon as any published crate depends on the new one.
 #
 # The pipeline cannot use `cargo publish --workspace` (which would order the
 # publish itself) because ESRP performs the upload, one .crate file at a time,
@@ -112,8 +118,10 @@ CRATES: list[str] = [
 ]
 
 # The pipeline packages this list on a Windows, a Linux, and a macOS agent, so
-# every crate here has to compile on all three.  A platform-specific crate
-# gates its code with cfg and builds to an empty library elsewhere.
+# every crate here has to compile on all three.  A platform-specific crate gates
+# its platform code with cfg; the other targets still build, though not
+# necessarily to an empty library -- learning_mode_windows, for example, still
+# exports its error type and a capability probe that returns false.
 
 
 def _cargo_metadata(manifest_path: str) -> dict:
@@ -308,6 +316,21 @@ def cmd_package(args: argparse.Namespace) -> int:
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
+    # cargo builds its sibling-resolution overlay in target/package/tmp-registry
+    # and does not prune entries from earlier runs, so .crate files built from
+    # different manifests accumulate there; a broken tree was observed holding
+    # 41 .crate files against 21 index entries, including two versions of the
+    # same crate.  A leftover artifact for a name or version the workspace no
+    # longer produces makes verification fail with "no hash listed for <crate>"
+    # -- see rust-lang/cargo#16011 and #16525, where the maintainer notes the
+    # failure "seems to arise from prior state and a cargo clean makes things
+    # work".  Deleting the directory was confirmed locally to turn a reproducing
+    # failure green.  Whether any given agent starts clean is a pool property
+    # this script cannot check, so it always removes the directory.
+    if os.path.isdir(package_dir):
+        print(f"removing stale {package_dir}", flush=True)
+        shutil.rmtree(package_dir)
+
     print(f"=== cargo package: {len(order)} crates (leaf-first) ===")
     for crate in order:
         print(f"  {crate} {versions[crate]}")
@@ -316,11 +339,13 @@ def cmd_package(args: argparse.Namespace) -> int:
     manifest = os.path.abspath(args.manifest_path)
     # Verification stays on. Passing --registry (rather than the default
     # crates-io) is what makes cargo resolve sibling crates against the
-    # temporary package registry, so the overlay bug in cargo#17196 does not
-    # apply here and --no-verify is unnecessary. --allow-dirty is likewise
-    # omitted: the only file the pipeline modifies is the workspace
-    # .cargo/config.toml, which lies outside every package directory, so a
-    # dirty-tree failure here means a crate source really was modified.
+    # temporary package registry, which is the documented workaround for the
+    # overlay bug in cargo#17196, so --no-verify is unnecessary. --allow-dirty
+    # is likewise omitted: the files the pipeline writes into the tree are the
+    # workspace .cargo/config.toml (Cargo.Setup.*.yml) and the rustup-init
+    # binary plus its .sha256 sidecar at the repo root (Rust.Toolchain.Public.yml),
+    # and all of them lie outside every packaged crate directory under src/, so
+    # a dirty-tree failure here means a crate source really was modified.
 
     package_args = [
         "cargo",
@@ -491,7 +516,10 @@ RESUME_MARKER = "RESUME-SUBSET"
 
 
 def _template_crate_order(template_path: str) -> tuple[list[str], str | None]:
-    """Read the crateOrder default out of Publish.CratesIo.Job.yml.
+    """Read the crateOrder default out of a job template.
+
+    Both Publish.CratesIo.Job.yml and Package.Crates.Job.yml carry the same
+    list, so this is called once per file.
 
     Returns the crate names and the resume-subset reason, if one is declared.
 
@@ -600,11 +628,13 @@ def cmd_check_template(args: argparse.Namespace) -> int:
     until afterwards, and a missed publish is not fixable by re-running: the
     crates that did land cannot be republished.
 
-    This runs in two places on purpose. In CI it catches drift at PR time, which
-    is where it is cheap to fix. In the release pipeline it catches drift at
-    release time, which is where it is irreversible -- CI alone cannot cover
-    that, because a release ref can be pushed straight to the remote without
-    ever opening a pull request.
+    There are two call sites, and they cover different moments. The GitHub
+    Versioning Checks workflow calls it at PR time, which is where drift is
+    cheap to fix. The shared ADO packaging job calls it too, which means every
+    pipeline that packages -- including the release pipeline -- rechecks at
+    release time, where drift is irreversible. PR-time checks alone cannot
+    cover that, because a release ref can be pushed straight to the remote
+    without ever opening a pull request.
 
     A deliberate resume is the one legitimate reason for the template to hold a
     short list, and it is declared in the template itself with a RESUME-SUBSET
@@ -677,10 +707,11 @@ def main() -> int:
     package.add_argument("--manifest-path", default="src/Cargo.toml")
     package.add_argument("--out-dir", required=True)
     # Which registry cargo resolves unpublished workspace siblings against.
-    # Defaults to the private feed because that is the only value known to
-    # work: verification is enabled (see cmd_package), and with the default
-    # crates-io the overlay bug in rust-lang/cargo#17196 fails the run. Keeping
-    # this aligned with the pipeline also means a local repro matches CI.
+    # The packaging job always passes this explicitly -- Mxc-Azure-Feed on
+    # official builds and MxcDependencies on unofficial ones -- so this default
+    # only applies to a local run. It has to name a registry the effective cargo
+    # config declares, or cargo fails with "registry index was not found in any
+    # configuration" before packaging starts.
     package.add_argument("--registry", default="Mxc-Azure-Feed")
     package.set_defaults(func=cmd_package)
 
@@ -714,8 +745,11 @@ def main() -> int:
     )
     order.set_defaults(func=cmd_order)
 
-    # CI-only. Developers never run this: it is what makes forgetting to paste
-    # the `order` output a failed build instead of a silently skipped crate.
+    # Called from the GitHub Versioning Checks workflow and from the shared ADO
+    # packaging job, so every pipeline that packages rechecks it. It is what
+    # makes forgetting to paste the `order` output a failed build instead of a
+    # silently skipped crate, and it is safe to run locally before opening a
+    # pull request.
     check_template = sub.add_parser(
         "check-template",
         help="CI guard: assert the template's crateOrder equals the computed order",

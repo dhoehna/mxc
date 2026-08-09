@@ -6,13 +6,14 @@ crate workspace to [crates.io](https://crates.io) via ESRP Release.
 ## Overview
 
 The **1ES.Release.Crates** pipeline (`.azure-pipelines/1ES.Release.Crates.yml`)
-packages and publishes the 20-crate release closure from the MXC Rust workspace
+packages and publishes the 21-crate release closure from the MXC Rust workspace
 in a single pipeline run:
 
-1. **Package stage** — checks out the release ref the run was queued against,
-   runs one `cargo package` invocation carrying a `-p` flag per crate, and
-   uploads the `.crate` files plus a `release-order.json` manifest as the
-   `mxc-crates-package` artifact.
+1. **Package stage** — checks out the release ref the run was queued against and
+   runs `cargo package` on a Windows, a Linux, and a macOS agent, each carrying a
+   `-p` flag per crate. The Windows leg uploads the `.crate` files plus a
+   `release-order.json` manifest as the `mxc-crates-package` artifact; the other
+   two legs are verification that the closure builds natively on those systems.
 2. **Publish stage** — downloads that artifact and publishes each `.crate` to
    crates.io through ESRP, one `EsrpRelease@12` task per crate, leaf-first.
 
@@ -39,6 +40,7 @@ publish order is *not* a property of this list, see below.
 - `mxc_telemetry`
 - `nanvix_common`
 - `nanvix_runner`
+- `process_security_environment_spec`
 - `sandbox_spec`
 - `seatbelt_common`
 - `windows_sandbox_common`
@@ -64,10 +66,12 @@ computed during the run. It is therefore a **pasted copy** of the command's
 output rather than a live call.
 
 Nothing about pasting is trusted, though. The `Versioning Checks` workflow runs
-`crates_release.py check-template` on every pull request, which recomputes the
-order and fails the build if the template does not match it exactly — same
-crates, same sequence. Editing `CRATES` and forgetting to regenerate is a red
-build, not a bad release.
+`crates_release.py check-template` on pull requests into `main`, `feature/*`,
+and `user/*`, and on pushes to `main`. It recomputes the order and fails the
+build if the template does not match it exactly — same crates, same sequence.
+Editing `CRATES` and forgetting to regenerate is a red build, not a bad
+release. The one accepted deviation is a declared `RESUME-SUBSET`, covered
+under "Resuming a failed release" below.
 
 That check exists because the run-time check cannot catch this case.
 `verify-order` accepts an ordered *subset* of the packaged closure — that is
@@ -84,16 +88,20 @@ caught before the release, at PR time, which is what `check-template` does.
 python3 .azure-pipelines/scripts/crates_release.py order
 ```
 
-That prints the list ready to paste over the `crateOrder` default in
-`.azure-pipelines/templates/Publish.CratesIo.Job.yml`. It validates the graph
-before printing, so a broken workspace produces a named error rather than a
-list that fails halfway through a release.
+That prints the list ready to paste over the `crateOrder` default. **Two
+templates carry that list** — `.azure-pipelines/templates/Publish.CratesIo.Job.yml`
+and `.azure-pipelines/templates/Package.Crates.Job.yml` — because an Azure
+Pipelines template cannot read another template's parameter defaults. Paste the
+same output over both. The command validates the graph before printing, so a
+broken workspace produces a named error rather than a list that fails halfway
+through a release.
 
 To add a crate, put the package name anywhere in the `CRATES` list in
 `.azure-pipelines/scripts/crates_release.py` — that list is an unordered *set*
 of what to publish, not an ordering — then run the command above and paste the
-result over `crateOrder`. Both steps are required, and `check-template` is what
-catches doing only the first. `verify-order` does **not**: it accepts an ordered
+result over both copies of `crateOrder`. All three steps are required, and
+`check-template` is what catches doing only some of them: the packaging job
+runs it once per template. `verify-order` does **not**: it accepts an ordered
 subset by design, so a stale `crateOrder` passes it and the new crate is simply
 never published.
 
@@ -273,7 +281,7 @@ crates.io public. Do not clear `dryRun` until crate naming is settled and ESRP
 ## Resuming a failed release
 
 crates.io rejects duplicate versions. If the pipeline fails partway through
-(e.g. crate 7 of 20 fails for a transient reason), crates 1–6 are already
+(e.g. crate 7 of 21 fails for a transient reason), crates 1–6 are already
 published and cannot be republished.
 
 To resume:
@@ -300,6 +308,11 @@ To resume:
    back, which crates.io then rejects. Do not bump the crate version; the
    remaining crates still need to publish at the version that failed.
 
+   **Leave the copy in `Package.Crates.Job.yml` alone.** A resume trims what
+   gets *published*, not what gets *packaged*: the packaging job always builds
+   the full closure, and `check-template` requires that copy to stay complete.
+   Packaging a crate that is already live is harmless — nothing uploads it.
+
    Add a `RESUME-SUBSET` marker line directly above `default:`, naming the run
    this is resuming:
 
@@ -310,7 +323,15 @@ To resume:
        default:
          - bwrap_common
          - windows_sandbox_lifecycle
+         - mxc_engine
+         - mxc-sdk
    ```
+
+   The subset must list **every** crate that has not yet published, in its
+   original relative order. Nothing checks completeness: both `check-template`
+   and `verify-order` accept any correctly-ordered subset, so a crate dropped
+   from this list is silently never published and cannot be recovered by
+   re-running.
 
    The marker is **required**. Without it the packaging job fails the run,
    because a short `crateOrder` with nothing declaring intent is
@@ -323,18 +344,23 @@ To resume:
 5. Merge the `crateOrder` edit to `main` separately, or revert it there once
    the release completes — `main` should end up carrying the full list again,
    with the `RESUME-SUBSET` marker removed, so the next release publishes the
-   whole closure. A pull request into `main` that still carries the marker or
-   the short list fails `check-template`, which is the intended backstop.
+   whole closure. Note this step is **not** enforced: `check-template` accepts a
+   marked resume subset and exits 0, so a pull request into `main` that still
+   carries the marker and the short list passes. Restoring the full list is
+   currently a manual responsibility with no automated backstop.
 
 The `verify-order` guard accepts a subset of the original order as long as it
 is still in correct leaf-first sequence. It logs a warning naming every
 dependency it assumes is already live.
 
-The `check-template` gate runs in two places, and a resume has to satisfy both.
-CI runs it on pull requests into `main`; the release pipeline runs it again in
-the packaging job, before any artifact is produced, because a release ref can
-be pushed straight to `microsoft/mxc` without ever opening a pull request — so
-CI alone would leave the irreversible path unguarded.
+`check-template` is invoked from two places in the tree, and each of them now
+runs it twice — once per template that carries a `crateOrder` — so a resume has
+to satisfy every pipeline that reaches them. The GitHub `Versioning Checks`
+workflow runs it directly, and the shared ADO packaging job runs it before any
+artifact is produced — which means it also runs inside the release pipeline,
+because a release ref can be pushed straight to `microsoft/mxc` without ever
+opening a pull request, and the pull-request checks alone would leave the
+irreversible path unguarded.
 
 That is why step 3 requires the `RESUME-SUBSET` marker. Without it the release
 pipeline refuses to publish a short list at all, which is the point: a trimmed
@@ -346,8 +372,9 @@ order and prints exactly which crates it is assuming are already live.
 Note that GitHub's `pull_request: branches:` filter matches the **base** branch,
 not the source branch, so a pull request *from* a `release/*` branch *into*
 `main` does run `check-template` — and should, since `main` must carry the full
-list. Only a direct push to `release/*` skips the CI run, which is precisely
-the case the release pipeline's own copy of the check covers.
+list. A direct push to `release/*` skips the CI run, as does any pull request
+whose base branch is outside `main`, `feature/*`, and `user/*` — precisely the
+cases the release pipeline's own copy of the check covers.
 
 There is no automated resume. The operator asserts what landed by editing
 `crateOrder`.
@@ -355,27 +382,33 @@ There is no automated resume. The operator asserts what landed by editing
 ## Network isolation
 
 The publish job runs on a 1ES pool with CFSClean network isolation — crates.io
-is **not reachable** from the agent. Dependency resolution during packaging uses
-the internal `Mxc-Azure-Feed`, appended to the workspace cargo config by
-`.azure-pipelines/templates/Cargo.Setup.Private.yml` from
-`.azure-pipelines/.cargo/config.toml`. ESRP itself handles the outbound publish
-to crates.io.
+is **not reachable** from the agent. Dependency resolution during packaging goes
+through whichever mirror the build configured: official builds and the release
+pipeline use the internal `Mxc-Azure-Feed`, appended to the workspace cargo
+config by `.azure-pipelines/templates/Cargo.Setup.Private.yml` from
+`.azure-pipelines/.cargo/config.toml`; unofficial and fork builds, including the
+PR packaging legs, use the anonymous public `MxcDependencies` mirror appended by
+`Cargo.Setup.Public.yml` from `.azure-pipelines/.cargo/config.public.toml`. ESRP
+itself handles the outbound publish to crates.io.
 
-Packaging passes `--registry Mxc-Azure-Feed` to work around
-[rust-lang/cargo#17196](https://github.com/rust-lang/cargo/issues/17196): with
-`[source.crates-io] replace-with` active, cargo registers the temporary overlay
-holding the just-packaged workspace siblings under the pre-replacement source
-id but looks it up under the post-replacement one, so the overlay is silently
-bypassed and each sibling is searched for in the feed, where it does not exist.
-The emitted `.crate` files are byte-identical either way.
+Packaging passes `--registry` naming that same feed to work around
+[rust-lang/cargo#17196](https://github.com/rust-lang/cargo/issues/17196), open
+and reproducible on the pinned toolchain at the time of writing: with `[source.crates-io] replace-with` active, cargo
+registers the temporary overlay holding the just-packaged workspace siblings
+under the pre-replacement source id but looks it up under the post-replacement
+one, so the overlay is silently bypassed and each sibling is searched for in the
+feed, where it does not exist. The value must name a registry the effective
+cargo config declares, or cargo fails with "registry index was not found in any
+configuration" before packaging starts.
 
 Because `--registry` already steers resolution to the temporary overlay,
 per-crate verification builds succeed and packaging deliberately does *not*
-pass `--no-verify`. Nor does it pass `--allow-dirty`: the only file the
-pipeline modifies is the workspace `.cargo/config.toml`, which lies outside
-every package directory and so does not make any package dirty. A dirty-tree
-failure during packaging therefore means a crate source really was modified,
-and should stop the release.
+pass `--no-verify`. Nor does it pass `--allow-dirty`: the files the pipeline
+writes into the tree — the workspace `.cargo/config.toml`, and `rustup-init`
+plus its `.sha256` sidecar at the repo root — all lie outside every package
+directory, so none of them makes a package dirty. A dirty-tree failure during
+packaging therefore means a crate source really was modified, and should stop
+the release.
 
 ## Prerequisites / known blockers
 
@@ -390,13 +423,13 @@ These must be resolved before the first real (non-dry-run) publish:
 3. **`hyperlight_common` name collision** — crates.io treats `-` and `_` as
    equivalent when checking name collisions, so `hyperlight_common` collides
    with the existing `hyperlight-common` crate, published from
-   github.com/hyperlight-dev/hyperlight.  It is the only one of the 20 names
-   that is taken today; the other 19 are unregistered.  The crate must be
+   github.com/hyperlight-dev/hyperlight.  It is the only one of the 21 names
+   that is taken today; the other 20 are unregistered.  The crate must be
    renamed or co-ownership obtained before it can be published. Note that
    `hyperlight-common` is marked `trustpub_only` on crates.io, so co-ownership
    alone may not permit an ESRP token publish.
 4. **crates.io rate limit** — the default `PublishNew` rate limit is burst-5
-   plus 1 per 10 minutes.  A 20-crate first release will be throttled.  An
+   plus 1 per 10 minutes.  A 21-crate first release will be throttled.  An
    override must be requested from help@crates.io before the first publish.
 5. **Pipeline registration** — `.azure-pipelines/1ES.Release.Crates.yml` is new
    and must be registered as a pipeline in Azure DevOps, and that pipeline must
@@ -407,9 +440,9 @@ These must be resolved before the first real (non-dry-run) publish:
 | File | Purpose |
 |------|---------|
 | `.azure-pipelines/1ES.Release.Crates.yml` | Top-level release pipeline (parameters, release-ref gate, stage wiring) |
-| `.azure-pipelines/templates/Package.Crates.Job.yml` | Packaging job — runs `cargo package`, produces artifact |
-| `.azure-pipelines/templates/Publish.CratesIo.Job.yml` | ESRP publish job — `verify-order`, stage, publish loop |
-| `.azure-pipelines/scripts/crates_release.py` | Helper script (`package`, `order`, `verify-order`, `check-template`, `stage` subcommands) |
+| `.azure-pipelines/templates/Package.Crates.Job.yml` | Packaging job — carries `crateOrder`, calls `cargo package` directly, writes `release-order.json`, produces the artifact |
+| `.azure-pipelines/templates/Publish.CratesIo.Job.yml` | ESRP publish job — carries `crateOrder`, runs `verify-order`, stage, publish loop |
+| `.azure-pipelines/scripts/crates_release.py` | Source of truth for `CRATES`, and the `order`, `check-template`, `verify-order`, and `stage` subcommands the pipeline runs. Its `package` subcommand is a local-reproduction convenience; the pipeline calls `cargo package` itself |
 | `src/Cargo.toml` | Workspace version (single source of truth for all crate versions) |
 
 ## Comparison with the npm release

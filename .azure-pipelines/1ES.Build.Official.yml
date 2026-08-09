@@ -6,7 +6,7 @@
 # pipeline) so policies, retention, and queuing rules for official builds
 # can be managed independently.
 #
-# No `trigger:`/`pr:` block — official builds are manually queued or
+# `trigger: none` / `pr: none` — official builds are manually queued or
 # scheduled externally. The actual stage list lives in
 # `1ES.Build.Stages.yml`, shared with `1ES.Build.yml`; any
 # build-content changes belong there, not here.
@@ -29,9 +29,9 @@ parameters:
     type: boolean
     default: false
   - name: packageCrates
-    displayName: Package crates.io release artifacts
+    displayName: Verify crate packaging on Windows, Linux, and macOS
     type: boolean
-    default: false
+    default: true
 
 variables:
   # Variable group managed in Dart — see the pipeline's variable group list.

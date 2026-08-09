@@ -15,7 +15,9 @@
 #
 # Resuming a failed release: re-queue with the already-published crates
 # removed from crateOrder.  verify-order accepts that subset only if it is
-# still in packaged leaf-first order.
+# still in packaged leaf-first order, and check-template additionally requires
+# a RESUME-SUBSET marker in this file declaring the intent -- without it, a
+# short list is treated as a stale template and fails the build.
 
 parameters:
   - name: ESRPInfo
@@ -34,10 +36,13 @@ parameters:
   #
   # ADDING A CRATE: add the package name to the CRATES list in
   # scripts/crates_release.py, then run the command above and paste the result
-  # here.  Both steps are required.
+  # here AND over the identical crateOrder in Package.Crates.Job.yml.  All
+  # three steps are required; check-template runs once per template.
   #
   # Drop already-published crates from this list to resume a failed release,
-  # keeping the survivors in their existing relative order.
+  # keeping the survivors in their existing relative order.  Leave the copy in
+  # Package.Crates.Job.yml complete -- a resume trims what is published, not
+  # what is packaged.
   - name: crateOrder
     type: object
     default:

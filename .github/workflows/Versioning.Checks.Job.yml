@@ -34,7 +34,11 @@ jobs:
         run: node scripts/versioning/check-schema-codegen.js
 
       - name: Check crates.io publish order is in sync (codegen)
-        run: python3 .azure-pipelines/scripts/crates_release.py check-template
+        run: |
+          python3 .azure-pipelines/scripts/crates_release.py check-template \
+            --template-path .azure-pipelines/templates/Publish.CratesIo.Job.yml
+          python3 .azure-pipelines/scripts/crates_release.py check-template \
+            --template-path .azure-pipelines/templates/Package.Crates.Job.yml
 
       - name: Check PSEC generated contract (provenance + drift)
         run: node scripts/versioning/check-psec-codegen.js
