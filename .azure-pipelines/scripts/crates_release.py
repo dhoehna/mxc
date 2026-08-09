@@ -503,8 +503,8 @@ RESUME_MARKER = "RESUME-SUBSET"
 def _template_crate_order(template_path: str) -> tuple[list[str], str | None]:
     """Read the crateOrder default out of a job template.
 
-    Both Publish.CratesIo.Job.yml and Package.Crates.Job.yml carry the same
-    list, so this is called once per file.
+    Only Publish.CratesIo.Job.yml carries a crateOrder; Package.Crates.Job.yml
+    derives its list at run time.
 
     Returns the crate names and the resume-subset reason, if one is declared.
 
