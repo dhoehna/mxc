@@ -7,7 +7,7 @@
 # Called by Package.Crates.Job.yml.  Runnable by hand from the repo root to
 # reproduce exactly what the packaging leg does:
 #
-#   pwsh .azure-pipelines/scripts/Invoke-CratePackage.ps1 -OutDir out/crates
+#   pwsh scripts/ci/Invoke-CratePackage.ps1 -OutDir out/crates
 
 [CmdletBinding()]
 param

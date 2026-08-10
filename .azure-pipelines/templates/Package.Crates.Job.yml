@@ -82,7 +82,7 @@ jobs:
           displayName: Package crate closure
           inputs:
             targetType: filePath
-            filePath: $(Build.SourcesDirectory)/.azure-pipelines/scripts/Invoke-CratePackage.ps1
+            filePath: $(Build.SourcesDirectory)/scripts/ci/Invoke-CratePackage.ps1
             arguments: -OutDir '$(outDir)' -Registry '$(cargoRegistry)'
             pwsh: true
             workingDirectory: $(Build.SourcesDirectory)

@@ -31,7 +31,7 @@ there is nothing to keep in sync.
 To see the current list without opening that file:
 
 ```pwsh
-pwsh .azure-pipelines/scripts/Get-CrateOrder.ps1
+pwsh scripts/ci/Get-CrateOrder.ps1
 ```
 
 21 crates ship today, but that count is derived, not declared — the script
@@ -48,12 +48,12 @@ The list is literal YAML because `${{ each }}` expands when the pipeline
 compiles, before any step has run, so the ESRP tasks cannot be generated from
 an order computed during the run.
 
-`.azure-pipelines/scripts/Get-CrateOrder.ps1` computes that order from
+`scripts/ci/Get-CrateOrder.ps1` computes that order from
 `cargo metadata`, and is both what the packaging job runs and how the literal
 is regenerated:
 
 ```pwsh
-pwsh .azure-pipelines/scripts/Get-CrateOrder.ps1 -Yaml
+pwsh scripts/ci/Get-CrateOrder.ps1 -Yaml
 ```
 
 `-Yaml` prints paste-ready `- name` lines. Run it after adding or removing a
@@ -305,7 +305,8 @@ These must be resolved before the first real (non-dry-run) publish:
 | `.azure-pipelines/1ES.Release.Crates.yml` | Top-level release pipeline — the release-ref gate and the stage wiring |
 | `.azure-pipelines/templates/Package.Crates.Job.yml` | Packaging job — runs `cargo package` over the derived order and produces the artifact |
 | `.azure-pipelines/templates/Publish.CratesIo.Job.yml` | ESRP publish job — declares `crateOrder`, and runs one staging step and one `EsrpRelease@12` task per crate |
-| `.azure-pipelines/scripts/Get-CrateOrder.ps1` | Computes the leaf-first order from `cargo metadata` — run by packaging, and by a developer regenerating `crateOrder` |
+| `scripts/ci/Get-CrateOrder.ps1` | Computes the leaf-first order from `cargo metadata` — run by packaging, and by a developer regenerating `crateOrder` |
+| `scripts/ci/Invoke-CratePackage.ps1` | Packages the closure and copies the `.crate` files where the artifact task reads them — run by the packaging job |
 | `src/Cargo.toml` | Workspace version (single source of truth for all crate versions) |
 
 ## Comparison with the npm release

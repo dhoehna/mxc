@@ -7,7 +7,7 @@
 #   Package.Crates.Job.yml   at run time, to build the cargo package -p list
 #   a developer               to regenerate crateOrder in Publish.CratesIo.Job.yml
 #
-#   pwsh .azure-pipelines/scripts/Get-CrateOrder.ps1 -Yaml
+#   pwsh scripts/ci/Get-CrateOrder.ps1 -Yaml
 
 [CmdletBinding()]
 param

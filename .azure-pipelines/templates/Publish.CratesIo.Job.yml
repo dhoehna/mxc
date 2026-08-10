@@ -21,7 +21,7 @@ parameters:
   # at run time and needs no copy.
   #
   # Regenerate after adding or removing a crate:
-  #   pwsh .azure-pipelines/scripts/Get-CrateOrder.ps1 -Yaml
+  #   pwsh scripts/ci/Get-CrateOrder.ps1 -Yaml
   - name: crateOrder
     type: object
     default:
