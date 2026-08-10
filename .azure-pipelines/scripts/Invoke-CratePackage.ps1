@@ -27,6 +27,10 @@ $ErrorActionPreference = 'Stop'
 
 $crates = & (Join-Path $PSScriptRoot 'Get-CrateOrder.ps1') -ManifestPath $ManifestPath
 
+# Without -p flags cargo packages every workspace member and still exits 0, so
+# an empty closure has to stop the run here rather than reach cargo.
+if ($crates.Count -eq 0) { throw "Get-CrateOrder.ps1 returned no crates" }
+
 $packageArgs = @()
 foreach ($crate in $crates)
 {
@@ -45,7 +49,9 @@ Write-Host "packaging $($crates.Count) crates"
 # One cargo call for the whole closure: cargo resolves the crates against each
 # other inside a temporary overlay, which is the only way to package a crate
 # whose path dependencies are not on a registry yet.
-cargo package --manifest-path $ManifestPath @packageArgs
+$cargoArgs = @('package', '--manifest-path', $ManifestPath) + $packageArgs
+Write-Host "cargo $($cargoArgs -join ' ')"
+cargo @cargoArgs
 if ($LASTEXITCODE -ne 0) { throw "cargo package failed with exit $LASTEXITCODE" }
 
 $metadata = cargo metadata --format-version 1 --no-deps --manifest-path $ManifestPath | ConvertFrom-Json
