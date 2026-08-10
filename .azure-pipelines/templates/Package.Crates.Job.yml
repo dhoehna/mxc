@@ -6,8 +6,9 @@
 # closure builds natively there.  Only the Windows leg publishes the artifact;
 # the other two are verification.
 #
-# Get-CrateOrder.ps1 derives the crate list from the workspace at run time, so
-# adding a crate needs no edit here.
+# The steps hold no logic: Invoke-CratePackage.ps1 does the packaging and
+# derives the crate list from the workspace, so adding a crate needs no edit
+# here, and the same command reproduces a leg locally.
 
 parameters:
   # Official builds resolve through the authenticated Mxc-Azure-Feed; unofficial
@@ -77,36 +78,20 @@ jobs:
         - ${{ else }}:
           - template: Cargo.Setup.Public.yml@self
 
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
-            $crates = & .azure-pipelines/scripts/Get-CrateOrder.ps1
-            $packageArgs = @()
-            foreach ($crate in $crates) { $packageArgs += '-p'; $packageArgs += $crate }
-            Write-Host "packaging $($crates.Count) crates"
-            # One cargo call for the whole closure: cargo resolves the crates
-            # against each other inside a temporary overlay, which is the only
-            # way to package a crate whose path dependencies are not on a
-            # registry yet.
-            cargo package --manifest-path src/Cargo.toml --registry $(cargoRegistry) @packageArgs
-            if ($LASTEXITCODE -ne 0) { throw "cargo package failed with exit $LASTEXITCODE" }
+        - task: PowerShell@2
           displayName: Package crate closure
-          workingDirectory: $(Build.SourcesDirectory)
-
-        # Only the Windows leg publishes the artifact.  A .crate is the same
-        # bytes whichever agent produced it, so one copy is all the publish
-        # stage needs; the Linux and macOS legs run to prove the closure
-        # builds natively there.
-        - ${{ if eq(item.os, 'windows') }}:
-          - pwsh: |
-              $ErrorActionPreference = 'Stop'
-              $packageDir = Join-Path (cargo metadata --format-version 1 --no-deps --manifest-path src/Cargo.toml | ConvertFrom-Json).target_directory 'package'
-              New-Item -ItemType Directory -Force -Path '$(outDir)' | Out-Null
-              $found = @(Get-ChildItem -Path $packageDir -Filter '*.crate' -File)
-              Copy-Item $found.FullName -Destination '$(outDir)'
-              Write-Host "collected $($found.Count) crates"
-            displayName: Collect crates into the artifact
+          inputs:
+            targetType: filePath
+            filePath: $(Build.SourcesDirectory)/.azure-pipelines/scripts/Invoke-CratePackage.ps1
+            arguments: -OutDir '$(outDir)' -Registry '$(cargoRegistry)'
+            pwsh: true
             workingDirectory: $(Build.SourcesDirectory)
 
+        # Every leg packages, because that is what proves the closure builds
+        # natively on that OS.  A .crate is the same bytes whichever agent
+        # produced it, so one leg is enough to feed the publish stage, and
+        # Windows is the one that uploads it.
+        - ${{ if eq(item.os, 'windows') }}:
           - task: 1ES.PublishPipelineArtifact@1
             displayName: Publish crate package artifact
             inputs:
