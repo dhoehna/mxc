@@ -21,7 +21,7 @@ hyperlight_common = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 appcontainer_common = { workspace = true }
-nanvix_binaries = { path = "../../backends/nanvix/binaries", version = "0.7.0", optional = true }
+nanvix_binaries = { path = "../../backends/nanvix/binaries", optional = true }
 wslc_common = { workspace = true, optional = true }
 # Shared PLM dep: `wpr_command` (safe wpr.exe resolver used for
 # ctrl-c cleanup), `CTRL_HANDLER_DRAIN_TIMEOUT`, `wait_until_cleared`,
@@ -29,14 +29,14 @@ wslc_common = { workspace = true, optional = true }
 # two crates can't drift. The `--wxc-singleton-held-by-parent` handoff
 # is a CLI arg on `plm.exe`, not an env var, because ShellExecuteExW
 # with `runas` drops the caller's env block on the way through UAC.
-plm = { path = "../../host/plm", version = "0.1.0" }
+plm = { path = "../../host/plm" }
 tempfile.workspace = true
 
 [build-dependencies]
 mxc_build_common.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
-nanvix_build_common = { path = "../../backends/nanvix/build_common", version = "0.7.0" }
+nanvix_build_common = { path = "../../backends/nanvix/build_common" }
 
 [features]
 default = []
