@@ -150,6 +150,23 @@ containment tier selected at runtime:
   runs sharing the same `containerId` can revoke each other's ACEs — use distinct
   `containerId` values for parallel runs.
 
+#### Path grants and root directories for Windows BaseContainer
+
+For Windows BaseContainer, a path grant in `readwritePaths` applies to that directory
+and its descendants with the exception of root directories. Granting access to a
+**volume root** (e.g. `C:\`) does **not** cascade to its child folders to prevent over-provisioning. 
+
+For example, `"readwritePaths": ["C:\\"]` does **not** grant access to files
+under `C:\data`.
+
+#### Upward directory traversal for Windows BaseContainer
+
+Many tools search **upward** from the working directory toward the volume root,
+looking for a marker file that defines their project. With Windows BaseContainer, when such a tool reaches a parent directory that is not in the allowlist, `ACCESS_DENIED` will be returned. 
+
+When resolving this error, grant only the specific directories the tool must reach and keep that set as small as possible. 
+Avoid resolving this error by granting broad profile roots. Each 'readwritePaths' grant also exposes that directory's descendants and granting broad profile roots may result in over-permissioning.
+
 ### UI Policy
 
 The `ui` section is the cross-platform UI-restriction policy. Every field is
