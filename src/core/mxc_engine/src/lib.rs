@@ -42,13 +42,15 @@ mod state_aware;
 mod state_aware_telemetry;
 
 pub use error::{Error, ErrorCode};
+#[cfg(all(target_os = "windows", feature = "isolation_session"))]
+pub use platform::isolation_session_available;
 pub use platform::{platform_support, PlatformSupport};
 pub use policy::{
     available_tools_policy, build_request, build_request_with_containment, temporary_files_policy,
     user_profile_policy, Containment, FilesystemPolicyResult, SandboxPolicy, SandboxRequest,
     WslcSection,
 };
-pub use probe::{available_backends, AvailableBackend};
+pub use probe::{available_backends, AvailableBackend, BackendCapability};
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub use run::{resolve_runner, run, ResolvedRunner};
 pub use state_aware::{exec_state_aware_json, run_state_aware, run_state_aware_json};

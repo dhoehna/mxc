@@ -82,9 +82,9 @@ enum RollbackStep {
 /// that outlives the process -- which argues for removing the firewall while
 /// the name is still unambiguous, before the container is gone.
 ///
-/// A process that never created the chain must not remove one: chain names
-/// derive from the container name and truncate to 20 characters, so the name
-/// may by now answer for a different, live container.
+/// A process that never created the chain must not remove one: the chain name
+/// depends only on the container name, so the name may by now answer for a
+/// different, live container.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn rollback_plan(rollback: SignalRollback, owns_firewall: bool) -> Vec<RollbackStep> {
     let mut plan = Vec::new();
@@ -238,11 +238,10 @@ pub(crate) fn set_active_created(created: CreatedResources) {
 /// would be the bug rather than the fix.
 ///
 /// Also the mirror of [`set_active_created`] after a successful teardown.
-/// Chain names are derived from the container name and truncate to 20
-/// characters, so they can collide; an ownership record left published after a
-/// successful teardown would let a later signal run cleanup against a name that
-/// by then may answer for a different, live container — stripping its firewall
-/// while it runs.
+/// Chain names depend only on the container name, so an ownership record left
+/// published after a successful teardown would let a later signal run cleanup
+/// against a name that by then may answer for a different, live container —
+/// stripping its firewall while it runs.
 pub fn clear_active() {
     *lock_slot() = ActiveSandbox::default();
 }
@@ -432,8 +431,8 @@ mod tests {
             "a provisioned container must survive a signal"
         );
 
-        // A process that created no chain must remove none: names truncate to
-        // 20 characters and can collide, so the chain may by now belong to a
+        // A process that created no chain must remove none: the name depends
+        // only on the container name, so the chain may by now belong to a
         // different live container. The container this process was starting is
         // still stopped, because that start is what is being rolled back.
         assert_eq!(
@@ -501,8 +500,8 @@ mod tests {
         assert_eq!(lock_slot().created, v4_only);
 
         // A successful teardown gives the claim back. Without this the record
-        // outlives the chain it describes, and since chain names truncate to 20
-        // characters and can collide, a signal arriving afterwards would run
+        // outlives the chain it describes, and since the chain name depends
+        // only on the container name, a signal arriving afterwards would run
         // cleanup against a name that may by then answer for a different, live
         // container.
         set_active_network_only("torn-down-box");
@@ -597,8 +596,8 @@ mod tests {
         );
 
         // A new container must not inherit the previous one's ownership record.
-        // Chain names truncate, so acting on a stale record can tear down a
-        // different container's chain.
+        // The chain name depends only on the container name, so acting on a
+        // stale record can tear down a chain that is still in use.
         set_active("ctr-b");
         assert_eq!(
             active_snapshot(),
