@@ -9,7 +9,6 @@ import {
   ExecConfigFor,
   IsolationSessionProvisionConfig,
   IsolationSessionStartConfig,
-  IsolationSessionUserConfig,
   LxcNetworkConfig,
   ProvisionMetadataFor,
   ProvisionResult,
