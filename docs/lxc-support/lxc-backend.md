@@ -109,7 +109,9 @@ Filesystem policies are enforced via bind mounts in the container configuration:
 
 ## Network Policy
 
-Network policies are enforced with parallel `iptables` and `ip6tables` chains scoped to the container's virtual ethernet (veth) interface:
+Network policy has two independent halves: outbound (egress) filtering on the host, described first, and inbound (ingress) filtering inside the container, described under [Inbound (ingress) policy](#inbound-ingress-policy).
+
+Outbound policies are enforced with parallel `iptables` and `ip6tables` chains scoped to the container's virtual ethernet (veth) interface:
 
 | Policy | Implementation |
 |--------|---------------|
@@ -132,7 +134,24 @@ Host IPv6 activity is read from `/proc/net/if_inet6`: a non-loopback interface w
 
 The chains are hooked into `FORWARD` for container egress by matching the host-side veth as the input interface. If MXC cannot discover the container veth, it skips the `FORWARD` hook with a warning rather than applying host-wide rules.
 
-Firewall state is torn down automatically with best-effort removal of the `FORWARD` hooks and both per-container chains; there is no network-policy opt-out field. Setup failures after partial creation are rolled back before returning an error, so retries do not trip over leftover chains.
+Egress firewall state is torn down automatically with best-effort removal of the `FORWARD` hooks and both per-container chains; there is no egress network-policy opt-out field, and `preservePolicy` does not currently keep the egress chains alive. Setup failures after partial creation are rolled back before returning an error, so retries do not trip over leftover chains.
+
+### Inbound (ingress) policy
+
+Inbound filtering is a separate chain from the egress chains above, and it lives **inside the container's own network namespace** rather than on the host. Every command is issued through `nsenter -t <init-pid> -n`, so the container's init PID is mandatory. When a firewall enforcement mode is requested and MXC cannot discover that PID, the run is aborted rather than started with inbound enforcement silently disabled. This is LXC-specific: Bubblewrap deliberately shares the host network namespace and never installs an inbound chain.
+
+| Policy | Implementation |
+|--------|---------------|
+| `allowLocalNetwork: false` (default) | Container `INPUT` chain drops new inbound connections |
+| `allowLocalNetwork: true` | **Not yet implemented.** Firewall setup fails with an explicit not-yet-implemented error rather than falling back to an unenforced accept |
+
+The chain uses an `MXCI-` prefix so it can never collide with, or be torn down for, the `MXC-` egress chain of the same container. Loopback, established and related traffic, and — for IPv6 — the ICMPv6 types required for Neighbor Discovery and Path MTU Discovery are permitted ahead of the terminal drop, so a default-deny container can still complete connections it initiated itself.
+
+IPv6 is classified with the same three-way probe as egress, but against the *container* namespace rather than the host: a host that reports IPv6 disabled says nothing about the namespace actually being filtered. `UnusableButIpv6Active` inside that namespace fails the run closed rather than enforcing an IPv4-only inbound policy that would leave inbound IPv6 open.
+
+Inbound rules are installed after the container starts and after egress setup completes, so inbound is unfiltered for a short interval at container startup. The workload script is executed only after installation finishes, so no sandboxed code runs during that interval and the exposure is to external traffic only. Narrowing this interval is tracked separately.
+
+Unlike egress, the inbound chain honors the lifecycle's `preservePolicy`: when it is set *and* installation succeeded, the chain is deliberately left in place after the run for inspection. A partially installed chain from a failed run is always torn down regardless of the setting.
 
 ## Usage
 

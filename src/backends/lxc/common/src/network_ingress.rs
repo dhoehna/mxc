@@ -168,6 +168,11 @@ pub struct IngressManager {
     v6_chain_created: bool,
     v4_hooked: bool,
     v6_hooked: bool,
+    /// Whether the caller asked for a successfully installed policy to outlive
+    /// this run (the lifecycle's `preservePolicy`). Consulted by [`Drop`] and
+    /// not only by the runner's explicit teardown call, because `Drop` fires on
+    /// every path out of the run and would otherwise silently undo the request.
+    preserve_policy: bool,
 }
 
 /// The outcome of a single `iptables`/`ip6tables` invocation, structured so the
@@ -368,7 +373,29 @@ impl IngressManager {
             v6_chain_created: false,
             v4_hooked: false,
             v6_hooked: false,
+            preserve_policy: false,
         }
+    }
+
+    /// Ask for the installed chain to outlive this manager, honoring the
+    /// lifecycle's `preservePolicy`.
+    ///
+    /// Call this only after [`Self::apply_firewall_rules`] has reported success.
+    /// The flag suppresses [`Drop`]'s teardown, so setting it beforehand would
+    /// strand whatever partial chain a failed install left behind — enforcement
+    /// the caller never asked for and did not know to look for.
+    pub fn set_preserve_policy(&mut self, preserve: bool) {
+        self.preserve_policy = preserve;
+    }
+
+    /// Whether [`Drop`] should tear the chain down.
+    ///
+    /// Extracted as a pure predicate because `Drop` itself runs against the real
+    /// `nsenter` path and so cannot be exercised in a unit test. Keeping the
+    /// decision here means the `preservePolicy` gate stays tested even though
+    /// the teardown it guards does not.
+    fn should_cleanup_on_drop(&self) -> bool {
+        self.rules_applied() && !self.preserve_policy
     }
 
     /// The iptables chain name this manager owns.
@@ -541,12 +568,18 @@ impl IngressManager {
     /// create the chain fresh, append the body rules, then hook into INPUT last
     /// — marking ownership immediately after each specific command succeeds.
     ///
-    /// The hook is emitted only after the body is fully in place, so a hooked
-    /// chain is never momentarily empty (there is no fail-open window). Because
-    /// the reset removes every prior reference first (see [`Self::reset_family`]),
-    /// a single `hooked` flag per family is sufficient — the duplicate-hook case
-    /// cannot arise. Ownership is recorded per resource, so a failure partway
-    /// through tears down exactly what was installed.
+    /// The hook is emitted only after the body is fully in place, so a chain
+    /// this call hooks is never momentarily empty. That covers the fresh-install
+    /// case only. When a *leftover* hooked chain from a crashed run exists, step
+    /// 1's reset unhooks it before the replacement is built, so whatever that
+    /// leftover was still enforcing lapses until the new hook lands at step 4.
+    /// Closing that gap needs an atomic swap this call cannot express, and the
+    /// gap is contained inside the larger window between container start and
+    /// ingress install — both are tracked in the follow-up rather than papered
+    /// over here. Because the reset removes every prior reference first (see
+    /// [`Self::reset_family`]), a single `hooked` flag per family is sufficient —
+    /// the duplicate-hook case cannot arise. Ownership is recorded per resource,
+    /// so a failure partway through tears down exactly what was installed.
     fn install_family(
         &mut self,
         family: IpFamily,
@@ -1048,7 +1081,11 @@ impl IngressManager {
 
 impl Drop for IngressManager {
     fn drop(&mut self) {
-        if self.rules_applied() {
+        // `preserve_policy` is checked here and not only at the runner's
+        // explicit teardown call. `Drop` runs on every path out of the run, so
+        // gating the explicit call alone would still remove the rules the
+        // caller asked to keep.
+        if self.should_cleanup_on_drop() {
             let mut logger = wxc_common::logger::Logger::new(wxc_common::logger::Mode::Buffer);
             let _ = self.remove_firewall_rules(&mut logger);
         }
@@ -1660,6 +1697,53 @@ mod tests {
             assert!(idx(StepKind::Unhook) < idx(StepKind::Flush));
             assert!(idx(StepKind::Flush) < idx(StepKind::Delete));
         }
+    }
+
+    /// `preservePolicy` must survive `Drop`, not just the runner's explicit
+    /// teardown call.
+    ///
+    /// `LxcScriptRunner` gates its explicit `remove_firewall_rules` call on
+    /// `cleanup_policy` (`!preserve_policy`), but `Drop` fires on every path out
+    /// of the run. An unconditional `Drop` therefore removes exactly the rules
+    /// the caller asked to keep, and the config field silently does nothing.
+    /// Assert the gate across all four states rather than the teardown itself,
+    /// which would reach the real `nsenter`.
+    #[test]
+    fn drop_honors_preserve_policy() {
+        let mut mgr = IngressManager::new("preserve-container", 4242);
+
+        // Nothing installed: never any cleanup to do, either way.
+        assert!(
+            !mgr.should_cleanup_on_drop(),
+            "a manager that installed nothing must not attempt teardown"
+        );
+        mgr.set_preserve_policy(true);
+        assert!(!mgr.should_cleanup_on_drop());
+
+        // A real install, preserved: Drop must leave the chain in place.
+        mgr.v4_chain_created = true;
+        mgr.v4_hooked = true;
+        assert!(
+            mgr.rules_applied(),
+            "precondition: the manager owns installed state"
+        );
+        assert!(
+            !mgr.should_cleanup_on_drop(),
+            "preservePolicy was requested, so Drop must not remove the chain"
+        );
+
+        // The same install without preservation is still cleaned up, so the
+        // flag cannot mask an ordinary leak.
+        mgr.set_preserve_policy(false);
+        assert!(
+            mgr.should_cleanup_on_drop(),
+            "without preservePolicy an installed chain must still be torn down"
+        );
+
+        // Leave nothing owned, so dropping this test's manager does not reach
+        // the real nsenter path.
+        mgr.v4_chain_created = false;
+        mgr.v4_hooked = false;
     }
 
     /// Item 20: `force_cleanup` must actually run — over the injectable runner —

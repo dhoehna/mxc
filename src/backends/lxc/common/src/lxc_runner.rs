@@ -283,6 +283,12 @@ impl LxcScriptRunner {
                         ));
                     }
                 }
+                // Every non-success arm above returns, so reaching this point
+                // means the inbound chain is fully installed. Only now may the
+                // policy be marked for preservation: the flag also suppresses
+                // `Drop`, and a partial chain from a failed install must still
+                // be torn down.
+                mgr.set_preserve_policy(!self.cleanup_policy);
                 ingress_manager = Some(mgr);
             }
             None if use_firewall => {
