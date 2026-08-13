@@ -307,6 +307,33 @@ trait CommandRunner {
     fn run(&mut self, argv: &[String]) -> Result<(), RunError>;
 }
 
+/// Build the `iptables`/`ip6tables` invocation with the message locale pinned.
+///
+/// [`StepKind::stderr_means_absent`] decides whether a non-zero exit means the
+/// target was already gone by matching iptables' own diagnostic text, and that
+/// text is localized. A subprocess inherits the host environment, so on a host
+/// running a non-English locale the benign "no chain by that name" message
+/// arrives translated, fails every match, and turns an idempotent teardown step
+/// into a fatal error — which aborts each fresh install, because install resets
+/// any leftover state before creating the chain. Exit codes cannot substitute:
+/// iptables returns 1 both for "no such chain" and for real failures.
+///
+/// Only these two keys are set, so the child keeps the rest of the environment
+/// it needs (`PATH` above all). `LANG` is pinned alongside `LC_ALL` because it
+/// is the fallback consulted when `LC_ALL` is absent.
+///
+/// Split out from [`NsenterRunner::run`] so the guarantee is unit testable:
+/// `run` spawns a real process and cannot execute in a test, but the [`Command`]
+/// it would spawn can be inspected.
+fn nsenter_command(argv: &[String]) -> Command {
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    // `nsenter` execs the target binary in this same environment, so pinning
+    // here reaches `iptables` itself.
+    command.env("LC_ALL", "C").env("LANG", "C");
+    command
+}
+
 /// The production [`CommandRunner`]: spawns the argv and distinguishes a spawn
 /// failure (state unknown, always a real error) from a non-zero exit (whose
 /// stderr may mean "already absent").
@@ -314,7 +341,7 @@ struct NsenterRunner;
 
 impl CommandRunner for NsenterRunner {
     fn run(&mut self, argv: &[String]) -> Result<(), RunError> {
-        let output = match Command::new(&argv[0]).args(&argv[1..]).output() {
+        let output = match nsenter_command(argv).output() {
             Ok(output) => output,
             Err(e) => {
                 return Err(RunError::Spawn(format!(
@@ -1192,6 +1219,120 @@ mod tests {
         RunError::Exit {
             stderr: "iptables: No chain/target/match by that name.".to_string(),
             msg: "chain: already absent".to_string(),
+        }
+    }
+
+    /// The C-locale messages iptables emits when the target is already gone,
+    /// paired with the step whose non-zero exit they are allowed to excuse.
+    /// These are the exact strings [`StepKind::stderr_means_absent`] is written
+    /// against, so they are the contract the locale pin exists to guarantee.
+    const C_LOCALE_ABSENT: &[(StepKind, &str)] = &[
+        (
+            StepKind::Unhook,
+            "iptables: Bad rule (does a matching rule exist in that chain?).",
+        ),
+        (
+            StepKind::Unhook,
+            "iptables: No chain/target/match by that name.",
+        ),
+        (
+            StepKind::Flush,
+            "iptables: No chain/target/match by that name.",
+        ),
+        (
+            StepKind::Delete,
+            "iptables: No chain/target/match by that name.",
+        ),
+    ];
+
+    #[test]
+    fn subprocess_env_pins_iptables_messages_to_the_c_locale() {
+        let argv = vec![
+            "nsenter".to_string(),
+            "-t".to_string(),
+            "42".to_string(),
+            "-n".to_string(),
+            "iptables".to_string(),
+        ];
+
+        let command = nsenter_command(&argv);
+        let env: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        assert!(
+            env.contains(&("LC_ALL".to_string(), Some("C".to_string()))),
+            "LC_ALL must be pinned to C so iptables' diagnostics are not translated; got {env:?}"
+        );
+        assert!(
+            env.contains(&("LANG".to_string(), Some("C".to_string()))),
+            "LANG must be pinned to C as the fallback when LC_ALL is unset; got {env:?}"
+        );
+    }
+
+    #[test]
+    fn pinning_the_locale_does_not_disturb_the_command_being_run() {
+        let argv = vec![
+            "nsenter".to_string(),
+            "-t".to_string(),
+            "42".to_string(),
+            "-n".to_string(),
+            "ip6tables".to_string(),
+            "-F".to_string(),
+        ];
+
+        let command = nsenter_command(&argv);
+
+        assert_eq!(command.get_program(), "nsenter");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, argv[1..].to_vec());
+    }
+
+    #[test]
+    fn c_locale_absent_messages_are_recognized_by_their_step() {
+        for (kind, stderr) in C_LOCALE_ABSENT {
+            assert!(
+                kind.stderr_means_absent(stderr),
+                "{kind:?} must read {stderr:?} as already-absent"
+            );
+        }
+    }
+
+    /// The regression the locale pin exists to prevent.
+    ///
+    /// These are the same two conditions as [`C_LOCALE_ABSENT`], as a localized
+    /// `iptables` emits them. Without the pin the subprocess inherits the host
+    /// locale, these are what teardown would actually receive, and none of them
+    /// matches — so a container that is already clean would report a fatal reset
+    /// error and abort every fresh install on that host.
+    #[test]
+    fn localized_absent_messages_are_not_recognized_without_the_locale_pin() {
+        // German and French renderings of "No chain/target/match by that name"
+        // and "Bad rule (does a matching rule exist in that chain?)".
+        let localized = [
+            "iptables: Kein Chain/Target/Match mit diesem Namen.",
+            "iptables: Pas de chaîne/cible/correspondance de ce nom.",
+            "iptables: Règle incorrecte (une règle correspondante existe-t-elle dans cette chaîne ?).",
+        ];
+
+        for kind in [StepKind::Unhook, StepKind::Flush, StepKind::Delete] {
+            for stderr in localized {
+                assert!(
+                    !kind.stderr_means_absent(stderr),
+                    "{kind:?} matched localized text {stderr:?}; the locale pin in \
+                     `nsenter_command` is the only thing keeping this classification sound, \
+                     so it must not be removed"
+                );
+            }
         }
     }
 
