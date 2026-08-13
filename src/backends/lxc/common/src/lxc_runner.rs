@@ -283,11 +283,13 @@ impl LxcScriptRunner {
                         ));
                     }
                 }
-                // Every non-success arm above returns, so reaching this point
-                // means the inbound chain is fully installed. Only now may the
-                // policy be marked for preservation: the flag also suppresses
-                // `Drop`, and a partial chain from a failed install must still
-                // be torn down.
+                // Every non-success arm above returns, so the apply call
+                // succeeded. Only now may the policy be marked for
+                // preservation: the flag also suppresses `Drop`, and a partial
+                // chain from a failed install must still be torn down. Success
+                // does not imply a chain exists — a non-firewall enforcement
+                // mode succeeds without installing one — but in that case no
+                // ownership flag is set and `Drop` has nothing to do either way.
                 mgr.set_preserve_policy(!self.cleanup_policy);
                 ingress_manager = Some(mgr);
             }
@@ -297,10 +299,10 @@ impl LxcScriptRunner {
                 // ingress-without-a-netns case: enforcing inbound requires
                 // entering the container's namespace, so running anyway would
                 // silently disable the requested inbound deny (a fail-open).
-                // Abort instead. This is LXC-specific: Bubblewrap deliberately
-                // shares the host net namespace and never constructs an
-                // IngressManager, reaching its own firewall path through its own
-                // runner, so it is unaffected by this guard.
+                // Abort instead. This guard is specific to the LXC ingress
+                // path, which addresses its namespace by init PID; other
+                // backends reach their firewall handling through their own
+                // runners and never construct an `IngressManager`.
                 if self.destroy_on_exit || container_created {
                     let _ = container.destroy();
                 }
