@@ -119,7 +119,7 @@ pub fn exec_state_aware(
             let handle =
                 wxc_common::state_aware_dispatch::dispatch_state_aware_exec(&mut runner, parsed)?;
             Ok(Box::new(
-                wxc_common::exec_stream::ExecSandboxProcess::from_exec_handle(handle),
+                wxc_common::exec_stream::ExecSandboxProcess::from_exec_handle(handle)?,
             ))
         }
         #[cfg(all(target_os = "windows", feature = "wslc"))]
@@ -128,7 +128,7 @@ pub fn exec_state_aware(
             let handle =
                 wxc_common::state_aware_dispatch::dispatch_state_aware_exec(&mut runner, parsed)?;
             Ok(Box::new(
-                wxc_common::exec_stream::ExecSandboxProcess::from_exec_handle(handle),
+                wxc_common::exec_stream::ExecSandboxProcess::from_exec_handle(handle)?,
             ))
         }
         // Feature-off build: keep the documented `backend_unavailable` contract

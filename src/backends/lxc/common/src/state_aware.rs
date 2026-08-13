@@ -19,7 +19,7 @@ use wxc_common::models::{
 };
 use wxc_common::mxc_error::MxcError;
 use wxc_common::state_aware_backend::{
-    null_pipe_handle, DeprovisionResult, ExecHandle, ProvisionResult, StartResult,
+    null_pipe_handle, DeprovisionResult, ExecConsumer, ExecHandle, ProvisionResult, StartResult,
     StatefulSandboxBackend, StopResult,
 };
 
@@ -570,6 +570,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         sandbox_id: &str,
         request: &ExecutionRequest,
         _config: Option<()>,
+        _consumer: ExecConsumer,
     ) -> Result<ExecHandle, MxcError> {
         let container_name = extract_container_name(sandbox_id)?;
         reject_start_policy_on_other_phase("exec", &request.policy)?;

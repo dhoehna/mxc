@@ -1490,6 +1490,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mxc_config_contract"
+version = "0.7.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "mxc_darwin"
 version = "0.7.0"
 dependencies = [
@@ -3121,6 +3130,7 @@ name = "wslc_common"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "base64",
  "libloading",
  "serde",
  "serde_json",
@@ -3160,6 +3170,7 @@ dependencies = [
  "base64",
  "getrandom 0.2.17",
  "libc",
+ "mxc_config_contract",
  "mxc_telemetry",
  "nanvix_common",
  "schemars",
