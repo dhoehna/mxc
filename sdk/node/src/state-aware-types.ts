@@ -132,9 +132,10 @@ export interface LxcProvisionConfig {
  * (`src/backends/lxc/common/src/state_aware.rs:166`) exactly. A restriction is
  * a non-empty `allowedHosts`, a non-empty `blockedHosts`, or an explicit
  * `defaultPolicy: 'block'` — and nothing else. An explicit
- * `defaultPolicy: 'allow'` and an omitted `defaultPolicy` are *not*
- * restrictions, so they must keep working without an `enforcementMode`; the
- * plain start in `run_lxc_state_aware_test.sh` is exactly that case.
+ * `defaultPolicy: 'allow'`, an omitted `defaultPolicy`, and an *empty*
+ * `allowedHosts` or `blockedHosts` are *not* restrictions, so they must keep
+ * working without an `enforcementMode`; the plain start in
+ * `run_lxc_state_aware_test.sh` is exactly that case.
  */
 type LxcFirewallEnforcementMode = 'firewall' | 'both';
 
@@ -160,8 +161,14 @@ export interface LxcUnrestrictedNetworkConfig {
   enforcementMode?: LxcFirewallEnforcementMode;
   /** Only the non-restrictive default is expressible without a firewall mode. */
   defaultPolicy?: Extract<NetworkConfig['defaultPolicy'], 'allow'>;
-  allowedHosts?: never;
-  blockedHosts?: never;
+  /**
+   * Only an empty list is expressible without a firewall mode. Rust counts a
+   * list as a restriction when it is non-empty, so `[]` is no restriction and
+   * `never` here rejected a value the backend accepts: `{ allowedHosts: [] }`
+   * matched neither arm.
+   */
+  allowedHosts?: [];
+  blockedHosts?: [];
 }
 
 export type LxcNetworkConfig =

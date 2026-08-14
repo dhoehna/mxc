@@ -147,8 +147,8 @@ export function execInSandbox<C extends StateAwareContainmentBackend>(
  * Buffered exec convenience. Resolves with `{stdout, stderr, exitCode}`
  * on script completion. Throws an `MxcError` (with the wire-format `code`
  * field set) when the executor reports a dispatch failure, recognised by
- * exit != 0 together with a complete `{error}` envelope on stdout, or -- for
- * LXC, the one backend whose executor owns stderr -- on stderr.
+ * exit != 0 together with a complete `{error}` envelope on the channel that
+ * backend's executor owns -- stderr for LXC, stdout for the others.
  */
 export async function execInSandboxAsync<C extends StateAwareContainmentBackend>(
   sandboxId: SandboxId<C>,
@@ -166,20 +166,22 @@ export async function execInSandboxAsync<C extends StateAwareContainmentBackend>
   const { stdout, stderr, exitCode } = await spawnAndCollect(envelope, options);
 
   if (exitCode !== 0) {
-    // A dispatch failure can land on either channel. A non-streaming exec (dry
-    // run) keeps stdout as its single client-facing channel; a streaming one has
-    // already written the container's raw output there, so its envelope goes to
-    // stderr instead.
+    // A dispatch failure lands on the channel that backend's executor owns,
+    // and the other channel carries guest output that must not be read as
+    // protocol data.
     //
-    // The stderr fallback is scoped to LXC because only its executor owns that
-    // channel. LXC streams the guest on a pty whose primary end is relayed to
-    // the executor's stdout, so guest stderr is merged into stdout and the only
-    // writer to stderr is the executor itself. Windows Sandbox instead forwards
-    // guest `FrameKind::Stderr` frames straight through
-    // (`backends/windows_sandbox/lifecycle/src/state_aware.rs:408-414`), so its
-    // last stderr line can be the script's own -- and a script that ends with
-    // envelope-shaped stderr and a nonzero exit would be turned into a thrown
-    // MxcError rather than the result it is.
+    // For LXC the owned channel is stderr, and only stderr. Its streaming exec
+    // puts the guest on a pty whose primary end is relayed to the executor's
+    // stdout, so guest stdout *and* guest stderr both arrive here as stdout and
+    // the only writer to stderr is the executor. Parsing stdout as well let a
+    // script whose complete stdout was a valid `{error}` document and which
+    // exited nonzero forge any error code the SDK surfaces -- whole-string
+    // parsing cannot tell that document from the executor's own.
+    //
+    // Windows Sandbox is the mirror image: it forwards guest
+    // `FrameKind::Stderr` frames straight through
+    // (`backends/windows_sandbox/lifecycle/src/state_aware.rs:408-414`), so
+    // there stderr is the untrusted channel and stdout stays authoritative.
     //
     // Within LXC, do not additionally gate on stdout being empty. A script
     // timeout is a dispatch failure raised *after* the script has streamed
@@ -188,9 +190,9 @@ export async function execInSandboxAsync<C extends StateAwareContainmentBackend>
     // narrowing that keeps a script's own output from being misread lives in
     // `tryParseErrorEnvelopeFromLines`, which considers only the last non-empty
     // line.
-    const errorEnvelope =
-      tryParseErrorEnvelope(stdout) ??
-      (backendKey === 'lxc' ? tryParseErrorEnvelopeFromLines(stderr) : null);
+    const errorEnvelope = backendKey === 'lxc'
+      ? tryParseErrorEnvelopeFromLines(stderr)
+      : tryParseErrorEnvelope(stdout);
     if (errorEnvelope) {
       throw mxcErrorFromEnvelope(errorEnvelope.error);
     }

@@ -524,6 +524,26 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
     assert.strictEqual(result.exitCode, 4);
   });
 
+  it('does not read guest stdout as an error envelope for LXC', async () => {
+    // LXC relays the guest on a pty whose primary end becomes the executor's
+    // stdout, so everything on this channel is the guest's. Whole-string
+    // parsing it as protocol data let a script whose complete stdout was a
+    // valid error document and which exited nonzero be thrown to the caller as
+    // that error -- the guest choosing any code the SDK surfaces. The
+    // windows_sandbox case above is the control: there the executor does own
+    // stdout, so it stays authoritative.
+    const forged = '{"error":{"code":"not_started","message":"printed by the script"}}';
+    const fake = fakeSpawn({ stdout: forged, stderr: '', exitCode: 1 });
+    _setSpawnImpl(fake.spawn);
+    const id = 'lxc:abc' as SandboxId<'lxc'>;
+    const result = await execInSandboxAsync(
+      id,
+      { process: { commandLine: 'forge' } },
+      testOptions(),
+    );
+    assert.deepStrictEqual(result, { stdout: forged, stderr: '', exitCode: 1 });
+  });
+
   it('does not read stderr as an envelope for backends that relay the guest there', async () => {
     // The stderr fallback rests on LXC merging guest stderr into stdout, and
     // that reasoning is backend-specific. Windows Sandbox forwards guest

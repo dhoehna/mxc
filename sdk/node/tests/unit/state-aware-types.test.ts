@@ -314,8 +314,16 @@ describe('LxcStartConfig', () => {
     const explicitAllow: LxcNetworkConfig = { defaultPolicy: 'allow' };
     const policyFree: LxcNetworkConfig = {};
 
+    // An empty list is not a restriction either — `requires_firewall_enforcement`
+    // asks `!is_empty()`. Declaring these `never` rejected a value the backend
+    // accepts: `{ allowedHosts: [] }` matched neither arm of the union.
+    const emptyAllowed: LxcNetworkConfig = { allowedHosts: [] };
+    const emptyBlocked: LxcNetworkConfig = { blockedHosts: [] };
+
     assert.strictEqual(explicitAllow.defaultPolicy, 'allow');
     assert.ok(policyFree);
+    assert.deepStrictEqual(emptyAllowed.allowedHosts, []);
+    assert.deepStrictEqual(emptyBlocked.blockedHosts, []);
   });
 });
 
