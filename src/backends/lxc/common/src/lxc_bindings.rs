@@ -599,12 +599,23 @@ impl LxcContainer {
     /// processes rewriting the same config cannot clobber each other's
     /// temporary, and it is removed on every failure path so a failed rewrite
     /// leaves no residue.
+    ///
+    /// A rename swaps in a *new* inode, so the target's mode and ownership are
+    /// whatever the temporary had rather than what the operator set. That would
+    /// silently relax a hardened `0600` root-owned config to a umask-derived
+    /// `0644` on the first start, and would hand the file to the executor's uid
+    /// when it runs as root. The original's metadata is therefore captured
+    /// before the write and restored onto the temporary before the rename. The
+    /// temporary is opened `0600` so its contents are never briefly readable by
+    /// anyone the final mode would exclude; when there is no original to mirror,
+    /// the platform default is left alone rather than a policy being invented.
     fn write_config_atomically(config_path: &str, contents: &str) -> std::io::Result<()> {
         use std::io::Write;
 
         let temp_path = format!("{}.mxc-tmp-{}", config_path, std::process::id());
+        let original = std::fs::metadata(config_path).ok();
         let write_temp = || -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&temp_path)?;
+            let mut file = Self::create_config_temp(&temp_path, original.is_some())?;
             file.write_all(contents.as_bytes())?;
             file.sync_all()
         };
@@ -612,11 +623,85 @@ impl LxcContainer {
             let _ = std::fs::remove_file(&temp_path);
             return Err(e);
         }
+        if let Some(ref meta) = original {
+            if let Err(e) = Self::mirror_config_metadata(&temp_path, meta) {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(e);
+            }
+        }
         if let Err(e) = std::fs::rename(&temp_path, config_path) {
             let _ = std::fs::remove_file(&temp_path);
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Open the rewrite temporary, restricted to the owner when there is an
+    /// existing config whose mode will be restored before the rename.
+    #[cfg(unix)]
+    fn create_config_temp(temp_path: &str, has_original: bool) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if !has_original {
+            return std::fs::File::create(temp_path);
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(temp_path)
+    }
+
+    #[cfg(not(unix))]
+    fn create_config_temp(temp_path: &str, _has_original: bool) -> std::io::Result<std::fs::File> {
+        std::fs::File::create(temp_path)
+    }
+
+    /// Put the replaced config's mode and ownership onto its replacement.
+    ///
+    /// Ownership is restored only when it actually differs, so an unprivileged
+    /// executor rewriting a config it already owns is not failed by a `chown`
+    /// it never needed permission to make.
+    #[cfg(unix)]
+    fn mirror_config_metadata(
+        temp_path: &str,
+        original: &std::fs::Metadata,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Masked to the permission bits: the mode read back from a `Metadata`
+        // also carries the file-type bits, which are not this call's to set.
+        std::fs::set_permissions(
+            temp_path,
+            std::fs::Permissions::from_mode(original.mode() & 0o7777),
+        )?;
+        let temp_meta = std::fs::metadata(temp_path)?;
+        if temp_meta.uid() != original.uid() || temp_meta.gid() != original.gid() {
+            std::os::unix::fs::chown(temp_path, Some(original.uid()), Some(original.gid()))
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "could not restore the config's owner {}:{} onto its replacement, so \
+                             the rewrite was abandoned rather than silently changing who owns it: \
+                             {e}",
+                            original.uid(),
+                            original.gid()
+                        ),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn mirror_config_metadata(
+        temp_path: &str,
+        original: &std::fs::Metadata,
+    ) -> std::io::Result<()> {
+        std::fs::set_permissions(temp_path, original.permissions())
     }
 
     /// Remove every configuration line for `key` from the container's config
@@ -1096,6 +1181,41 @@ mod tests {
         assert!(
             dir.join("config").is_dir(),
             "the failed write must not have replaced the target"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_atomic_config_rewrite_keeps_the_operator_s_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A rename swaps in a new inode, so without explicit restoration a
+        // hardened config silently relaxes to whatever the umask allows the
+        // first time a start rewrites it. An operator who set 0600 gets to keep
+        // it.
+        let dir = std::env::temp_dir().join(format!("mxc-atomic-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test temp dir");
+        let target = dir.join("config");
+        let path = target.to_string_lossy().to_string();
+
+        std::fs::write(&target, "lxc.mount.entry = old\n").expect("seed the original config");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("harden the original config");
+
+        LxcContainer::write_config_atomically(&path, "lxc.mount.entry = new\n")
+            .expect("rewrite must succeed");
+
+        let mode = std::fs::metadata(&target)
+            .expect("stat the rewritten config")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the rewrite must not widen the config's permissions"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

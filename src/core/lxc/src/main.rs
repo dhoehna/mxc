@@ -257,11 +257,14 @@ fn main() {
         (String::new(), false)
     };
 
-    let mut logger = Logger::new(if cli.debug {
-        Mode::Console
-    } else {
-        Mode::Buffer
-    });
+    // Always buffered until the request is parsed. `--debug` selects console
+    // logging, which writes diagnostics straight to stdout -- but a state-aware
+    // request needs stdout to carry nothing but its JSON envelope, and config
+    // parsing emits warnings (overlapping path lists, a mount path missing on
+    // the host) through this logger before the phase is even known. Promoting
+    // to console only on the one-shot branch keeps `{ debug: true }` from
+    // corrupting the state-aware channel.
+    let mut logger = Logger::new(Mode::Buffer);
 
     if let Some(ref log_path) = cli.log_file {
         if let Err(e) = logger.enable_file_sink(std::path::Path::new(log_path)) {
@@ -285,7 +288,16 @@ fn main() {
 
     // Load request
     let request = match load_mxc_request(&config_data, &mut logger, is_base64) {
-        Ok(MxcRequest::OneShot(req)) => req,
+        Ok(MxcRequest::OneShot(req)) => {
+            // One-shot owns stdout outright, so `--debug` streams there as it
+            // always has. Flush what was buffered while the phase was still
+            // unknown so the switch costs no output.
+            if cli.debug {
+                let buffered = logger.promote_to_console();
+                print!("{}", buffered);
+            }
+            req
+        }
         Ok(MxcRequest::StateAware(parsed)) => run_state_aware_main(
             parsed,
             cli.dry_run,

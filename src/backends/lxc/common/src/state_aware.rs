@@ -988,16 +988,46 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
                 }
             };
             if let Err(e) = container.start() {
-                // The firewall is already installed; tear it down so an aborted
-                // start does not leak iptables state. The veth never came up, so
-                // no interface-scoped discovery is needed — the FORWARD hooks are
-                // found by enumerating on the chain name.
+                // A failed `lxc-start` is not evidence that the container is
+                // down. `LIVE_STATES` counts STARTING and ABORTING as live for
+                // exactly this reason: a start can fail with the container
+                // already up or still coming up. Removing the egress chain on
+                // the assumption that it never started would leave a running
+                // container unfiltered, so establish that it is stopped first.
                 //
-                // Ownership-scoped, not authoritative: `apply_network_policy` may
-                // have installed nothing, and a chain present without this attempt
-                // creating it belongs to a concurrent start whose container is
-                // running behind it.
-                cleanup_network_owned(container_name, None, installed, &mut logger);
+                // Only a definitive "not running" is evidence that unfiltering
+                // is safe -- an unreadable probe is not, so it is treated as
+                // live.
+                if container.is_running().unwrap_or(true) {
+                    // Discover the veth while the container still has one, then
+                    // kill it. Kill, not stop, for the reason the failed-ingress
+                    // rollback below gives: a graceful stop waits up to 60 s,
+                    // and every second of it is a container whose start already
+                    // failed sitting there with a half-applied policy.
+                    let veth = NetworkIptablesManager::discover_veth_interface(container_name);
+                    if let Err(stop_err) = container.kill() {
+                        // The egress chain is the only part of the policy still
+                        // in force, so removing it now would turn a filtered
+                        // container into an unfiltered one. It stays -- the same
+                        // trade the ingress rollback and `stop` both make.
+                        signal_cleanup::clear_active();
+                        return Err(MxcError::backend_error(format!(
+                            "Failed to start container: {e}; it could not be stopped afterwards \
+                             ({stop_err}), so it may still be running and its egress rules were \
+                             left in place"
+                        )));
+                    }
+                    cleanup_network_owned(container_name, veth.as_deref(), installed, &mut logger);
+                } else {
+                    // Confirmed stopped, so there is no veth to discover and the
+                    // FORWARD hooks are found by enumerating on the chain name.
+                    //
+                    // Ownership-scoped, not authoritative: `apply_network_policy`
+                    // may have installed nothing, and a chain present without
+                    // this attempt creating it belongs to a concurrent start
+                    // whose container is running behind it.
+                    cleanup_network_owned(container_name, None, installed, &mut logger);
+                }
                 signal_cleanup::clear_active();
                 return Err(MxcError::backend_error(format!(
                     "Failed to start container: {e}"

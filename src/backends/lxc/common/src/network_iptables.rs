@@ -765,13 +765,21 @@ impl NetworkIptablesManager {
 
     /// Read `<tool> -S FORWARD`, distinguishing a missing tool from a ruleset
     /// that would not read.
+    ///
+    /// Only [`NotFound`](std::io::ErrorKind::NotFound) means the tool is absent.
+    /// A spawn can also fail because the executable is there but unusable --
+    /// `PermissionDenied`, an exhausted descriptor table, or a transient
+    /// resource shortage -- and those say nothing about what is installed.
+    /// Reading them as "absent" would report an empty FORWARD chain on a host
+    /// whose hooks are still in place, so they fail closed as `Unreadable`.
     fn probe_forward_chain(tool: &str) -> ForwardProbe {
         match Command::new(tool).args(["-S", "FORWARD"]).output() {
             Ok(o) if o.status.success() => {
                 ForwardProbe::Dump(String::from_utf8_lossy(&o.stdout).into_owned())
             }
             Ok(_) => ForwardProbe::Unreadable,
-            Err(_) => ForwardProbe::ToolAbsent,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ForwardProbe::ToolAbsent,
+            Err(_) => ForwardProbe::Unreadable,
         }
     }
 
@@ -786,7 +794,9 @@ impl NetworkIptablesManager {
     ///
     /// A host without the tool at all reports absent, which is the right answer
     /// for teardown: a chain that cannot be addressed cannot be removed, and
-    /// there is nothing to remove.
+    /// there is nothing to remove. A tool that exists but could not be run is a
+    /// different case entirely -- nothing was learned, so it is an error rather
+    /// than a clean bill of health.
     fn chain_exists(tool: &str, chain: &str) -> Result<bool, String> {
         match Command::new(tool).args(["-S", chain]).output() {
             Ok(o) if o.status.success() => Ok(true),
@@ -798,7 +808,11 @@ impl NetworkIptablesManager {
                     String::from_utf8_lossy(&o.stderr).trim()
                 )),
             },
-            Err(_) => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!(
+                "{tool} is installed but could not be run, so whether chain {chain} exists is \
+                 unknown: {e}"
+            )),
         }
     }
 
@@ -2017,6 +2031,56 @@ mod tests {
             !NetworkIptablesManager::hook_present(&ForwardProbe::ToolAbsent, "MXC-abc123"),
             "a tool that cannot be spawned holds no rules, so it holds no hook"
         );
+    }
+
+    #[test]
+    fn a_missing_binary_is_absent_but_an_unrunnable_one_is_unknown() {
+        // `Command::output()` fails for more reasons than a missing executable,
+        // and only one of them means "there are no rules here". Permission
+        // denied, an exhausted descriptor table, or a transient resource
+        // shortage all leave the ruleset exactly as it was, so reading them as
+        // absent would let an authoritative teardown certify a host whose hooks
+        // are untouched.
+        assert!(
+            matches!(
+                NetworkIptablesManager::probe_forward_chain("mxc-no-such-firewall-tool"),
+                ForwardProbe::ToolAbsent
+            ),
+            "a binary that is not installed is genuinely absent"
+        );
+        assert_eq!(
+            NetworkIptablesManager::chain_exists("mxc-no-such-firewall-tool", "MXC-abc123"),
+            Ok(false),
+            "a chain that cannot be addressed at all cannot exist"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_will_not_execute_is_never_read_as_absent() {
+        let dir = std::env::temp_dir().join(format!("mxc-unrunnable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test temp dir");
+        // Present on disk, but not executable: the spawn fails with
+        // PermissionDenied rather than NotFound, which says nothing about what
+        // is installed in the filter table.
+        let tool = dir.join("iptables");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").expect("seed a non-executable tool");
+        let tool = tool.to_string_lossy().to_string();
+
+        assert!(
+            matches!(
+                NetworkIptablesManager::probe_forward_chain(&tool),
+                ForwardProbe::Unreadable
+            ),
+            "a tool that exists but will not run leaves FORWARD unknown, not empty"
+        );
+        assert!(
+            NetworkIptablesManager::chain_exists(&tool, "MXC-abc123").is_err(),
+            "an unrunnable tool must not answer the chain question at all"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
