@@ -142,7 +142,9 @@ Inbound filtering is a separate chain from the egress chains above, and it lives
 
 Every `iptables`/`ip6tables` subprocess is spawned with `LC_ALL=C` and `LANG=C`. Teardown decides whether a non-zero exit means "already absent" by matching iptables' own diagnostic text, and that text is localized, so an unpinned locale would turn a benign already-absent result on a non-English host into a fatal error and abort every fresh install.
 
-| Policy | Implementation |
+The rows below describe the `firewall` and `both` enforcement modes. `networkEnforcementMode` defaults to `capabilities`, and under that mode the ingress path installs nothing at all — the same gate that skips the egress chains skips this one, so inbound is unfiltered and `allowLocalNetwork: true` is accepted rather than refused. Inbound default-deny is a property of the firewall enforcement modes, not of every LXC run.
+
+| Policy (`networkEnforcementMode`: `firewall` or `both`) | Implementation |
 |--------|---------------|
 | `allowLocalNetwork: false` (default) | Container `INPUT` chain drops new inbound connections |
 | `allowLocalNetwork: true` | **Not yet implemented.** Firewall setup fails with an explicit not-yet-implemented error rather than falling back to an unenforced accept |
