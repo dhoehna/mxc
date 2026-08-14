@@ -673,9 +673,10 @@ fn cleanup_network_authoritative(
 /// descriptor closes, so a phase that dies mid-sequence frees it; an `O_EXCL`
 /// lock file would instead wedge every later phase of that container name.
 struct LifecycleLock {
-    /// Held for its `Drop`, which is what releases the lock.
+    /// Held for its `Drop`, which is what releases the lock.  `None` when the
+    /// LXC root does not exist; see `acquire`.
     #[cfg(target_os = "linux")]
-    _guard: nix::fcntl::Flock<std::fs::File>,
+    _guard: Option<nix::fcntl::Flock<std::fs::File>>,
 }
 
 impl LifecycleLock {
@@ -691,17 +692,30 @@ impl LifecycleLock {
                 container.lxc_path(),
                 container_name
             );
-            let file = std::fs::OpenOptions::new()
+            let file = match std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .write(true)
                 .open(&path)
-                .map_err(|e| {
-                    MxcError::backend_error(format!(
+            {
+                Ok(file) => file,
+                // No LXC root means no container directory under it, so
+                // nothing has passed the `is_defined` gate that every start
+                // clears before it touches host state — there is no transition
+                // to be serialized against. `stop` and `deprovision` are
+                // required to be idempotent, and refusing them here would make
+                // cleanup on a host that never had LXC an error. Any other
+                // failure, permission in particular, still refuses the phase.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(LifecycleLock { _guard: None })
+                }
+                Err(e) => {
+                    return Err(MxcError::backend_error(format!(
                         "Failed to open the lifecycle lock for LXC container {container_name:?} at \
                          {path}: {e}"
-                    ))
-                })?;
+                    )))
+                }
+            };
             let guard = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
                 .map_err(|(_, errno)| {
                     MxcError::backend_error(format!(
@@ -709,7 +723,9 @@ impl LifecycleLock {
                          {errno}"
                     ))
                 })?;
-            Ok(LifecycleLock { _guard: guard })
+            Ok(LifecycleLock {
+                _guard: Some(guard),
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1420,6 +1436,27 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lifecycle_lock_is_skipped_when_there_is_no_lxc_root() {
+        // `stop` and `deprovision` have to stay idempotent on a host that never
+        // had LXC. No root means no container directory under it, so no start
+        // can have cleared its `is_defined` gate and there is no transition to
+        // serialize against.
+        let dir =
+            std::env::temp_dir().join(format!("mxc-lifecycle-noroot-{}", mint_random_token()));
+        let container = LxcContainer::new("absent", Some(dir.to_str().expect("utf-8 temp dir")));
+
+        assert!(
+            LifecycleLock::acquire(&container, "absent").is_ok(),
+            "a missing LXC root must not refuse the phase"
+        );
+        assert!(
+            !dir.exists(),
+            "the lock must not create the LXC root as a side effect"
+        );
     }
 
     #[cfg(target_os = "linux")]
