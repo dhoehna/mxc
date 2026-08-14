@@ -85,6 +85,19 @@ pub fn resolve_default_lxcpath() -> String {
 #[cfg(any(target_os = "linux", test))]
 const EXEC_MARKER_VAR: &str = "MXC_EXEC_ID";
 
+/// Mint a token for one exec, unique to this process and this call.
+///
+/// Uniqueness matters in both directions: two execs in the same container must
+/// not reap each other, and a stale token from an earlier process must not
+/// match anything live.
+pub fn mint_exec_marker() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        wxc_common::id::mint_random_token()
+    )
+}
+
 /// Build the post-binary argv for the `lxc-attach` that reaps an exec's
 /// leftovers, given the marker value that exec was stamped with.
 ///
@@ -710,6 +723,12 @@ impl LxcContainer {
     ///
     /// `timeout: Some(d)` kills the child if it runs longer than `d` and
     /// returns `Err("script timed out after {ms}ms")`.
+    ///
+    /// `marker: Some(token)` stamps the exec so its container-side processes
+    /// can be reaped later; see [`mint_exec_marker`].  The caller owns the
+    /// token because a timeout is not the only way an exec ends early -- a
+    /// signal kills this process outright, and the watchdog needs the same
+    /// token to reap on its way out.
     #[cfg(target_os = "linux")]
     pub fn attach_run(
         &self,
@@ -717,27 +736,14 @@ impl LxcContainer {
         working_directory: &str,
         env: &[String],
         timeout: Option<std::time::Duration>,
+        marker: Option<&str>,
     ) -> Result<(i32, String, String), String> {
         use mxc_pty::{run_with_pty, PtyOptions, PtyOutcome, Signal};
 
         const UNBLOCK: &[Signal] = &[Signal::SIGHUP, Signal::SIGTERM, Signal::SIGINT];
 
         let mut cmd = self.lxc_command("lxc-attach");
-        // Only a timed exec needs the marker, and only a timed exec can be
-        // torn down with work still running inside the container.
-        let marker = timeout.map(|_| {
-            format!(
-                "{}-{}",
-                std::process::id(),
-                wxc_common::id::mint_random_token()
-            )
-        });
-        cmd.args(build_attach_args(
-            env,
-            working_directory,
-            command,
-            marker.as_deref(),
-        ));
+        cmd.args(build_attach_args(env, working_directory, command, marker));
 
         let options = PtyOptions {
             unblock_signals: UNBLOCK,
@@ -757,7 +763,7 @@ impl LxcContainer {
                 // the work.  Reap before reporting, and if the reap fails say
                 // so: a bare timeout message would tell the caller the script
                 // stopped when it may still be running.
-                if let Some(token) = marker.as_deref() {
+                if let Some(token) = marker {
                     if let Err(e) = self.reap_marked_processes(token) {
                         return Err(format!(
                             "script timed out after {}ms, and its processes could not be \
@@ -774,17 +780,17 @@ impl LxcContainer {
 
     /// Kill every process in the container whose environment carries `marker`.
     ///
-    /// Used by [`attach_run`](Self::attach_run) on timeout.  Reaching into the
-    /// container's PID namespace requires a second attach; the alternative the
-    /// issue raised — stopping and restarting the container — would discard the
-    /// ingress chain that lives in its network namespace and the rest of the
-    /// start-time enforcement, so it trades an orphaned process for an
-    /// unfiltered sandbox.
+    /// Called on timeout by [`attach_run`](Self::attach_run) and on a fatal
+    /// signal by the cleanup watchdog.  Reaching into the container's PID
+    /// namespace requires a second attach; the alternative the issue raised —
+    /// stopping and restarting the container — would discard the ingress chain
+    /// that lives in its network namespace and the rest of the start-time
+    /// enforcement, so it trades an orphaned process for an unfiltered sandbox.
     #[cfg(target_os = "linux")]
-    fn reap_marked_processes(&self, marker: &str) -> Result<(), String> {
+    pub(crate) fn reap_marked_processes(&self, marker: &str) -> Result<(), String> {
         let mut cmd = self.lxc_command("lxc-attach");
         cmd.args(build_reap_args(marker));
-        Self::run_status(cmd, "lxc-attach (reap after timeout)")
+        Self::run_status(cmd, "lxc-attach (reap)")
     }
 
     /// Stub for the workspace-wide clippy lane that runs on Windows.
@@ -795,6 +801,7 @@ impl LxcContainer {
         _working_directory: &str,
         _env: &[String],
         _timeout: Option<std::time::Duration>,
+        _marker: Option<&str>,
     ) -> Result<(i32, String, String), String> {
         Err("LxcContainer::attach_run is only supported on Linux".to_string())
     }

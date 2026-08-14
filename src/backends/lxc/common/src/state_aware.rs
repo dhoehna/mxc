@@ -24,7 +24,7 @@ use wxc_common::state_aware_backend::{
 };
 
 use crate::filesystem_mounts;
-use crate::lxc_bindings::LxcContainer;
+use crate::lxc_bindings::{mint_exec_marker, LxcContainer};
 use crate::network_ingress::IngressManager;
 use crate::network_iptables::{CreatedResources, NetworkIptablesManager};
 use crate::signal_cleanup;
@@ -838,9 +838,21 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
                 // partial ingress chain -- and remove the egress state this
                 // start installed.
                 let veth = NetworkIptablesManager::discover_veth_interface(container_name);
-                let _ = container.stop();
-                cleanup_network_owned(container_name, veth.as_deref(), installed, &mut logger);
+                let stopped = container.stop();
                 signal_cleanup::clear_active();
+                if let Err(stop_err) = stopped {
+                    // The container is still up, and the egress chain is the
+                    // only half of its policy still in force. Removing it now
+                    // would turn a half-filtered container into an unfiltered
+                    // one, so it stays -- the same trade `stop` makes when it
+                    // cannot stop the container, and the same one the signal
+                    // rollback makes when its stop fails.
+                    return Err(MxcError::backend_error(format!(
+                        "{e}; the container could not be stopped afterwards ({stop_err}), so it \
+                         is still running and its egress rules were left in place"
+                    )));
+                }
+                cleanup_network_owned(container_name, veth.as_deref(), installed, &mut logger);
                 return Err(e);
             }
             // Past this point the chain and the container are both meant to
@@ -885,13 +897,23 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         } else {
             Some(Duration::from_millis(u64::from(request.script_timeout)))
         };
-        let exit_code = container
-            .attach_run(
-                &request.script_code,
-                &request.working_directory,
-                &request.env,
-                timeout,
-            )
+
+        // Registered for the whole attach, not just the timed part: a signal
+        // kills this process without waiting for the timeout, and the container
+        // is persistent, so anything the script started would otherwise be
+        // inherited by the next exec.
+        let marker = mint_exec_marker();
+        signal_cleanup::set_active_exec(container_name, &marker);
+        let outcome = container.attach_run(
+            &request.script_code,
+            &request.working_directory,
+            &request.env,
+            timeout,
+            Some(&marker),
+        );
+        signal_cleanup::clear_active();
+
+        let exit_code = outcome
             .map(|(exit_code, _, _)| exit_code)
             .map_err(|e| MxcError::backend_error(format!("Execution failed: {e}")))?;
 

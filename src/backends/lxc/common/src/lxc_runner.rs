@@ -351,11 +351,17 @@ impl LxcScriptRunner {
             Some(Duration::from_millis(u64::from(request.script_timeout)))
         };
         let _ = writeln!(logger, "Executing script inside container...");
+        // Stamped so a timeout can reap what the script started.  The one-shot
+        // container is normally destroyed on exit, which reaps everything, but
+        // a run configured to leave it behind has the same persistence problem
+        // the state-aware path does.
+        let marker = crate::lxc_bindings::mint_exec_marker();
         let result = container.attach_run(
             &request.script_code,
             &request.working_directory,
             &request.env,
             timeout,
+            Some(&marker),
         );
 
         let response = match result {

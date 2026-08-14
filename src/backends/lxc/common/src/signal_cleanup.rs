@@ -50,6 +50,12 @@ enum SignalRollback {
     /// The container is stopped, not destroyed, and left for a later `stop` or
     /// `deprovision` to reclaim.
     NetworkOnly,
+    /// State-aware `exec`: the container, its firewall, and its ingress rules
+    /// are all meant to survive.  Only the processes this exec started inside
+    /// the container are rolled back, because killing this process kills the
+    /// host-side attach and nothing else -- the container is persistent, so its
+    /// descendants would otherwise run on into the next exec.
+    ReapExec,
 }
 
 /// One action the watchdog takes on a fatal signal.
@@ -71,6 +77,9 @@ enum RollbackStep {
     RemoveIngress,
     /// Discard the container entirely.
     DestroyContainer,
+    /// Kill the processes one exec started inside the container, found by the
+    /// marker that exec was stamped with.
+    ReapExec,
 }
 
 /// The steps a signal rollback runs, in the order they must run.
@@ -104,10 +113,17 @@ enum RollbackStep {
 /// A process that never created the chain must not remove one: the chain name
 /// depends only on the container name, so the name may by now answer for a
 /// different, live container.
+///
+/// The exec rollback shares none of that. Nothing it touches was installed by
+/// start, so it removes no firewall and stops no container -- it kills only the
+/// processes carrying this exec's marker, which no other owner can be holding.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn rollback_plan(rollback: SignalRollback, owns_firewall: bool) -> Vec<RollbackStep> {
     let mut plan = Vec::new();
     match rollback {
+        SignalRollback::ReapExec => {
+            plan.push(RollbackStep::ReapExec);
+        }
         SignalRollback::NetworkOnly => {
             plan.push(RollbackStep::StopContainer);
             if owns_firewall {
@@ -197,6 +213,11 @@ struct ActiveSandbox {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     created: CreatedResources,
     netns_pid: Option<u32>,
+    /// The marker stamped on the exec currently running in `name`, when one is
+    /// running, so a signal can reap the processes it started inside the
+    /// container.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    exec_marker: Option<String>,
 }
 
 static ACTIVE_CONTAINER: OnceLock<Mutex<ActiveSandbox>> = OnceLock::new();
@@ -222,6 +243,7 @@ pub fn set_active(name: &str) {
     slot.rollback = SignalRollback::DestroyContainer;
     slot.created = CreatedResources::default();
     slot.netns_pid = None;
+    slot.exec_marker = None;
 }
 
 /// Records `name` as the currently active container for the *state-aware*
@@ -244,6 +266,32 @@ pub fn set_active_network_only(name: &str) {
     slot.veth = None;
     slot.rollback = SignalRollback::NetworkOnly;
     slot.created = CreatedResources::default();
+    slot.exec_marker = None;
+}
+
+/// Records the exec running in `name` under `marker`, so a fatal signal reaps
+/// the processes it started inside the container.
+///
+/// The exec phase registered nothing before this. `start` clears the
+/// registration once it succeeds -- correctly, since a later signal must not
+/// strip the firewall off a running container -- which left the whole exec
+/// window uncovered. A signal there killed the host-side `lxc-attach` and
+/// returned, while the script's descendants carried on inside a container that
+/// is persistent by design and would hand them to the next exec.
+///
+/// This does not resurrect the start-time registration. Nothing here stops the
+/// container or touches its rules; they are all meant to survive the exec, and
+/// the marker reaches only what this exec started.
+///
+/// Call [`clear_active`] as soon as the attach returns.
+pub fn set_active_exec(name: &str, marker: &str) {
+    let mut slot = lock_slot();
+    slot.name = Some(name.to_owned());
+    slot.veth = None;
+    slot.rollback = SignalRollback::ReapExec;
+    slot.created = CreatedResources::default();
+    slot.netns_pid = None;
+    slot.exec_marker = Some(marker.to_owned());
 }
 
 /// Records which iptables chains and FORWARD hooks this process created for
@@ -406,6 +454,14 @@ fn run_watchdog(mask: SigSet) -> ! {
                     true
                 }
                 RollbackStep::DestroyContainer => LxcContainer::new(&name, None).destroy().is_ok(),
+                // Without a marker there is nothing to match on, and matching
+                // too widely would kill processes this exec never started.
+                RollbackStep::ReapExec => {
+                    if let Some(marker) = active.exec_marker.as_deref() {
+                        let _ = LxcContainer::new(&name, None).reap_marked_processes(marker);
+                    }
+                    true
+                }
             });
         }
         std::process::exit(128 + sig as i32);
@@ -425,6 +481,29 @@ mod tests {
             !failing.contains(&step)
         });
         ran
+    }
+
+    #[test]
+    fn an_exec_rollback_touches_nothing_but_the_exec() {
+        // The container, its firewall, and its ingress rules are all meant to
+        // survive an exec.  A rollback that stopped the container or removed
+        // its rules would turn a cancelled command into a destroyed sandbox.
+        assert_eq!(
+            rollback_plan(SignalRollback::ReapExec, true),
+            vec![RollbackStep::ReapExec],
+            "cancelling an exec must not stop the container or remove its rules"
+        );
+    }
+
+    #[test]
+    fn an_exec_rollback_still_reaps_when_this_process_owns_the_firewall() {
+        // Ownership of the firewall is a start-phase fact and says nothing
+        // about an exec.  The plan must not vary with it.
+        assert_eq!(
+            rollback_plan(SignalRollback::ReapExec, false),
+            rollback_plan(SignalRollback::ReapExec, true),
+            "firewall ownership must not change what an exec rollback does"
+        );
     }
 
     #[test]
