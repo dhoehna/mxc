@@ -39,6 +39,20 @@ skip() {
 [ "$(id -u)" -eq 0 ] || skip "requires root for iptables/ip6tables and LXC."
 command -v iptables >/dev/null 2>&1 || skip "iptables is not installed."
 command -v ip6tables >/dev/null 2>&1 || skip "ip6tables is not installed."
+# Presence is not usability, and the difference is load-bearing twice over.  On
+# a host without kernel IPv6 the binary is normally installed and every
+# invocation still fails: under `set -o pipefail` the chain snapshots below
+# would then abort this script before a single assertion ran, reporting FAIL on
+# a host configuration the implementation explicitly supports.  Probing here
+# instead turns that into an honest SKIP.
+#
+# The whole test is skipped rather than just its IPv6 half.  The container
+# probe runs the same binary through `nsenter`, so it fails too, and the
+# inbound install's IPv6 classification -- a first-class part of what this test
+# covers -- then depends on whether the *container* namespace has an
+# `if_inet6`, which the host cannot predict.  Asserting the IPv4 half alone
+# would be non-deterministic, and a flaky test is worse than a declared gap.
+ip6tables -S >/dev/null 2>&1 || skip "ip6tables is installed but unusable here (no kernel IPv6 support), so the inbound IPv6 classification cannot be exercised."
 command -v nsenter >/dev/null 2>&1 || skip "nsenter is not installed."
 command -v lxc-create >/dev/null 2>&1 || skip "LXC (lxc-create) is not installed."
 [ -f "$LXC_EXEC" ] || skip "lxc-exec binary not built; run build.sh first."

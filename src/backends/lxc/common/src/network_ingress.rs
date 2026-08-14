@@ -1054,11 +1054,11 @@ impl IngressManager {
 
     /// Classify `ip6tables` usability *for the container's network namespace*.
     ///
-    /// Reuses main's pure classifiers ([`NetworkIptablesManager::classify_ip6tables_status`],
-    /// [`NetworkIptablesManager::classify_host_ipv6_state`],
-    /// [`NetworkIptablesManager::ipv6_state_treated_as_active`]) but feeds them
-    /// namespace-scoped inputs — `/proc/<pid>/net/if_inet6` and an in-namespace
-    /// `ip6tables -S` probe — rather than the host's. A host that has IPv6
+    /// Reuses main's pure classifiers ([`NetworkIptablesManager::classify_ip6tables_status`]
+    /// and [`NetworkIptablesManager::ipv6_state_treated_as_active`]) but feeds
+    /// them namespace-scoped inputs — an in-namespace `ip6tables -S` probe and
+    /// [`Self::classify_container_ipv6_state`], which reads
+    /// `/proc/<pid>/net/if_inet6` — rather than the host's. A host that has IPv6
     /// disabled says nothing about the container namespace we are filtering, so
     /// probing the host would let a container's IPv6 inbound bypass the deny.
     fn container_ip6tables_status(
@@ -1080,18 +1080,64 @@ impl IngressManager {
         )
     }
 
-    /// Whether the container namespace has an active, non-loopback IPv6 stack.
+    /// Whether the container namespace has a live IPv6 stack.
     /// Reads `/proc/<pid>/net/if_inet6` (the netns view of process `<pid>`) and
-    /// defers to main's pure classifier so the file-content → state mapping
-    /// stays unit-tested. `/proc/<pid>/net` presence separates "IPv6 is off in
+    /// defers to [`Self::classify_container_ipv6_state`] so the mapping stays
+    /// unit-tested. `/proc/<pid>/net` presence separates "IPv6 is off in
     /// this namespace" from "we could not read it" (fail-closed).
     fn container_ipv6_state(&self) -> HostIpv6State {
         let if_inet6 = format!("/proc/{}/net/if_inet6", self.netns_pid);
         let proc_net = format!("/proc/{}/net", self.netns_pid);
-        NetworkIptablesManager::classify_host_ipv6_state(
+        Self::classify_container_ipv6_state(
             std::fs::read_to_string(&if_inet6),
             std::path::Path::new(&proc_net).is_dir(),
         )
+    }
+
+    /// Classify the container namespace's IPv6 state from a
+    /// `/proc/<pid>/net/if_inet6` read.
+    ///
+    /// Deliberately **not** [`NetworkIptablesManager::classify_host_ipv6_state`].
+    /// That classifier inspects the file's *contents* — an address list — and
+    /// reports `Inactive` when nothing but `lo` is present.  For a long-lived
+    /// host that is a fair reading.  For a container it is a fail-open race:
+    /// `wait_for_network` returns on the first address of *any* family and its
+    /// return value is discarded, so a container whose IPv6 address has not
+    /// arrived yet presents exactly the same address-less file as one with IPv6
+    /// switched off.  Reading that as `Inactive` lets an unusable `ip6tables`
+    /// take the IPv4-only path, leaving the IPv6 address that arrives a moment
+    /// later unfiltered inbound — the fail-open this module exists to close.
+    ///
+    /// Existence is the stable signal; contents are the volatile one.  The
+    /// kernel never creates `if_inet6` when IPv6 is disabled at boot (see
+    /// [`HostIpv6State::Inactive`]), so the file being present — even with no
+    /// addresses yet — means the stack is there, and only its absence is
+    /// evidence of "off".
+    ///
+    /// Strictly more conservative than the host classifier: this can turn a
+    /// silent IPv4-only install into a fail-closed abort, never the reverse.
+    fn classify_container_ipv6_state(
+        read_result: std::io::Result<String>,
+        proc_net_present: bool,
+    ) -> HostIpv6State {
+        match read_result {
+            // Present at all, so the IPv6 stack exists in this namespace. The
+            // current address list cannot demote that to "off", because an
+            // address may still be on its way.
+            Ok(_) => HostIpv6State::Active,
+            // Absent while `/proc/<pid>/net` is there means IPv6 really is off
+            // in this namespace. Absent along with `/proc/<pid>/net` means the
+            // process is gone or `/proc` is not visible, which is "we do not
+            // know" and must not become a confirmed negative.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if proc_net_present {
+                    HostIpv6State::Inactive
+                } else {
+                    HostIpv6State::Unknown
+                }
+            }
+            Err(_) => HostIpv6State::Unknown,
+        }
     }
 
     /// Run a read-only `ip6tables -S` inside the container namespace, reporting
@@ -1162,6 +1208,115 @@ mod tests {
 
     /// The chain name these builder tests pin against.
     const TEST_CHAIN: &str = "MXC-t";
+
+    // ── Container-namespace IPv6 classification ──────────────────────────────
+    //
+    // These pin the difference between this module's classifier and main's.
+    // Swapping `classify_container_ipv6_state` back to
+    // `NetworkIptablesManager::classify_host_ipv6_state` fails the first three;
+    // the last three keep the correction from swinging too far and making the
+    // legitimate IPv4-only path unreachable.
+
+    /// A real `/proc/net/if_inet6` loopback line: address, if_index, prefix_len,
+    /// scope, flags, device.
+    const LOOPBACK_ONLY_IF_INET6: &str = "00000000000000000000000000000001 01 80 10 80       lo\n";
+
+    /// The race this classifier exists to close. A container that has not been
+    /// assigned an IPv6 address yet shows the same address-less `if_inet6` as
+    /// one with IPv6 switched off, so contents cannot be read as "IPv6 is off".
+    #[test]
+    fn container_if_inet6_with_only_loopback_is_still_active() {
+        let state = IngressManager::classify_container_ipv6_state(
+            Ok(LOOPBACK_ONLY_IF_INET6.to_string()),
+            true,
+        );
+        assert_eq!(
+            state,
+            HostIpv6State::Active,
+            "a container carrying only loopback may still be waiting for its IPv6 address; \
+             calling that Inactive is the fail-open this classifier exists to prevent"
+        );
+    }
+
+    /// An empty file is the same situation as loopback-only: the kernel created
+    /// it, so the stack is there; it simply has no addresses yet.
+    #[test]
+    fn container_empty_if_inet6_is_still_active() {
+        let state = IngressManager::classify_container_ipv6_state(Ok(String::new()), true);
+        assert_eq!(
+            state,
+            HostIpv6State::Active,
+            "an empty if_inet6 means no addresses *yet*, not IPv6 disabled"
+        );
+    }
+
+    /// The consequence stated as an outcome rather than an intermediate state:
+    /// an unusable `ip6tables` plus an address-less container must abort, not
+    /// quietly install IPv4-only enforcement.
+    #[test]
+    fn address_less_container_with_unusable_ip6tables_fails_closed() {
+        let state = IngressManager::classify_container_ipv6_state(
+            Ok(LOOPBACK_ONLY_IF_INET6.to_string()),
+            true,
+        );
+        let status = NetworkIptablesManager::classify_ip6tables_status(
+            false,
+            NetworkIptablesManager::ipv6_state_treated_as_active(state),
+        );
+        assert!(
+            matches!(status, Ip6tablesStatus::UnusableButIpv6Active),
+            "a failed probe against a container that may still receive an IPv6 address must \
+             fail closed, not take the IPv4-only path"
+        );
+    }
+
+    /// The genuine IPv4-only case must still work. A kernel with IPv6 disabled
+    /// at boot never creates `if_inet6`, and that absence -- with
+    /// `/proc/<pid>/net` present to prove the read was real -- is the one signal
+    /// that still means "off".
+    #[test]
+    fn container_missing_if_inet6_with_proc_net_is_inactive() {
+        let state = IngressManager::classify_container_ipv6_state(
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            true,
+        );
+        assert_eq!(
+            state,
+            HostIpv6State::Inactive,
+            "a kernel with IPv6 off at boot creates no if_inet6; that must stay the IPv4-only \
+             path or default-deny could never install on such a host"
+        );
+    }
+
+    /// A missing file with no `/proc/<pid>/net` behind it is "we could not read
+    /// it", not "IPv6 is off" -- the process may simply be gone.
+    #[test]
+    fn container_missing_if_inet6_without_proc_net_is_unknown() {
+        let state = IngressManager::classify_container_ipv6_state(
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            false,
+        );
+        assert_eq!(
+            state,
+            HostIpv6State::Unknown,
+            "without /proc/<pid>/net the read proves nothing and must not become a confirmed \
+             negative"
+        );
+    }
+
+    /// Any other read error is uncertainty, which must not be downgraded.
+    #[test]
+    fn container_unreadable_if_inet6_is_unknown() {
+        let state = IngressManager::classify_container_ipv6_state(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            true,
+        );
+        assert_eq!(
+            state,
+            HostIpv6State::Unknown,
+            "an unreadable if_inet6 means we do not know, not that IPv6 is off"
+        );
+    }
 
     /// The full install sequence for one policy/family: `-N`, then the chain
     /// body, then the `-I INPUT` hook. Composed from the split [`IngressRules`]

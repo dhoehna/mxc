@@ -25,6 +25,39 @@ use wxc_common::models::NetworkEnforcementMode;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/// A netns PID that can never name a live process.
+///
+/// These tests drive the production [`IngressManager::apply_firewall_rules`],
+/// which constructs a real `NsenterRunner`.  On a privileged Linux host a PID
+/// that happened to exist would therefore be entered for real, and that
+/// process's iptables chains reset and installed — a unit test mutating live
+/// network state.  Linux caps `pid_max` at `PID_MAX_LIMIT`, 2^22 (4194304), so
+/// `u32::MAX` is outside every representable PID and `nsenter -t` is
+/// guaranteed to fail before reaching a namespace.
+///
+/// This costs no coverage: every test below asserts which *classification* an
+/// outcome is (or is not), never the happy path, and each one already tolerates
+/// an `Err` from an unreachable namespace.
+const UNOCCUPIABLE_NETNS_PID: u32 = u32::MAX;
+
+/// Guards the constant above against a well-meaning "use a realistic PID"
+/// cleanup.  The safety property is not that the number looks unusual, it is
+/// that no process can ever hold it, so the property is asserted rather than
+/// left to the comment.
+#[test]
+fn the_test_netns_pid_cannot_name_a_live_process() {
+    // `PID_MAX_LIMIT` in the Linux kernel is 2^22; `/proc/sys/kernel/pid_max`
+    // cannot be raised above it, so no PID above this value is representable.
+    const PID_MAX_LIMIT: u32 = 1 << 22;
+
+    assert!(
+        UNOCCUPIABLE_NETNS_PID > PID_MAX_LIMIT,
+        "the netns PID these tests use must be unreachable ({UNOCCUPIABLE_NETNS_PID} must \
+         exceed PID_MAX_LIMIT {PID_MAX_LIMIT}); otherwise a privileged Linux run can enter a \
+         real process's network namespace and reset its iptables chains"
+    );
+}
+
 fn make_logger() -> Logger {
     Logger::new(Mode::Buffer)
 }
@@ -51,7 +84,7 @@ fn firewall_policy(allow_local: bool) -> ContainerPolicy {
 #[test]
 fn permissive_inbound_in_a_container_netns_is_refused_not_installed() {
     let policy = firewall_policy(true);
-    let mut mgr = IngressManager::new("test-container-refused", 12345);
+    let mut mgr = IngressManager::new("test-container-refused", UNOCCUPIABLE_NETNS_PID);
     let mut logger = make_logger();
 
     let result = mgr.apply_firewall_rules(&policy, &mut logger);
@@ -92,7 +125,7 @@ fn permissive_inbound_in_both_mode_is_refused_not_installed() {
         network_enforcement_mode: NetworkEnforcementMode::Both,
         ..Default::default()
     };
-    let mut mgr = IngressManager::new("test-container-refused-both", 22222);
+    let mut mgr = IngressManager::new("test-container-refused-both", UNOCCUPIABLE_NETNS_PID);
     let mut logger = make_logger();
 
     let result = mgr.apply_firewall_rules(&policy, &mut logger);
@@ -126,7 +159,7 @@ fn permissive_inbound_in_both_mode_is_refused_not_installed() {
 #[test]
 fn permissive_inbound_refusal_does_not_set_rules_applied() {
     let policy = firewall_policy(true);
-    let mut mgr = IngressManager::new("test-container-refused-state", 99999);
+    let mut mgr = IngressManager::new("test-container-refused-state", UNOCCUPIABLE_NETNS_PID);
     let mut logger = make_logger();
 
     let result = mgr.apply_firewall_rules(&policy, &mut logger);
@@ -156,7 +189,7 @@ fn permissive_inbound_refusal_does_not_set_rules_applied() {
 #[test]
 fn default_deny_with_netns_is_not_the_permissive_refusal() {
     let policy = firewall_policy(false);
-    let mut mgr = IngressManager::new("test-container-deny-with-netns", 55555);
+    let mut mgr = IngressManager::new("test-container-deny-with-netns", UNOCCUPIABLE_NETNS_PID);
     let mut logger = make_logger();
 
     let result = mgr.apply_firewall_rules(&policy, &mut logger);
@@ -193,7 +226,7 @@ fn permissive_inbound_capabilities_mode_is_not_refused() {
         network_enforcement_mode: NetworkEnforcementMode::Capabilities,
         ..Default::default()
     };
-    let mut mgr = IngressManager::new("test-container-perm-caps", 77777);
+    let mut mgr = IngressManager::new("test-container-perm-caps", UNOCCUPIABLE_NETNS_PID);
     let mut logger = make_logger();
 
     let result = mgr.apply_firewall_rules(&policy, &mut logger);
