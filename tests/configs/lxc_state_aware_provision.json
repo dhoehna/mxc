@@ -3,7 +3,7 @@
   "containment": "lxc",
   "experimental": {
     "lxc": {
-      "provision": { "distribution": "alpine", "release": "3.20" }
+      "provision": { "distribution": "alpine", "release": "3.23" }
     }
   }
 }
