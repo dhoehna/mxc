@@ -1700,9 +1700,14 @@ raw-JSON caller that sends it is not rejected.
 > discovered after start: the name is derived from the container name and pinned to
 > `lxc.net.0.veth.pair` before start, so the chain is scoped before the interface
 > exists. Start fails instead when that pin cannot be trusted to cover the
-> container's traffic — when the config uses `lxc.include`, or declares anything
-> other than exactly one interface. `allowLocalNetwork` and `removeRulesOnExit` are
-> not part of the LXC surface (see `LxcNetworkConfig`).
+> container's traffic — when the config uses `lxc.include`, declares anything
+> other than exactly one interface, puts that sole interface at an index other
+> than `lxc.net.0`, or does not declare `lxc.net.0.type = veth`. An undeclared
+> type is refused alongside a wrong one, because absence is not evidence of a
+> veth, and a `macvlan` or `phys` interface would take a hook pinned to a veth
+> name that never appears while its traffic ran unfiltered. `allowLocalNetwork`
+> and `removeRulesOnExit` are not part of the LXC surface (see
+> `LxcNetworkConfig`).
 >
 > An explicit `defaultPolicy: "block"` now triggers the same rejection as
 > `allowedHosts`/`blockedHosts`: the parser records whether the field was present in
