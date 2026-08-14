@@ -40,23 +40,23 @@ use wxc_common::models::NetworkEnforcementMode;
 /// an `Err` from an unreachable namespace.
 const UNOCCUPIABLE_NETNS_PID: u32 = u32::MAX;
 
+/// `PID_MAX_LIMIT` in the Linux kernel is 2^22; `/proc/sys/kernel/pid_max`
+/// cannot be raised above it, so no PID at or above this value is
+/// representable.
+const PID_MAX_LIMIT: u32 = 1 << 22;
+
 /// Guards the constant above against a well-meaning "use a realistic PID"
 /// cleanup.  The safety property is not that the number looks unusual, it is
-/// that no process can ever hold it, so the property is asserted rather than
-/// left to the comment.
-#[test]
-fn the_test_netns_pid_cannot_name_a_live_process() {
-    // `PID_MAX_LIMIT` in the Linux kernel is 2^22; `/proc/sys/kernel/pid_max`
-    // cannot be raised above it, so no PID above this value is representable.
-    const PID_MAX_LIMIT: u32 = 1 << 22;
-
-    assert!(
-        UNOCCUPIABLE_NETNS_PID > PID_MAX_LIMIT,
-        "the netns PID these tests use must be unreachable ({UNOCCUPIABLE_NETNS_PID} must \
-         exceed PID_MAX_LIMIT {PID_MAX_LIMIT}); otherwise a privileged Linux run can enter a \
-         real process's network namespace and reset its iptables chains"
-    );
-}
+/// that no process can ever hold it, so it is checked at compile time rather
+/// than left to a comment: lowering the PID to something a host could actually
+/// be running fails the build, instead of silently arming every test below to
+/// enter a live namespace.
+const _: () = assert!(
+    UNOCCUPIABLE_NETNS_PID > PID_MAX_LIMIT,
+    "the netns PID these tests use must exceed the kernel's PID_MAX_LIMIT; otherwise a \
+     privileged Linux run can enter a real process's network namespace and reset its \
+     iptables chains"
+);
 
 fn make_logger() -> Logger {
     Logger::new(Mode::Buffer)
