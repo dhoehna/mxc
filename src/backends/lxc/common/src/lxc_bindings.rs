@@ -135,6 +135,15 @@ pub struct NetInterfaceConfig {
     pub indices: Vec<u32>,
     /// Whether this file pulls in another config with `lxc.include`.
     pub has_include: bool,
+    /// The declared `lxc.net.N.type` for each index that states one.
+    ///
+    /// A missing entry means the config never declared a type for that index,
+    /// which is not the same as declaring it `none`. The only distinction that
+    /// matters to the firewall is whether an interface is a `veth`, because the
+    /// pin and the `FORWARD` hook are both veth concepts, so a caller that
+    /// needs certainty treats anything other than an explicit `veth` -- absent
+    /// included -- as unenforceable.
+    pub types: std::collections::BTreeMap<u32, String>,
 }
 
 /// Extract the network-interface picture from an LXC config file.
@@ -154,9 +163,10 @@ pub struct NetInterfaceConfig {
 fn parse_net_interface_config(config_contents: &str) -> NetInterfaceConfig {
     let mut indices: Vec<u32> = Vec::new();
     let mut has_include = false;
+    let mut types: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
 
     for line in config_contents.lines() {
-        let Some((lhs, _)) = line.split_once('=') else {
+        let Some((lhs, rhs)) = line.split_once('=') else {
             continue;
         };
         let key = lhs.trim();
@@ -168,9 +178,12 @@ fn parse_net_interface_config(config_contents: &str) -> NetInterfaceConfig {
             continue;
         }
         if let Some(rest) = key.strip_prefix("lxc.net.") {
-            if let Some((index, _)) = rest.split_once('.') {
+            if let Some((index, sub_key)) = rest.split_once('.') {
                 if let Ok(n) = index.parse::<u32>() {
                     indices.push(n);
+                    if sub_key == "type" {
+                        types.insert(n, rhs.trim().to_string());
+                    }
                 }
             }
         }
@@ -181,6 +194,7 @@ fn parse_net_interface_config(config_contents: &str) -> NetInterfaceConfig {
     NetInterfaceConfig {
         indices,
         has_include,
+        types,
     }
 }
 
@@ -896,6 +910,34 @@ mod tests {
         let net = parse_net_interface_config(config);
         assert_eq!(net.indices, vec![0]);
         assert!(!net.has_include);
+    }
+
+    #[test]
+    fn a_declared_interface_type_is_captured_for_each_index() {
+        // The index alone cannot tell the firewall whether it can enforce.
+        // Enforcement names the host end of a veth pair, so the caller has to
+        // see the declared type to refuse a macvlan or phys interface instead
+        // of hooking a veth name that will never exist.
+        let config = "lxc.net.0.type = veth\n\
+                      lxc.net.0.link = lxcbr0\n\
+                      lxc.net.1.type = macvlan\n";
+        let net = parse_net_interface_config(config);
+        assert_eq!(net.indices, vec![0, 1]);
+        assert_eq!(net.types.get(&0).map(String::as_str), Some("veth"));
+        assert_eq!(net.types.get(&1).map(String::as_str), Some("macvlan"));
+    }
+
+    #[test]
+    fn an_interface_that_declares_no_type_reports_no_type() {
+        // The negative control for the test above. An undeclared type must stay
+        // distinguishable from `veth`, because the firewall gate treats only a
+        // positive `veth` as enforceable -- reporting a default here would let
+        // an unenforceable container through.
+        let config = "lxc.net.0.link = lxcbr0\n\
+                      lxc.net.0.flags = up\n";
+        let net = parse_net_interface_config(config);
+        assert_eq!(net.indices, vec![0]);
+        assert!(!net.types.contains_key(&0));
     }
 
     #[test]

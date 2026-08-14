@@ -25,6 +25,7 @@ use wxc_common::state_aware_backend::{
 
 use crate::filesystem_mounts;
 use crate::lxc_bindings::LxcContainer;
+use crate::network_ingress::IngressManager;
 use crate::network_iptables::{CreatedResources, NetworkIptablesManager};
 use crate::signal_cleanup;
 
@@ -136,10 +137,17 @@ fn has_filesystem_policy(policy: &ContainerPolicy) -> bool {
 }
 
 fn has_network_policy(policy: &ContainerPolicy) -> bool {
-    matches!(
-        policy.network_enforcement_mode,
-        NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-    ) || !policy.allowed_hosts.is_empty()
+    // `network_specified` is the outermost bit: it is true for any `network`
+    // block at all, including an empty one and one that only sets
+    // `allowLocalNetwork: false`. The narrower bits below cannot see those --
+    // both produce a policy indistinguishable from the struct default -- so a
+    // phase that documents "no network section" would otherwise accept one.
+    policy.network_specified
+        || matches!(
+            policy.network_enforcement_mode,
+            NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
+        )
+        || !policy.allowed_hosts.is_empty()
         || !policy.blocked_hosts.is_empty()
         || policy.allow_local_network
         || policy.network_proxy.is_enabled()
@@ -335,6 +343,55 @@ fn apply_network_policy(
             )));
         }
 
+        // Exactly one interface is necessary but not sufficient -- it also has
+        // to be the one everything downstream assumes. The pin below, the veth
+        // name, and the FORWARD hook are all written against `lxc.net.0`, so a
+        // container whose single interface sits at another index would get a
+        // chain built against an interface it never uses, while MXC reported the
+        // policy as enforced.
+        let index = net.indices[0];
+        if index != 0 {
+            return Err(MxcError::policy_validation(format!(
+                "Container {:?} configures its only network interface at lxc.net.{} rather \
+                 than lxc.net.0; a firewall-enforced network policy is pinned to lxc.net.0 \
+                 and would not cover it. Renumber the interface to lxc.net.0, or run without \
+                 firewall enforcement",
+                container.name(),
+                index,
+            )));
+        }
+
+        // Same assumption, the other half. Enforcement works by naming the host
+        // end of a veth pair and hooking that name in FORWARD, so the interface
+        // has to actually be a veth. A macvlan or phys interface at index 0
+        // satisfies every check above and then gets a hook pinned to a veth name
+        // that will never exist, while its traffic uses the real interface
+        // unfiltered. An undeclared type is refused for the same reason: it is
+        // not evidence of a veth.
+        match net.types.get(&index).map(String::as_str) {
+            Some("veth") => {}
+            Some(other) => {
+                return Err(MxcError::policy_validation(format!(
+                    "Container {:?} configures lxc.net.0.type = {:?}; a firewall-enforced \
+                     network policy can only be applied to a veth interface, because \
+                     enforcement pins the host end of the veth pair and hooks that name in \
+                     FORWARD. Use a veth interface, or run without firewall enforcement",
+                    container.name(),
+                    other,
+                )));
+            }
+            None => {
+                return Err(MxcError::policy_validation(format!(
+                    "Container {:?} does not declare lxc.net.0.type; a firewall-enforced \
+                     network policy can only be applied to a declared veth interface, because \
+                     enforcement pins the host end of the veth pair and hooks that name in \
+                     FORWARD. Declare lxc.net.0.type = veth, or run without firewall \
+                     enforcement",
+                    container.name()
+                )));
+            }
+        }
+
         let veth = NetworkIptablesManager::deterministic_veth_name(container.name());
 
         // The name is re-derived on every start, so drop any pin from a prior
@@ -430,6 +487,59 @@ fn apply_network_policy(
 /// `created` is the ownership record: only the chains and hooks named in it are
 /// removed, so a process that created nothing removes nothing. Use this from
 /// the start path, which knows what it installed.
+/// Install the container's inbound default-deny chain, failing closed.
+///
+/// The egress chain is installed *before* the container runs, because iptables
+/// accepts a veth name that does not exist yet. Ingress cannot work that way:
+/// the chain lives inside the container's **own** network namespace, which does
+/// not exist until the container starts, so this necessarily runs afterwards.
+/// The one-shot path orders it the same way for the same reason.
+///
+/// Without this the state-aware path enforced only half the network policy.
+/// `allowLocalNetwork` defaults to false, so a container started here accepted
+/// inbound connections from the host and the LAN while MXC reported the policy
+/// as enforced -- egress filtered, ingress wide open. `IngressManager` also
+/// refuses `allowLocalNetwork: true` outright rather than installing an
+/// over-broad accept, so wiring it in is what makes that value honored or
+/// refused instead of silently ignored.
+fn apply_ingress_policy(
+    container: &LxcContainer,
+    container_name: &str,
+    request: &ExecutionRequest,
+    logger: &mut Logger,
+) -> Result<(), MxcError> {
+    let policy = normalized_policy(request, logger)?;
+
+    let Some(pid) = container.init_pid() else {
+        if uses_firewall_mode(&policy) {
+            // Enforcing inbound means entering the container's netns, and the
+            // init PID is the only handle on it. Continuing would silently drop
+            // the requested deny, so refuse the start instead.
+            return Err(MxcError::backend_error(
+                "Failed to discover the container init PID; cannot enter the container \
+                 network namespace to enforce the inbound network policy",
+            ));
+        }
+        return Ok(());
+    };
+
+    let mut manager = IngressManager::new(container_name, pid);
+    let applied = manager
+        .apply_firewall_rules(&policy, logger)
+        .map_err(|e| MxcError::backend_error(format!("Inbound network policy error: {e}")))?;
+    if !applied {
+        return Err(MxcError::backend_error(
+            "Failed to apply inbound network firewall rules",
+        ));
+    }
+
+    // The container outlives this call, so its rules must too. `Drop` otherwise
+    // tears them down on the way out of this function, undoing the install this
+    // function exists to perform.
+    manager.set_preserve_policy(true);
+    Ok(())
+}
+
 fn cleanup_network_owned(
     container_name: &str,
     veth: Option<&str>,
@@ -557,6 +667,21 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
                 return Err(MxcError::backend_error(format!(
                     "Failed to start container: {e}"
                 )));
+            }
+            // Inbound enforcement lands only once the container's network
+            // namespace exists, so unlike the egress chain it comes after start.
+            if let Err(e) = apply_ingress_policy(&container, container_name, request, &mut logger) {
+                // The container is up and its inbound deny is not in force, so
+                // leaving it running is exactly the fail-open this guard exists
+                // to prevent. Discover the veth while the container still has
+                // one, then stop it -- which also discards the netns holding any
+                // partial ingress chain -- and remove the egress state this
+                // start installed.
+                let veth = NetworkIptablesManager::discover_veth_interface(container_name);
+                let _ = container.stop();
+                cleanup_network_owned(container_name, veth.as_deref(), installed, &mut logger);
+                signal_cleanup::clear_active();
+                return Err(e);
             }
             // Past this point the chain and the container are both meant to
             // persist, so a signal must not roll either back.
@@ -847,6 +972,32 @@ mod tests {
         // pre-start iptables install are scoped to the firewall modes, so a
         // default policy neither touches the container config nor installs rules.
         assert!(!uses_firewall_mode(&policy));
+    }
+
+    #[test]
+    fn a_network_block_that_expresses_no_restriction_is_still_a_network_block() {
+        // `network: {}`, and a block that only restates the `allowLocalNetwork:
+        // false` default, both parse to a policy identical to the struct
+        // default -- every narrower bit reads false. Only `network_specified`
+        // can see them. The phase contract says provision, exec, stop, and
+        // deprovision take no network section, so without this bit they were
+        // accepted there and silently ignored.
+        let empty_block = ContainerPolicy {
+            network_specified: true,
+            ..Default::default()
+        };
+        assert!(has_network_policy(&empty_block));
+        assert!(reject_start_policy_on_other_phase("exec", &empty_block).is_err());
+    }
+
+    #[test]
+    fn a_policy_with_no_network_section_is_not_a_network_policy() {
+        // The negative control for the test above: without it, "reject
+        // everything" would pass, and the plain start in
+        // run_lxc_state_aware_test.sh would start failing on every phase.
+        let none = ContainerPolicy::default();
+        assert!(!has_network_policy(&none));
+        assert!(reject_start_policy_on_other_phase("exec", &none).is_ok());
     }
 
     #[test]
