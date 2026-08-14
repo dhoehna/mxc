@@ -477,13 +477,11 @@ impl LxcContainer {
             .lxc_command("lxc-info")
             .output()
             .map_err(|e| format!("failed to run lxc-info: {e}"))?;
-        let config = std::path::Path::new(&self.lxc_path)
-            .join(&self.name)
-            .join("config");
+        let config = self.config_file_path();
         interpret_defined_probe(
             output.status.success(),
             &String::from_utf8_lossy(&output.stderr),
-            &config,
+            std::path::Path::new(&config),
             &self.name,
         )
     }

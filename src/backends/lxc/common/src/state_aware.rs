@@ -706,6 +706,20 @@ struct LifecycleLock {
 const LOCK_ACQUIRE_ATTEMPTS: usize = 8;
 
 impl LifecycleLock {
+    /// Where the lock file for `container_name` lives.
+    ///
+    /// One function so `acquire` and `release_and_reclaim` cannot drift: a
+    /// reclaim that computed a different path would unlink a file nobody holds
+    /// and leave the real one behind.
+    #[cfg(target_os = "linux")]
+    fn lock_path(container: &LxcContainer, container_name: &str) -> String {
+        format!(
+            "{}/.mxc-lifecycle-{}.lock",
+            container.lxc_path(),
+            container_name
+        )
+    }
+
     /// Take the lock, waiting for any concurrent transition of the same sandbox.
     ///
     /// Off Linux there is no LXC to serialize, so this is a no-op that exists
@@ -713,11 +727,7 @@ impl LifecycleLock {
     fn acquire(container: &LxcContainer, container_name: &str) -> Result<Self, MxcError> {
         #[cfg(target_os = "linux")]
         {
-            let path = format!(
-                "{}/.mxc-lifecycle-{}.lock",
-                container.lxc_path(),
-                container_name
-            );
+            let path = Self::lock_path(container, container_name);
             for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
                 let file = match std::fs::OpenOptions::new()
                     .create(true)
@@ -814,12 +824,7 @@ impl LifecycleLock {
         #[cfg(target_os = "linux")]
         {
             if self._guard.is_some() {
-                let path = format!(
-                    "{}/.mxc-lifecycle-{}.lock",
-                    container.lxc_path(),
-                    container_name
-                );
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(Self::lock_path(container, container_name));
             }
         }
         #[cfg(not(target_os = "linux"))]
