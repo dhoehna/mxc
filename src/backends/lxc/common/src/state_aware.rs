@@ -662,7 +662,9 @@ fn cleanup_network_authoritative(
 ///
 /// `exec` deliberately stays out.  It installs and removes no host state, so it
 /// cannot produce that fail-open, and an exclusive lock there would serialize
-/// concurrent execs into one sandbox, which is a supported thing to do.
+/// concurrent execs into one sandbox, which is a supported thing to do.  Every
+/// other phase takes it: `provision` because minting probes for an unused name
+/// and then creates it, which is the same shape of race.
 ///
 /// The lock file lives in the LXC root rather than in the container directory
 /// because `deprovision` destroys that directory: a lock file inside it would
@@ -767,6 +769,13 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             })?,
         };
         let container = LxcContainer::new(&container_name, None);
+        // Same lock the other phases take. Minting probes for an unused name
+        // and then creates it, so without this two provisions that mint the
+        // same name both see it free and both create; and a supplied name can
+        // race the same way. Holding the lock across the probe and the create
+        // makes the loser adopt, which is what a second provision of a name
+        // that already exists is supposed to do.
+        let _lifecycle_lock = LifecycleLock::acquire(&container, &container_name)?;
         let created = !container
             .is_defined()
             .map_err(|e| probe_failed("exists", &container_name, e))?;
