@@ -68,8 +68,60 @@ pub fn resolve_default_lxcpath() -> String {
     resolve_lxcpath_with_env(|k| std::env::var(k).ok(), current_euid)
 }
 
+/// Environment variable stamped on every process an exec starts inside the
+/// container, so a timeout can find its descendants and kill them.
+///
+/// A timeout tears down `lxc-attach` on the host, which says nothing about the
+/// processes the script started inside the container's PID namespace.  The
+/// container is persistent — it outlives the exec and lives until deprovision
+/// — so those survivors keep holding CPU, memory, handles, and network inside a
+/// sandbox the caller believes is idle, and the next exec shares the container
+/// with them.
+///
+/// The marker rides on the environment, which every `fork`/`exec` inherits, so
+/// it reaches descendants at any depth.  A process that deliberately scrubs its
+/// own environment escapes; nothing short of a per-exec PID namespace covers
+/// that, and lxc-attach does not offer one.
+#[cfg(any(target_os = "linux", test))]
+const EXEC_MARKER_VAR: &str = "MXC_EXEC_ID";
+
+/// Build the post-binary argv for the `lxc-attach` that reaps an exec's
+/// leftovers, given the marker value that exec was stamped with.
+///
+/// The marker travels as a positional argument rather than being spliced into
+/// the script, so nothing in it can be read as shell syntax.  Only `cat` and
+/// `kill` are used beyond shell builtins: `grep`'s `-a` and `-F` flags are not
+/// dependable across the busybox and GNU userlands MXC containers are built
+/// from.  Command substitution drops the NULs that separate `environ` entries,
+/// which concatenates neighbors but leaves each `KEY=VALUE` intact, so the
+/// substring test still holds.
+///
+/// The reaping shell is attached *without* the marker, so it cannot match
+/// itself.
+#[cfg(any(target_os = "linux", test))]
+fn build_reap_args(marker: &str) -> Vec<String> {
+    vec![
+        "--".to_string(),
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "for d in /proc/[0-9]*; do \
+           e=$(cat \"$d/environ\" 2>/dev/null) || continue; \
+           case \"$e\" in *\"$1\"*) kill -9 \"${d#/proc/}\" 2>/dev/null ;; esac; \
+         done; \
+         exit 0"
+            .to_string(),
+        "_".to_string(),
+        format!("{}={}", EXEC_MARKER_VAR, marker),
+    ]
+}
+
 /// Build the post-binary argv for `lxc-attach` (the args that follow the
 /// `-n NAME -P lxcpath` flags already appended by `lxc_command`).
+///
+/// `marker`, when present, is stamped into the child's environment as
+/// [`EXEC_MARKER_VAR`] so a timeout can locate the whole process tree later;
+/// see [`build_reap_args`].  It is only supplied when the caller set a timeout,
+/// so the no-timeout argv is unchanged.
 ///
 /// Extracted so the env / cwd / command layering is unit-testable without
 /// actually spawning `lxc-attach`. See [`LxcContainer::attach_run`] for
@@ -79,7 +131,12 @@ pub fn resolve_default_lxcpath() -> String {
 /// that never calls this helper, and the workspace clippy lane on
 /// `windows-latest` would otherwise flag it as dead code.
 #[cfg(any(target_os = "linux", test))]
-fn build_attach_args(env: &[String], working_directory: &str, command: &str) -> Vec<String> {
+fn build_attach_args(
+    env: &[String],
+    working_directory: &str,
+    command: &str,
+    marker: Option<&str>,
+) -> Vec<String> {
     // Loose upper bound; realloc-avoidance hint only.
     let mut args: Vec<String> = Vec::with_capacity(env.len() + 8);
 
@@ -99,6 +156,13 @@ fn build_attach_args(env: &[String], working_directory: &str, command: &str) -> 
                 }
             }
         }
+    }
+
+    // Stamped after the caller's entries so `--clear-env` still leads, and
+    // outside the `env.is_empty()` gate so a caller that set no env still gets
+    // a reapable exec.
+    if let Some(token) = marker {
+        args.push(format!("--set-var={}={}", EXEC_MARKER_VAR, token));
     }
 
     args.push("--".to_string());
@@ -659,7 +723,21 @@ impl LxcContainer {
         const UNBLOCK: &[Signal] = &[Signal::SIGHUP, Signal::SIGTERM, Signal::SIGINT];
 
         let mut cmd = self.lxc_command("lxc-attach");
-        cmd.args(build_attach_args(env, working_directory, command));
+        // Only a timed exec needs the marker, and only a timed exec can be
+        // torn down with work still running inside the container.
+        let marker = timeout.map(|_| {
+            format!(
+                "{}-{}",
+                std::process::id(),
+                wxc_common::id::mint_random_token()
+            )
+        });
+        cmd.args(build_attach_args(
+            env,
+            working_directory,
+            command,
+            marker.as_deref(),
+        ));
 
         let options = PtyOptions {
             unblock_signals: UNBLOCK,
@@ -674,9 +752,39 @@ impl LxcContainer {
 
             PtyOutcome::TimedOut => {
                 let ms = timeout.map(|d| d.as_millis()).unwrap_or(0);
+
+                // Killing lxc-attach ended the caller's view of the work, not
+                // the work.  Reap before reporting, and if the reap fails say
+                // so: a bare timeout message would tell the caller the script
+                // stopped when it may still be running.
+                if let Some(token) = marker.as_deref() {
+                    if let Err(e) = self.reap_marked_processes(token) {
+                        return Err(format!(
+                            "script timed out after {}ms, and its processes could not be \
+                             reaped from the container, so they may still be running: {}",
+                            ms, e
+                        ));
+                    }
+                }
+
                 Err(format!("script timed out after {}ms", ms))
             }
         }
+    }
+
+    /// Kill every process in the container whose environment carries `marker`.
+    ///
+    /// Used by [`attach_run`](Self::attach_run) on timeout.  Reaching into the
+    /// container's PID namespace requires a second attach; the alternative the
+    /// issue raised — stopping and restarting the container — would discard the
+    /// ingress chain that lives in its network namespace and the rest of the
+    /// start-time enforcement, so it trades an orphaned process for an
+    /// unfiltered sandbox.
+    #[cfg(target_os = "linux")]
+    fn reap_marked_processes(&self, marker: &str) -> Result<(), String> {
+        let mut cmd = self.lxc_command("lxc-attach");
+        cmd.args(build_reap_args(marker));
+        Self::run_status(cmd, "lxc-attach (reap after timeout)")
     }
 
     /// Stub for the workspace-wide clippy lane that runs on Windows.
@@ -1208,7 +1316,7 @@ mod tests {
         // Empty env + empty cwd must reproduce the original argv shape:
         // `-- /bin/sh -c <command>` so we don't perturb existing call sites
         // when neither cwd nor env is set.
-        let args = build_attach_args(&[], "", "echo hi");
+        let args = build_attach_args(&[], "", "echo hi", None);
         assert_eq!(args, vec!["--", "/bin/sh", "-c", "echo hi"]);
     }
 
@@ -1219,7 +1327,7 @@ mod tests {
             "EMPTY=".to_string(),
             "HAS_EQ_IN_VAL=a=b=c".to_string(),
         ];
-        let args = build_attach_args(&env, "", "cmd");
+        let args = build_attach_args(&env, "", "cmd", None);
         assert_eq!(
             args,
             vec![
@@ -1239,7 +1347,7 @@ mod tests {
     fn build_attach_args_env_entries_without_equals_are_skipped() {
         // Malformed entry can't poison the whole attach call.
         let env = vec!["BADENTRY".to_string(), "OK=val".to_string()];
-        let args = build_attach_args(&env, "", "cmd");
+        let args = build_attach_args(&env, "", "cmd", None);
         assert_eq!(
             args,
             vec![
@@ -1264,7 +1372,7 @@ mod tests {
             "=val=more".to_string(),
             "OK=val".to_string(),
         ];
-        let args = build_attach_args(&env, "", "cmd");
+        let args = build_attach_args(&env, "", "cmd", None);
         assert_eq!(
             args,
             vec![
@@ -1280,7 +1388,7 @@ mod tests {
 
     #[test]
     fn build_attach_args_cwd_wraps_command_with_cd_prelude() {
-        let args = build_attach_args(&[], "/opt/work", "echo hi");
+        let args = build_attach_args(&[], "/opt/work", "echo hi", None);
         assert_eq!(
             args,
             vec![
@@ -1302,7 +1410,7 @@ mod tests {
         // pass through sh as `$1` verbatim — no escaping needed here.
         let cwd = "/tmp/has spaces & 'quotes' $vars `cmd`";
         let cmd = "printf '%s' \"$PWD\"";
-        let args = build_attach_args(&[], cwd, cmd);
+        let args = build_attach_args(&[], cwd, cmd, None);
 
         // cwd and command must appear verbatim as the last two argv entries.
         assert_eq!(args[args.len() - 2], cwd);
@@ -1316,7 +1424,7 @@ mod tests {
     #[test]
     fn build_attach_args_combines_env_and_cwd() {
         let env = vec!["FOO=bar".to_string()];
-        let args = build_attach_args(&env, "/work", "cmd");
+        let args = build_attach_args(&env, "/work", "cmd", None);
         assert_eq!(
             args,
             vec![
@@ -1340,7 +1448,7 @@ mod tests {
         // also has to land BEFORE the `--set-var` entries so lxc-attach
         // clears first, then applies user vars on top.
         let env = vec!["FOO=bar".to_string()];
-        let args = build_attach_args(&env, "", "cmd");
+        let args = build_attach_args(&env, "", "cmd", None);
         let clear_idx = args
             .iter()
             .position(|a| a == "--clear-env")
@@ -1361,7 +1469,7 @@ mod tests {
         // Backward-compat guarantee: empty env preserves the legacy
         // keep-env shape so existing call sites with no explicit env are
         // undisturbed.
-        let args = build_attach_args(&[], "", "echo hi");
+        let args = build_attach_args(&[], "", "echo hi", None);
         assert!(
             !args.iter().any(|a| a == "--clear-env"),
             "--clear-env must not appear when env is empty, got {:?}",
@@ -1376,7 +1484,7 @@ mod tests {
         // host env doesn't leak in through a back door. lxc-attach's own
         // baseline (HOME, PATH, USER, ...) keeps the child runnable.
         let env = vec!["BADENTRY".to_string(), "=alsobad".to_string()];
-        let args = build_attach_args(&env, "", "cmd");
+        let args = build_attach_args(&env, "", "cmd", None);
         assert_eq!(args, vec!["--clear-env", "--", "/bin/sh", "-c", "cmd"]);
     }
 
@@ -1391,7 +1499,7 @@ mod tests {
         // `MXC_TEST_FOO=HOST_LEAK_SHOULD_NOT_APPEAR` and asserts the
         // child sees the config's `MXC_TEST_FOO=bar baz`.
         let env = vec!["MXC_TEST_FOO=bar baz".to_string()];
-        let args = build_attach_args(&env, "", "cmd");
+        let args = build_attach_args(&env, "", "cmd", None);
         let clear_idx = args.iter().position(|a| a == "--clear-env").unwrap();
         let set_idx = args
             .iter()
@@ -1401,6 +1509,107 @@ mod tests {
             clear_idx < set_idx,
             "--clear-env must precede --set-var so caller value wins, got {:?}",
             args
+        );
+    }
+
+    #[test]
+    fn a_timed_exec_is_stamped_so_its_descendants_can_be_found() {
+        // The marker is the only handle a timeout has on work that outlived
+        // the attach.  Without it the reap has nothing to match.
+        let args = build_attach_args(&[], "", "sleep 99", Some("tok123"));
+        assert!(
+            args.iter().any(|a| a == "--set-var=MXC_EXEC_ID=tok123"),
+            "timed exec must carry the marker, got {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn stamping_a_marker_does_not_clear_an_untouched_environment() {
+        // `--clear-env` is the caller's choice, keyed on the caller's env.
+        // Reaping must not smuggle in a wipe of the container's own
+        // environment as a side effect.
+        let args = build_attach_args(&[], "", "sleep 99", Some("tok123"));
+        assert!(
+            !args.iter().any(|a| a == "--clear-env"),
+            "marker must not pull in --clear-env, got {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn the_marker_is_applied_after_the_environment_is_cleared() {
+        // Same ordering rule as the caller's own vars: a marker set before
+        // `--clear-env` would be wiped, leaving a timed exec unreapable.
+        let env = vec!["FOO=bar".to_string()];
+        let args = build_attach_args(&env, "", "cmd", Some("tok123"));
+        let clear_idx = args.iter().position(|a| a == "--clear-env").unwrap();
+        let marker_idx = args
+            .iter()
+            .position(|a| a == "--set-var=MXC_EXEC_ID=tok123")
+            .expect("marker should be present");
+        assert!(
+            clear_idx < marker_idx,
+            "--clear-env must precede the marker, got {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn an_untimed_exec_carries_no_marker() {
+        // Nothing can time out, so nothing needs reaping, and the argv stays
+        // exactly what it was before reaping existed.
+        let args = build_attach_args(&[], "", "echo hi", None);
+        assert!(
+            !args.iter().any(|a| a.contains("MXC_EXEC_ID")),
+            "untimed exec must not be stamped, got {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn the_reaper_matches_the_marker_of_exactly_one_exec() {
+        // Two concurrent execs in one container must not reap each other, so
+        // the argv has to carry the specific token and not just the var name.
+        let mine = build_reap_args("tok123");
+        let theirs = build_reap_args("tok456");
+        assert_eq!(mine.last().unwrap(), "MXC_EXEC_ID=tok123");
+        assert_eq!(theirs.last().unwrap(), "MXC_EXEC_ID=tok456");
+        assert_ne!(mine, theirs);
+    }
+
+    #[test]
+    fn the_reaper_never_splices_the_marker_into_its_script() {
+        // The token reaches the shell as `$1`.  Spliced in, a token bearing
+        // shell syntax would run as code inside the container.
+        let args = build_reap_args("t'; rm -rf /; #");
+        let script = args
+            .iter()
+            .find(|a| a.contains("kill -9"))
+            .expect("reap script should be present");
+        assert!(
+            !script.contains("rm -rf"),
+            "marker must not appear in the script body, got {:?}",
+            script
+        );
+        assert!(
+            script.contains("\"$1\""),
+            "script must read the marker positionally, got {:?}",
+            script
+        );
+    }
+
+    #[test]
+    fn the_reaper_reports_success_when_nothing_matched() {
+        // `kill` finding no targets is the normal case for a script that had
+        // already finished; a nonzero exit there would be read as a failed
+        // reap and reported to the caller as possibly-still-running work.
+        let args = build_reap_args("tok123");
+        let script = args.iter().find(|a| a.contains("kill -9")).unwrap();
+        assert!(
+            script.trim_end().ends_with("exit 0"),
+            "reap script must end with an unconditional success, got {:?}",
+            script
         );
     }
 }
