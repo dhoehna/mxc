@@ -241,14 +241,22 @@ impl StepKind {
     /// A spawn failure never reaches here — it is a real error by construction.
     fn stderr_means_absent(self, stderr: &str) -> bool {
         let s = stderr.to_ascii_lowercase();
+        // An absent chain is reported without the "no chain/target/match"
+        // phrasing.  iptables 1.8.10, nf_tables: "Chain 'X' does not exist";
+        // legacy: "Couldn't load target `X':No such file or directory".
+        let absent_chain = s.contains("does not exist") || s.contains("couldn't load target");
         match self {
-            // Deleting a jump rule that is not present in INPUT.
+            // The jump rule is absent because its target chain is gone, or
+            // because the chain remains with no INPUT reference left.
             StepKind::Unhook => {
                 s.contains("no chain/target/match by that name")
                     || s.contains("does a matching rule exist")
+                    || absent_chain
             }
             // Flushing or deleting a chain that does not exist.
-            StepKind::Flush | StepKind::Delete => s.contains("no chain/target/match by that name"),
+            StepKind::Flush | StepKind::Delete => {
+                s.contains("no chain/target/match by that name") || absent_chain
+            }
         }
     }
 }
@@ -2672,5 +2680,27 @@ mod tests {
             !StepKind::Flush.stderr_means_absent("does a matching rule exist in that chain?"),
             "a missing-rule message must not clear a chain flush/delete step"
         );
+    }
+
+    /// A fresh container has no MXCI chain, so the reset that precedes every
+    /// install must read an absent chain as benign.  Until it did, inbound
+    /// default-deny could not install on any `iptables-nft` host.  Strings
+    /// captured verbatim from iptables 1.8.10 under `LC_ALL=C`.
+    #[test]
+    fn absent_chain_messages_from_both_backends_are_recognized() {
+        let observed = [
+            "iptables v1.8.10 (nf_tables): Chain 'MXCI-CLI-LX-72gim3ftle7wtxye' does not exist",
+            "ip6tables v1.8.10 (nf_tables): Chain 'MXCI-CLI-LX-72gim3ftle7wtxye' does not exist",
+            "iptables v1.8.10 (legacy): Couldn't load target \
+             `MXCI-CLI-LX-72gim3ftle7wtxye':No such file or directory",
+        ];
+
+        for stderr in observed {
+            assert!(
+                StepKind::Unhook.stderr_means_absent(stderr),
+                "unhook must read {stderr:?} as an absent chain; misreading it aborts \
+                 every install on that host"
+            );
+        }
     }
 }
