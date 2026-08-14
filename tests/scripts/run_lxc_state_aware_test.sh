@@ -75,7 +75,12 @@ run_phase() {
     local req="$WORK_DIR/$phase.json"
 
     {
-        printf '{\n  "phase": "%s",\n  "containment": "lxc"' "$phase"
+        printf '{\n  "phase": "%s"' "$phase"
+        # The parser rejects a non-provision envelope that carries containment;
+        # the backend is fixed at provision and later phases route by sandboxId.
+        if [ "$phase" = "provision" ]; then
+            printf ',\n  "containment": "lxc"'
+        fi
         if [ -n "$sandbox_id" ]; then
             printf ',\n  "sandboxId": "%s"' "$sandbox_id"
         fi
