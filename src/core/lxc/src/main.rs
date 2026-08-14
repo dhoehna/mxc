@@ -98,9 +98,22 @@ fn delete_lxc_container(name: &str, logger: &mut Logger) -> bool {
 
     let container = LxcContainer::new(name, None);
 
-    if !container.is_defined() {
-        logger.log_line(&format!("Container '{}' does not exist.", name));
-        return false;
+    match container.is_defined() {
+        Ok(true) => {}
+        Ok(false) => {
+            logger.log_line(&format!("Container '{}' does not exist.", name));
+            return false;
+        }
+        Err(e) => {
+            // An unanswered probe is not an answer of "absent".  The caller
+            // asked for the container to be gone, so try the destroy and let
+            // its outcome be the report rather than leaving a container behind
+            // on the strength of a question we could not ask.
+            logger.log_line(&format!(
+                "Could not determine whether container '{}' exists ({}); attempting delete anyway.",
+                name, e
+            ));
+        }
     }
 
     match container.destroy() {
