@@ -79,9 +79,13 @@ pub fn resolve_default_lxcpath() -> String {
 /// with them.
 ///
 /// The marker rides on the environment, which every `fork`/`exec` inherits, so
-/// it reaches descendants at any depth.  A process that deliberately scrubs its
-/// own environment escapes; nothing short of a per-exec PID namespace covers
-/// that, and lxc-attach does not offer one.
+/// it reaches descendants at any depth.  But the environment belongs to the
+/// workload: anything that scrubs it escapes, so this cleans up after work that
+/// is not trying to escape and is not a boundary against work that is.
+/// `lxc-attach` joins the container's existing namespaces via `setns` and cannot
+/// create one, so a per-exec PID namespace would have to be unshared by the
+/// attached command itself — real, but a design that needs a live host to
+/// validate, so #871 carries it rather than this improvising one.
 ///
 /// The name is **reserved**: `build_attach_args` drops any caller-supplied
 /// entry that uses it, so a caller cannot set it to another exec's token and be
@@ -906,12 +910,19 @@ impl LxcContainer {
     /// The guarantee is exactly what the sentence above says and no more: this
     /// reaps processes *carrying the marker*, not every descendant of the exec.
     /// The marker is inherited across `fork`/`exec`, so it reaches descendants
-    /// at any depth — but a process that scrubs its own environment (`env -i`,
-    /// an explicit `unsetenv`) drops off the list and survives the reap.
-    /// Returning `Ok(())` therefore means every *marked* process was killed, not
-    /// that the container is quiet.  Closing that hole needs a per-exec PID
-    /// namespace, which `lxc-attach` does not offer; it is tracked separately
-    /// rather than worked around here.
+    /// at any depth — but the environment belongs to the workload, and a
+    /// workload that scrubs it (`env -i`, `env -u MXC_EXEC_ID`, an explicit
+    /// `unsetenv`) drops off the list and survives the reap.  Returning `Ok(())`
+    /// means every *marked* process was killed, not that the container is quiet.
+    ///
+    /// **This is hygiene, not containment.**  Contained code is untrusted, so a
+    /// handle the workload can erase is not a boundary against it — it only
+    /// cleans up after work that is not trying to escape, which is the case that
+    /// actually leaks into the next exec today.  A boundary needs kernel-owned
+    /// membership the workload cannot leave (a per-exec PID namespace or
+    /// cgroup); #871 carries that design and the host-dependent questions it
+    /// has to answer first, because a containment mechanism that silently fails
+    /// is worse than one documented not to be one.
     #[cfg(target_os = "linux")]
     pub(crate) fn reap_marked_processes(&self, marker: &str) -> Result<(), String> {
         let mut cmd = self.lxc_command("lxc-attach");
