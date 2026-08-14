@@ -1696,10 +1696,13 @@ raw-JSON caller that sends it is not rejected.
 > network policy only through iptables, so a policy carrying `allowedHosts` or
 > `blockedHosts` must set `enforcementMode` to `"firewall"` or `"both"`; under
 > `"capabilities"` (the default when the field is omitted) start fails rather than
-> silently leaving the container unfiltered. Start also fails if the container's
-> host-side veth cannot be discovered *in a firewall mode*, since the chain could not
-> then be scoped to the container. `allowLocalNetwork` and `removeRulesOnExit` are not
-> part of the LXC surface (see `LxcNetworkConfig`).
+> silently leaving the container unfiltered. In a firewall mode the veth is not
+> discovered after start: the name is derived from the container name and pinned to
+> `lxc.net.0.veth.pair` before start, so the chain is scoped before the interface
+> exists. Start fails instead when that pin cannot be trusted to cover the
+> container's traffic — when the config uses `lxc.include`, or declares anything
+> other than exactly one interface. `allowLocalNetwork` and `removeRulesOnExit` are
+> not part of the LXC surface (see `LxcNetworkConfig`).
 >
 > An explicit `defaultPolicy: "block"` now triggers the same rejection as
 > `allowedHosts`/`blockedHosts`: the parser records whether the field was present in

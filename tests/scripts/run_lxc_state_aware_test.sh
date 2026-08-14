@@ -20,10 +20,21 @@ LXC_EXEC="$REPO_DIR/src/target/release/lxc-exec"
 if [ ! -f "$LXC_EXEC" ]; then
     LXC_EXEC="$REPO_DIR/src/target/debug/lxc-exec"
 fi
-if [ ! -f "$LXC_EXEC" ]; then
-    echo "Error: lxc-exec not found. Run build.sh first."
-    exit 1
-fi
+
+# An honest skip for a missing prerequisite: exit 77 so run_lxc_all_tests.sh
+# records SKIPPED rather than FAILED. Without this the lifecycle runs anyway and
+# dies at provision on any host without LXC, which reads as a broken test rather
+# than an unmet prerequisite. The provision config asks for no network, so this
+# probes only root, the LXC runtime, and the binary.
+SKIP_EXIT=77
+skip() {
+    echo "SKIP: $1"
+    exit "$SKIP_EXIT"
+}
+
+[ "$(id -u)" -eq 0 ] || skip "requires root for LXC."
+command -v lxc-create >/dev/null 2>&1 || skip "LXC (lxc-create) is not installed."
+[ -f "$LXC_EXEC" ] || skip "lxc-exec binary not built; run build.sh first."
 
 WORK_DIR="$(mktemp -d)"
 SANDBOX_ID=""
@@ -149,9 +160,14 @@ check "stop exits 0" $?
 # --- deprovision -----------------------------------------------------------
 echo "=== deprovision ==="
 run_phase deprovision "$SANDBOX_ID"
-check "deprovision exits 0" $?
-# Claimed by this call; stop the trap from deprovisioning a second time.
-SANDBOX_ID=""
+DEPROVISION_RC=$?
+check "deprovision exits 0" "$DEPROVISION_RC"
+# Release the ID only once the container is actually gone. Clearing it after a
+# failed deprovision disarms the trap's retry, so the container the test could
+# not remove leaks into the next run.
+if [ "$DEPROVISION_RC" -eq 0 ]; then
+    SANDBOX_ID=""
+fi
 
 echo "================================"
 echo "Results: $PASSED passed, $FAILED failed"
