@@ -640,7 +640,8 @@ fn cleanup_network_authoritative(
     })
 }
 
-/// Advisory lock that makes the `start` phase one critical section per sandbox.
+/// Advisory lock that makes each state transition one critical section per
+/// sandbox.
 ///
 /// `start` reads whether the container is running and then, if it is not,
 /// writes filesystem policy, installs the firewall, and starts it.  Nothing
@@ -651,27 +652,42 @@ fn cleanup_network_authoritative(
 /// being reapplied to a live container — never fires.  The loser gets `Ok`,
 /// not the error the guard exists to produce.
 ///
-/// The lock file lives in the container's own directory, so it exists exactly
-/// when the sandbox does and `destroy` removes it along with everything else.
-/// `flock` is released by the kernel when the descriptor closes, so a start
-/// that dies mid-sequence frees it; an `O_EXCL` lock file would instead wedge
-/// every later start of that container name.
-struct StartLock {
+/// `stop` and `deprovision` have to take the same lock, because excluding only
+/// a second start leaves the worse race open: a concurrent stop reads "not
+/// running" in the window after a start installs its FORWARD chain and before
+/// `container.start()`, runs the authoritative network teardown, and removes
+/// the chain.  The start then brings the container up with no egress filter at
+/// all.  Teardown is only safely ordered against a running container if no
+/// start can be part-way through one.
+///
+/// `exec` deliberately stays out.  It installs and removes no host state, so it
+/// cannot produce that fail-open, and an exclusive lock there would serialize
+/// concurrent execs into one sandbox, which is a supported thing to do.
+///
+/// The lock file lives in the LXC root rather than in the container directory
+/// because `deprovision` destroys that directory: a lock file inside it would
+/// be unlinked while still held, and the next phase would create a fresh file
+/// and take a *different* lock, which is no lock at all.  Container names are
+/// validated for length and character set before they reach this, so the name
+/// cannot escape the root.  `flock` is released by the kernel when the
+/// descriptor closes, so a phase that dies mid-sequence frees it; an `O_EXCL`
+/// lock file would instead wedge every later phase of that container name.
+struct LifecycleLock {
     /// Held for its `Drop`, which is what releases the lock.
     #[cfg(target_os = "linux")]
     _guard: nix::fcntl::Flock<std::fs::File>,
 }
 
-impl StartLock {
-    /// Take the lock, waiting for any concurrent start of the same sandbox.
+impl LifecycleLock {
+    /// Take the lock, waiting for any concurrent transition of the same sandbox.
     ///
     /// Off Linux there is no LXC to serialize, so this is a no-op that exists
-    /// only so `start` reads the same on every target.
+    /// only so the phases read the same on every target.
     fn acquire(container: &LxcContainer, container_name: &str) -> Result<Self, MxcError> {
         #[cfg(target_os = "linux")]
         {
             let path = format!(
-                "{}/{}/.mxc-start.lock",
+                "{}/.mxc-lifecycle-{}.lock",
                 container.lxc_path(),
                 container_name
             );
@@ -682,23 +698,23 @@ impl StartLock {
                 .open(&path)
                 .map_err(|e| {
                     MxcError::backend_error(format!(
-                        "Failed to open the start lock for LXC container {container_name:?} at \
+                        "Failed to open the lifecycle lock for LXC container {container_name:?} at \
                          {path}: {e}"
                     ))
                 })?;
             let guard = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
                 .map_err(|(_, errno)| {
                     MxcError::backend_error(format!(
-                        "Failed to take the start lock for LXC container {container_name:?}: \
+                        "Failed to take the lifecycle lock for LXC container {container_name:?}: \
                          {errno}"
                     ))
                 })?;
-            Ok(StartLock { _guard: guard })
+            Ok(LifecycleLock { _guard: guard })
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (container, container_name);
-            Ok(StartLock {})
+            Ok(LifecycleLock {})
         }
     }
 }
@@ -761,6 +777,13 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
     ) -> Result<StartResult<()>, MxcError> {
         let container_name = extract_container_name(sandbox_id)?;
         let container = LxcContainer::new(container_name, None);
+        // Hold the sandbox still for the whole phase: the running/not-running
+        // decision below and the policy writes that depend on it have to be one
+        // critical section, or a second start slips past the `already_started`
+        // refusal and applies its policy to a container the first one is
+        // bringing up — and a concurrent stop tears this start's firewall back
+        // off between installing it and running the container.
+        let _lifecycle_lock = LifecycleLock::acquire(&container, container_name)?;
         if !container
             .is_defined()
             .map_err(|e| probe_failed("exists", container_name, e))?
@@ -770,11 +793,6 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
                 container_name
             )));
         }
-        // Hold the sandbox still: the running/not-running decision below and
-        // the policy writes that depend on it have to be one critical section,
-        // or a second start slips past the `already_started` refusal and
-        // applies its policy to a container the first one is bringing up.
-        let _start_lock = StartLock::acquire(&container, container_name)?;
         let mut logger = Logger::new(Mode::Buffer);
         if container
             .is_running()
@@ -936,6 +954,11 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         reject_start_policy_on_other_phase("stop", &request.policy)?;
 
         let container = LxcContainer::new(container_name, None);
+        // Same lock the start takes. Without it this teardown can observe a
+        // start's container as not running, strip the FORWARD chain that start
+        // just installed, and return before it calls `container.start()`,
+        // leaving a running container with no egress filtering.
+        let _lifecycle_lock = LifecycleLock::acquire(&container, container_name)?;
         if !container
             .is_defined()
             .map_err(|e| probe_failed("exists", container_name, e))?
@@ -977,6 +1000,11 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
 
         let mut logger = Logger::new(Mode::Buffer);
         let container = LxcContainer::new(container_name, None);
+        // Same lock the start takes, for the same reason as `stop`: this path
+        // also runs the authoritative network teardown, and must not do it
+        // while a start is between installing the firewall and running the
+        // container.
+        let _lifecycle_lock = LifecycleLock::acquire(&container, container_name)?;
         // Discover the veth before teardown while the container may still be
         // running; it disappears once destroyed, but iptables can still delete
         // a FORWARD rule that names it.
@@ -1359,35 +1387,66 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_start_lock_excludes_a_concurrent_start_and_releases_on_drop() {
-        // The lock is the whole of the fix for the check-then-act race, so
+    fn a_lifecycle_lock_excludes_a_concurrent_phase_and_releases_on_drop() {
+        // The lock is the whole of the fix for the check-then-act races, so
         // this asserts exclusion directly rather than racing two threads and
         // timing them: a second, non-blocking attempt must be refused while
         // the lock is held, and must succeed once it is dropped.
-        let dir = std::env::temp_dir().join(format!("mxc-start-lock-{}", mint_random_token()));
+        let dir = std::env::temp_dir().join(format!("mxc-lifecycle-lock-{}", mint_random_token()));
         let name = "locked";
         std::fs::create_dir_all(dir.join(name)).expect("container directory");
         let container = LxcContainer::new(name, Some(dir.to_str().expect("utf-8 temp dir")));
 
-        let held = StartLock::acquire(&container, name).expect("the first start takes the lock");
+        let held =
+            LifecycleLock::acquire(&container, name).expect("the first phase takes the lock");
 
-        let path = dir.join(name).join(".mxc-start.lock");
+        let path = dir.join(format!(".mxc-lifecycle-{name}.lock"));
         let probe = || {
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
-                .expect("the lock file the first start created");
+                .expect("the lock file the first phase created");
             nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
         };
 
         assert!(
             probe().is_err(),
-            "a second start must not enter the phase while the first holds the lock"
+            "a second phase must not enter while the first holds the lock"
         );
         drop(held);
         assert!(
             probe().is_ok(),
-            "the lock must be released when the start that took it returns"
+            "the lock must be released when the phase that took it returns"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lifecycle_lock_outlives_the_container_directory() {
+        // `deprovision` holds this lock across the destroy that removes the
+        // container directory. If the lock file lived in there it would be
+        // unlinked while held, and the next phase would create a fresh file and
+        // take a different lock — so the file has to sit in the LXC root and
+        // still be acquirable once the container is gone.
+        let dir = std::env::temp_dir().join(format!("mxc-lifecycle-gone-{}", mint_random_token()));
+        let name = "destroyed";
+        std::fs::create_dir_all(dir.join(name)).expect("container directory");
+        let container = LxcContainer::new(name, Some(dir.to_str().expect("utf-8 temp dir")));
+
+        let held =
+            LifecycleLock::acquire(&container, name).expect("the deprovision takes the lock");
+        std::fs::remove_dir_all(dir.join(name)).expect("the destroy removes the container");
+
+        assert!(
+            dir.join(format!(".mxc-lifecycle-{name}.lock")).exists(),
+            "the lock file must survive the container it guards"
+        );
+        drop(held);
+        assert!(
+            LifecycleLock::acquire(&container, name).is_ok(),
+            "a later phase must still be able to take the lock"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

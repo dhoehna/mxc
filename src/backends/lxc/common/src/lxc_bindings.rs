@@ -82,6 +82,10 @@ pub fn resolve_default_lxcpath() -> String {
 /// it reaches descendants at any depth.  A process that deliberately scrubs its
 /// own environment escapes; nothing short of a per-exec PID namespace covers
 /// that, and lxc-attach does not offer one.
+///
+/// The name is **reserved**: `build_attach_args` drops any caller-supplied
+/// entry that uses it, so a caller cannot set it to another exec's token and be
+/// reaped by that exec's timeout.
 #[cfg(any(target_os = "linux", test))]
 const EXEC_MARKER_VAR: &str = "MXC_EXEC_ID";
 
@@ -164,7 +168,13 @@ fn build_attach_args(
             // `"BADENTRY"` are both silently skipped; embedded `=` in
             // VAL is fine because split_once stops at the first one.
             if let Some((key, _)) = kv.split_once('=') {
-                if !key.is_empty() {
+                // `EXEC_MARKER_VAR` is reserved. Dropping a caller's copy is
+                // not just tidiness: the marker is what a timeout kills by, so
+                // a caller that set this name to another exec's token would be
+                // reaped by that exec. The drop is unconditional because a
+                // concurrent exec's timeout can reap this one even when this
+                // one carries no marker of its own.
+                if !key.is_empty() && key != EXEC_MARKER_VAR {
                     args.push(format!("--set-var={}", kv));
                 }
             }
@@ -1559,6 +1569,44 @@ mod tests {
             clear_idx < marker_idx,
             "--clear-env must precede the marker, got {:?}",
             args
+        );
+    }
+
+    #[test]
+    fn a_caller_cannot_supply_its_own_marker() {
+        // A caller that sets the reserved name could otherwise be reaped by
+        // whichever exec owns that token, so the entry is dropped whether or
+        // not this exec carries a marker of its own.
+        let env = vec!["MXC_EXEC_ID=stolen".to_string(), "KEEP=yes".to_string()];
+
+        let timed = build_attach_args(&env, "", "cmd", Some("mine"));
+        assert!(
+            timed.iter().any(|a| a == "--set-var=KEEP=yes"),
+            "unrelated caller vars must survive, got {:?}",
+            timed
+        );
+        assert!(
+            !timed.iter().any(|a| a == "--set-var=MXC_EXEC_ID=stolen"),
+            "the caller's marker must not reach the guest, got {:?}",
+            timed
+        );
+        assert_eq!(
+            timed
+                .iter()
+                .filter(|a| a.starts_with("--set-var=MXC_EXEC_ID="))
+                .count(),
+            1,
+            "exactly one marker must survive, got {:?}",
+            timed
+        );
+
+        let untimed = build_attach_args(&env, "", "cmd", None);
+        assert!(
+            !untimed
+                .iter()
+                .any(|a| a.starts_with("--set-var=MXC_EXEC_ID=")),
+            "an untimed exec must carry no marker at all, got {:?}",
+            untimed
         );
     }
 
