@@ -84,10 +84,13 @@ enum RollbackStep {
 /// removing the firewall first would leave a running container unfiltered with
 /// no process left to notice. Stopping first cannot produce that state.
 ///
-/// The one-shot path is the mirror. Its container is going away entirely, and
-/// `destroy` subsumes stopping it, so the only hazard is leaking host state
-/// that outlives the process -- which argues for removing the firewall while
-/// the name is still unambiguous, before the container is gone.
+/// The one-shot path runs the same invariant rather than the mirror of it. Its
+/// container is going away entirely and `destroy` subsumes stopping it, which
+/// once argued for removing the firewall first, while the name is still
+/// unambiguous. But `lxc-destroy` can fail, and that order would then have
+/// stripped the egress chain off a container that is still up. Destroy runs
+/// first and the firewall is removed only once it has succeeded, which is what
+/// the ordinary deprovision path already does.
 ///
 /// The inbound rules are different in kind. They live inside the container's
 /// own network namespace, reachable only by entering it through the init PID,
@@ -112,11 +115,15 @@ fn rollback_plan(rollback: SignalRollback, owns_firewall: bool) -> Vec<RollbackS
             }
         }
         SignalRollback::DestroyContainer => {
+            // Ingress first: those rules live inside the container's own netns,
+            // so a destroy would take the namespace away and leave nothing to
+            // enter. The firewall goes last, after the destroy has actually
+            // succeeded -- see `execute_rollback`.
+            plan.push(RollbackStep::RemoveIngress);
+            plan.push(RollbackStep::DestroyContainer);
             if owns_firewall {
                 plan.push(RollbackStep::RemoveFirewall);
             }
-            plan.push(RollbackStep::RemoveIngress);
-            plan.push(RollbackStep::DestroyContainer);
         }
     }
     plan
@@ -132,10 +139,12 @@ fn rollback_plan(rollback: SignalRollback, owns_firewall: bool) -> Vec<RollbackS
 /// ordering above exists to prevent. Ordering alone does not achieve that;
 /// `lxc-stop` can fail, and then the order it ran in no longer matters.
 ///
-/// Stopping is the only gate. A `DestroyContainer` plan has no stop step, so
-/// nothing in it is gated: `RemoveFirewall` and `RemoveIngress` both run ahead
-/// of `DestroyContainer`. That ordering assumes destroy succeeds -- see
-/// microsoft/mxc#856 for the case where it does not.
+/// A failed `DestroyContainer` abandons the rest for the same reason. The only
+/// step that follows it is `RemoveFirewall`, and a destroy that failed may well
+/// have left the container running, so continuing would unfilter it.
+/// `RemoveIngress` runs ahead of the destroy because it needs a namespace to
+/// enter, and it is deliberately not a gate: those rules die with the namespace
+/// either way, so a failure there cannot leave the container exposed.
 ///
 /// Bailing out leaks the chain rather than exposing the container, which is the
 /// same trade the ordinary stop path already makes deliberately: it propagates
@@ -145,7 +154,12 @@ fn rollback_plan(rollback: SignalRollback, owns_firewall: bool) -> Vec<RollbackS
 fn execute_rollback(plan: &[RollbackStep], run_step: &mut impl FnMut(RollbackStep) -> bool) {
     for &step in plan {
         let ok = run_step(step);
-        if !ok && step == RollbackStep::StopContainer {
+        if !ok
+            && matches!(
+                step,
+                RollbackStep::StopContainer | RollbackStep::DestroyContainer
+            )
+        {
             return;
         }
     }
@@ -448,20 +462,35 @@ mod tests {
     }
 
     #[test]
-    fn a_destroy_rollback_removes_the_firewall_even_though_nothing_stopped_first() {
-        // The gate is specific to a failed stop. Nothing precedes
-        // `RemoveFirewall` in a destroy plan, so it can never run behind a
-        // container that is still up, and a failed `destroy` has nothing after
-        // it to suppress. Gating on any failure at all would break this path.
+    fn a_destroy_that_succeeded_still_removes_the_firewall() {
+        // The negative control for the test below. The gate is specific to a
+        // step that actually failed; a rollback that never removed the firewall
+        // would leak the chain on every signal, so "always bail" must not pass.
+        let plan = rollback_plan(SignalRollback::DestroyContainer, true);
+        assert_eq!(
+            run_plan(&plan, &[]),
+            vec![
+                RollbackStep::RemoveIngress,
+                RollbackStep::DestroyContainer,
+                RollbackStep::RemoveFirewall
+            ],
+            "a destroy rollback must still remove the firewall it created"
+        );
+    }
+
+    #[test]
+    fn a_destroy_that_failed_does_not_unfilter_the_container_anyway() {
+        // A failed `lxc-destroy` may well have left the container running, so
+        // removing the firewall afterwards would strip egress filtering off a
+        // live container with no process left to notice -- the same fail-open
+        // the stop path already guards against. Ordering alone does not achieve
+        // this: destroy runs first precisely so that its failure is observable
+        // before anything unfilters the container.
         let plan = rollback_plan(SignalRollback::DestroyContainer, true);
         assert_eq!(
             run_plan(&plan, &[RollbackStep::DestroyContainer]),
-            vec![
-                RollbackStep::RemoveFirewall,
-                RollbackStep::RemoveIngress,
-                RollbackStep::DestroyContainer
-            ],
-            "a destroy rollback must still remove the firewall it created"
+            vec![RollbackStep::RemoveIngress, RollbackStep::DestroyContainer],
+            "a failed destroy must not be followed by removing the firewall"
         );
     }
 
@@ -509,17 +538,19 @@ mod tests {
     }
 
     #[test]
-    fn a_one_shot_rollback_removes_the_firewall_then_destroys_the_container() {
-        // The mirror case. This container is going away entirely and destroy
-        // subsumes stopping it, so the only hazard is host state outliving the
-        // process -- which argues for removing the chain while the name still
-        // unambiguously refers to this container.
+    fn a_one_shot_rollback_destroys_the_container_before_unfiltering_it() {
+        // This container is going away entirely and destroy subsumes stopping
+        // it, which once argued for removing the chain first, while the name
+        // still unambiguously referred to this container. But `lxc-destroy` can
+        // fail, and that order would then have unfiltered a container that is
+        // still running. Inbound goes first because it needs a namespace to
+        // enter, and the destroy is what takes that namespace away.
         assert_eq!(
             rollback_plan(SignalRollback::DestroyContainer, true),
             vec![
-                RollbackStep::RemoveFirewall,
                 RollbackStep::RemoveIngress,
-                RollbackStep::DestroyContainer
+                RollbackStep::DestroyContainer,
+                RollbackStep::RemoveFirewall
             ],
         );
 

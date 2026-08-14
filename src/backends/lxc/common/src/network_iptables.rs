@@ -1480,7 +1480,18 @@ impl NetworkIptablesManager {
         // A removal command can fail, and what survived is still ours. Clearing
         // the gate here regardless would strand it: Drop would then skip the
         // retry that is the last chance to remove it.
-        self.retain_residual_ownership(residual);
+        if self.retain_residual_ownership(residual) {
+            // Something survived. Answering `Ok` here told every caller the
+            // chain was gone while it was still filtering traffic -- stop and
+            // deprovision both reported success over a chain that outlived
+            // them and that blocks every later start. Ownership stays set, so
+            // Drop still gets its retry.
+            return Err(format!(
+                "failed to remove every iptables resource for chain {}; it is still installed, \
+                 and ownership is retained so the drop path can retry",
+                self.chain_name
+            ));
+        }
         Ok(())
     }
 
@@ -1556,13 +1567,13 @@ impl NetworkIptablesManager {
         container_name: &str,
         veth_interface: Option<&str>,
         logger: &mut Logger,
-    ) {
+    ) -> Result<(), String> {
         let mut mgr = Self::new(container_name);
         // Ask the host what is installed instead of asserting it, so a
         // container with nothing left issues no commands and logs no failures.
         let observed = Self::observe_existing(&mgr.chain_name);
         if observed.is_empty() {
-            return;
+            return Ok(());
         }
         if let Some(v) = veth_interface {
             mgr.set_veth_interface(v);
@@ -1571,7 +1582,20 @@ impl NetworkIptablesManager {
         // the start process and is long gone.
         mgr.rules_applied = true;
         mgr.created = observed;
-        let _ = mgr.remove_firewall_rules(logger);
+        let attempt = mgr.remove_firewall_rules(logger);
+
+        // The manager's `Drop` retries whatever survived the first pass, so the
+        // honest answer is what the host reports once that has run -- not what
+        // the first attempt returned. Reporting the first attempt would raise a
+        // false alarm every time the retry succeeded.
+        let chain_name = mgr.chain_name.clone();
+        drop(mgr);
+        if Self::observe_existing(&chain_name).is_empty() {
+            return Ok(());
+        }
+        Err(attempt.err().unwrap_or_else(|| {
+            format!("iptables state for chain {chain_name} survived authoritative cleanup")
+        }))
     }
 }
 
@@ -2057,6 +2081,43 @@ mod tests {
             fake.issued().is_empty(),
             "a chain whose -X succeeded is no longer ours to remove, got: {:?}",
             fake.issued()
+        );
+    }
+
+    #[test]
+    fn a_removal_that_left_the_chain_installed_says_so() {
+        // The residual was retained but never reported.  remove_firewall_rules
+        // answered Ok whether or not anything survived, so stop and
+        // deprovision told their callers the filtering was gone while the
+        // chain was still installed -- and still blocking the next start of
+        // that container name, which fails on a chain it did not create.
+        let fake = test_firewall::install();
+        fake.fail_every_command("iptables: permission denied");
+
+        let mut manager = NetworkIptablesManager::new("stranded");
+        manager.retain_residual_ownership(CreatedResources::for_test(true, false, false, false));
+
+        let mut logger = Logger::new(Mode::Buffer);
+        assert!(
+            manager.remove_firewall_rules(&mut logger).is_err(),
+            "a teardown that left the chain installed must not report success"
+        );
+    }
+
+    #[test]
+    fn a_removal_that_removed_everything_reports_success() {
+        // Negative control for the assertion above: the error has to come from
+        // the residual, not from every teardown.  Without this, returning Err
+        // unconditionally would satisfy the test above.
+        let _fake = test_firewall::install();
+
+        let mut manager = NetworkIptablesManager::new("departed");
+        manager.retain_residual_ownership(CreatedResources::for_test(true, false, false, false));
+
+        let mut logger = Logger::new(Mode::Buffer);
+        assert!(
+            manager.remove_firewall_rules(&mut logger).is_ok(),
+            "a teardown whose commands all succeeded must report success"
         );
     }
 

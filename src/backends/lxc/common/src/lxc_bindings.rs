@@ -198,6 +198,36 @@ fn parse_net_interface_config(config_contents: &str) -> NetInterfaceConfig {
     }
 }
 
+/// Read `lxc-info -s` output as "is this container running?".
+///
+/// Split out as a pure function so the three-way answer is testable without a
+/// container on the box.  Only a `State:` line answers the question; anything
+/// else is an error rather than `false`, because callers treat a stopped
+/// container as safe to unfilter and safe to skip stopping.  Guessing
+/// "stopped" from output we could not read is the one answer that turns a
+/// broken probe into an unfiltered running container.
+fn interpret_state_output(stdout: &str) -> Result<bool, String> {
+    for line in stdout.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim() == "State" {
+            return Ok(value.trim() == "RUNNING");
+        }
+    }
+    // No `State:` line. If the word shows up anyway, answer in the safe
+    // direction rather than give up: reporting "running" only ever costs a
+    // refused operation, whereas reporting "stopped" is what unfilters a live
+    // container.
+    if stdout.contains("RUNNING") {
+        return Ok(true);
+    }
+    Err(format!(
+        "lxc-info -s named no state, so whether the container is running is unknown (output: {:?})",
+        stdout.trim()
+    ))
+}
+
 /// Safe wrapper around an LXC container.
 pub struct LxcContainer {
     name: String,
@@ -258,19 +288,43 @@ impl LxcContainer {
         Ok(())
     }
 
-    /// Check if the container exists.
-    pub fn is_defined(&self) -> bool {
-        let output = self.lxc_command("lxc-info").output();
-        matches!(output, Ok(o) if o.status.success())
+    /// Whether the container exists.
+    ///
+    /// `Err` means the probe could not be run at all, which is not evidence of
+    /// absence.  Collapsing that into `false` reads "the probe broke" as "the
+    /// container is gone", which let deprovision skip the destroy and then
+    /// strip the firewall from a container that was still running.
+    ///
+    /// A nonzero exit *is* read as absence: that is how `lxc-info` reports a
+    /// container it does not know, and it is the only signal available short of
+    /// parsing its diagnostics.
+    pub fn is_defined(&self) -> Result<bool, String> {
+        let output = self
+            .lxc_command("lxc-info")
+            .output()
+            .map_err(|e| format!("failed to run lxc-info: {e}"))?;
+        Ok(output.status.success())
     }
 
-    /// Check if the container is running.
-    pub fn is_running(&self) -> bool {
-        let output = self.lxc_command("lxc-info").arg("-s").output();
-        match output {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).contains("RUNNING"),
-            Err(_) => false,
+    /// Whether the container is running.
+    ///
+    /// `Err` covers both a probe that could not run and one whose output names
+    /// no state we recognize.  Neither is evidence that the container is
+    /// stopped, and callers treat "stopped" as safe to unfilter or safe to
+    /// skip stopping -- so an unreadable probe must not answer `false`.
+    pub fn is_running(&self) -> Result<bool, String> {
+        let output = self
+            .lxc_command("lxc-info")
+            .arg("-s")
+            .output()
+            .map_err(|e| format!("failed to run lxc-info -s: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "lxc-info -s failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
+        interpret_state_output(&String::from_utf8_lossy(&output.stdout))
     }
 
     /// Return the PID of the container's init process, or `None` if the
@@ -910,6 +964,43 @@ mod tests {
         let net = parse_net_interface_config(config);
         assert_eq!(net.indices, vec![0]);
         assert!(!net.has_include);
+    }
+
+    #[test]
+    fn a_state_line_answers_whether_the_container_is_running() {
+        assert_eq!(
+            interpret_state_output("State:          RUNNING\n"),
+            Ok(true)
+        );
+        assert_eq!(
+            interpret_state_output("State:          STOPPED\n"),
+            Ok(false)
+        );
+        // Any other liblxc state is still an answer, and the answer is "not
+        // running".
+        assert_eq!(
+            interpret_state_output("State:          FROZEN\n"),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn output_that_names_no_state_is_unknown_rather_than_stopped() {
+        // The whole point of the three-way answer. Callers read "stopped" as
+        // safe to unfilter and safe to skip stopping, so inferring it from
+        // output we could not read is what turns a broken probe into an
+        // unfiltered running container.
+        assert!(interpret_state_output("").is_err());
+        assert!(interpret_state_output("Name:  box\n").is_err());
+    }
+
+    #[test]
+    fn an_unlabelled_running_is_still_read_as_running() {
+        // The negative control for the test above: unknown must not swallow a
+        // state we can plainly see. If the label ever changes, the failure has
+        // to land on the safe side -- a refused operation, never an unfiltered
+        // container.
+        assert_eq!(interpret_state_output("RUNNING\n"), Ok(true));
     }
 
     #[test]

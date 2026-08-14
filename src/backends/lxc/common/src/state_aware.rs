@@ -102,18 +102,68 @@ fn is_valid_container_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
-fn resolve_container_name(request: &ExecutionRequest) -> Result<String, MxcError> {
+/// Where a container name came from.
+///
+/// Provision has to tell the two apart.  A caller-supplied name that already
+/// exists is adopted on purpose, so provisioning the same named sandbox twice
+/// is idempotent.  A name MXC minted and that already exists is a collision:
+/// the token is 32 bits, so adopting it would silently hand the caller a
+/// container somebody else is already using.
+enum ContainerName {
+    Supplied(String),
+    Minted(String),
+}
+
+fn resolve_container_name(request: &ExecutionRequest) -> Result<ContainerName, MxcError> {
     if request.container_id.is_empty() {
-        return Ok(format!("mxc-{}", mint_random_token()));
+        return Ok(ContainerName::Minted(format!(
+            "mxc-{}",
+            mint_random_token()
+        )));
     }
     if is_valid_container_name(&request.container_id) {
-        Ok(request.container_id.clone())
+        Ok(ContainerName::Supplied(request.container_id.clone()))
     } else {
         Err(MxcError::malformed_request(format!(
             "containerId contains characters that are not valid for an LXC sandbox id: {:?}",
             request.container_id
         )))
     }
+}
+
+/// Number of names `mint_unused_container_name` will try before giving up.
+///
+/// The token is 32 bits, so a single collision is already unlikely and eight
+/// consecutive ones are not something a healthy host produces.  The bound
+/// exists so a host that answers "taken" for every name -- a stuck probe, or a
+/// `lxc-info` that reports every query as defined -- fails instead of looping.
+const NAME_MINT_ATTEMPTS: usize = 8;
+
+/// Re-mint until the name is free, rather than adopting whatever is there.
+///
+/// `is_taken` is injected so the decision can be tested without an LXC host.
+/// A probe that cannot answer propagates: "unknown" must not be read as
+/// "free", because that is how a collision becomes an adoption.
+///
+/// This narrows the collision window but does not close it -- another process
+/// can define the name between the probe and the create.  That is the safe
+/// direction: `create` fails on a name that now exists, so the caller gets an
+/// error rather than someone else's container.
+fn mint_unused_container_name(
+    first: String,
+    mut is_taken: impl FnMut(&str) -> Result<bool, MxcError>,
+) -> Result<String, MxcError> {
+    let mut candidate = first;
+    for _ in 0..NAME_MINT_ATTEMPTS {
+        if !is_taken(&candidate)? {
+            return Ok(candidate);
+        }
+        candidate = format!("mxc-{}", mint_random_token());
+    }
+    Err(MxcError::backend_error(format!(
+        "Could not mint an unused LXC container name in {NAME_MINT_ATTEMPTS} attempts; \
+         the last candidate {candidate:?} was already defined"
+    )))
 }
 
 fn validate_lxc_config(config: Option<&LxcConfig>) -> Result<(), MxcError> {
@@ -128,6 +178,19 @@ fn validate_lxc_config(config: Option<&LxcConfig>) -> Result<(), MxcError> {
         ));
     }
     Ok(())
+}
+
+/// Map a container state-probe failure onto a backend error.
+///
+/// Every phase asks whether the container exists or is running before deciding
+/// to create, start, stop, or unfilter it.  An unreadable answer is a backend
+/// failure, never a licence to assume whichever value is convenient -- assuming
+/// "gone" or "stopped" is what turns a broken probe into an unfiltered running
+/// container.
+fn probe_failed(question: &str, container_name: &str, detail: String) -> MxcError {
+    MxcError::backend_error(format!(
+        "Failed to determine whether LXC container {container_name:?} {question}: {detail}"
+    ))
 }
 
 fn has_filesystem_policy(policy: &ContainerPolicy) -> bool {
@@ -549,8 +612,8 @@ fn cleanup_network_owned(
     NetworkIptablesManager::force_cleanup(container_name, veth, created, logger);
 }
 
-/// Best-effort teardown of whatever iptables state exists for a container,
-/// whichever process installed it.
+/// Teardown of whatever iptables state exists for a container, whichever
+/// process installed it.
 ///
 /// For `stop` and `deprovision` only. They run in a different process from the
 /// `start` that created the chain, so they hold no ownership record and an
@@ -559,8 +622,85 @@ fn cleanup_network_owned(
 /// callers have already stopped or destroyed the container by this point, so
 /// nothing is left for the chain to protect. See
 /// `NetworkIptablesManager::force_cleanup_authoritative` for the full argument.
-fn cleanup_network_authoritative(container_name: &str, veth: Option<&str>, logger: &mut Logger) {
-    NetworkIptablesManager::force_cleanup_authoritative(container_name, veth, logger);
+///
+/// A failure is reported rather than swallowed. Discarding it made stop and
+/// deprovision answer success over a chain that survived them, which is the
+/// one outcome the caller has to know about: the stranded chain blocks every
+/// later start of that container name.
+fn cleanup_network_authoritative(
+    container_name: &str,
+    veth: Option<&str>,
+    logger: &mut Logger,
+) -> Result<(), MxcError> {
+    NetworkIptablesManager::force_cleanup_authoritative(container_name, veth, logger).map_err(|e| {
+        MxcError::backend_error(format!(
+            "Failed to remove the network filtering state for LXC container {container_name:?}; \
+             it is still installed and will block a later start: {e}"
+        ))
+    })
+}
+
+/// Advisory lock that makes the `start` phase one critical section per sandbox.
+///
+/// `start` reads whether the container is running and then, if it is not,
+/// writes filesystem policy, installs the firewall, and starts it.  Nothing
+/// held the container still in between, so two concurrent starts both read
+/// "not running" and both take the else arm.  Both then write policy: the
+/// container that comes up can be running behind the other start's mounts, and
+/// the `already_started` refusal — whose whole job is to stop start policy
+/// being reapplied to a live container — never fires.  The loser gets `Ok`,
+/// not the error the guard exists to produce.
+///
+/// The lock file lives in the container's own directory, so it exists exactly
+/// when the sandbox does and `destroy` removes it along with everything else.
+/// `flock` is released by the kernel when the descriptor closes, so a start
+/// that dies mid-sequence frees it; an `O_EXCL` lock file would instead wedge
+/// every later start of that container name.
+struct StartLock {
+    /// Held for its `Drop`, which is what releases the lock.
+    #[cfg(target_os = "linux")]
+    _guard: nix::fcntl::Flock<std::fs::File>,
+}
+
+impl StartLock {
+    /// Take the lock, waiting for any concurrent start of the same sandbox.
+    ///
+    /// Off Linux there is no LXC to serialize, so this is a no-op that exists
+    /// only so `start` reads the same on every target.
+    fn acquire(container: &LxcContainer, container_name: &str) -> Result<Self, MxcError> {
+        #[cfg(target_os = "linux")]
+        {
+            let path = format!(
+                "{}/{}/.mxc-start.lock",
+                container.lxc_path(),
+                container_name
+            );
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .map_err(|e| {
+                    MxcError::backend_error(format!(
+                        "Failed to open the start lock for LXC container {container_name:?} at \
+                         {path}: {e}"
+                    ))
+                })?;
+            let guard = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+                .map_err(|(_, errno)| {
+                    MxcError::backend_error(format!(
+                        "Failed to take the start lock for LXC container {container_name:?}: \
+                         {errno}"
+                    ))
+                })?;
+            Ok(StartLock { _guard: guard })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (container, container_name);
+            Ok(StartLock {})
+        }
+    }
 }
 
 impl StatefulSandboxBackend for LxcStateAwareRunner {
@@ -586,9 +726,18 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         reject_start_policy_on_other_phase("provision", &request.policy)?;
 
         let config = config.expect("validated above");
-        let container_name = resolve_container_name(request)?;
+        let container_name = match resolve_container_name(request)? {
+            ContainerName::Supplied(name) => name,
+            ContainerName::Minted(first) => mint_unused_container_name(first, |candidate| {
+                LxcContainer::new(candidate, None)
+                    .is_defined()
+                    .map_err(|e| probe_failed("exists", candidate, e))
+            })?,
+        };
         let container = LxcContainer::new(&container_name, None);
-        let created = !container.is_defined();
+        let created = !container
+            .is_defined()
+            .map_err(|e| probe_failed("exists", &container_name, e))?;
         if created {
             container
                 .create(&config.distribution, &config.release)
@@ -612,14 +761,25 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
     ) -> Result<StartResult<()>, MxcError> {
         let container_name = extract_container_name(sandbox_id)?;
         let container = LxcContainer::new(container_name, None);
-        if !container.is_defined() {
+        if !container
+            .is_defined()
+            .map_err(|e| probe_failed("exists", container_name, e))?
+        {
             return Err(MxcError::not_provisioned(format!(
                 "LXC container {:?} is not provisioned",
                 container_name
             )));
         }
+        // Hold the sandbox still: the running/not-running decision below and
+        // the policy writes that depend on it have to be one critical section,
+        // or a second start slips past the `already_started` refusal and
+        // applies its policy to a container the first one is bringing up.
+        let _start_lock = StartLock::acquire(&container, container_name)?;
         let mut logger = Logger::new(Mode::Buffer);
-        if container.is_running() {
+        if container
+            .is_running()
+            .map_err(|e| probe_failed("is running", container_name, e))?
+        {
             if has_filesystem_policy(&request.policy) || has_network_policy(&request.policy) {
                 return Err(MxcError::already_started(
                     "LXC container is already running; start policy cannot be reapplied",
@@ -701,13 +861,19 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         reject_start_policy_on_other_phase("exec", &request.policy)?;
 
         let container = LxcContainer::new(container_name, None);
-        if !container.is_defined() {
+        if !container
+            .is_defined()
+            .map_err(|e| probe_failed("exists", container_name, e))?
+        {
             return Err(MxcError::not_provisioned(format!(
                 "LXC container {:?} is not provisioned",
                 container_name
             )));
         }
-        if !container.is_running() {
+        if !container
+            .is_running()
+            .map_err(|e| probe_failed("is running", container_name, e))?
+        {
             return Err(MxcError::not_started(format!(
                 "LXC container {:?} is not started",
                 container_name
@@ -748,7 +914,10 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         reject_start_policy_on_other_phase("stop", &request.policy)?;
 
         let container = LxcContainer::new(container_name, None);
-        if !container.is_defined() {
+        if !container
+            .is_defined()
+            .map_err(|e| probe_failed("exists", container_name, e))?
+        {
             return Err(MxcError::not_provisioned(format!(
                 "LXC container {:?} is not provisioned",
                 container_name
@@ -763,12 +932,15 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         // the stop fails, propagate the error and leave the rules in place
         // rather than exposing a still-running container.
         let veth = NetworkIptablesManager::discover_veth_interface(container_name);
-        if container.is_running() {
+        if container
+            .is_running()
+            .map_err(|e| probe_failed("is running", container_name, e))?
+        {
             container
                 .stop()
                 .map_err(|e| MxcError::backend_error(format!("Failed to stop container: {e}")))?;
         }
-        cleanup_network_authoritative(container_name, veth.as_deref(), &mut logger);
+        cleanup_network_authoritative(container_name, veth.as_deref(), &mut logger)?;
         Ok(StopResult { metadata: None })
     }
 
@@ -787,7 +959,15 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         // running; it disappears once destroyed, but iptables can still delete
         // a FORWARD rule that names it.
         let veth = NetworkIptablesManager::discover_veth_interface(container_name);
-        if container.is_defined() {
+        // A probe that could not answer must not be read as "already gone".
+        // Skipping the destroy and then running the authoritative network
+        // teardown below would strip filtering from a container that is still
+        // running, which is the fail-open this ordering exists to prevent. The
+        // `?` leaves the rules in place and lets the caller retry.
+        if container
+            .is_defined()
+            .map_err(|e| probe_failed("exists", container_name, e))?
+        {
             // `destroy` force-stops and removes the container, so once it
             // returns no container process can run. Destroy *before* removing
             // the firewall rules so nothing runs without egress filtering
@@ -796,7 +976,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
                 MxcError::backend_error(format!("Failed to destroy container: {e}"))
             })?;
         }
-        cleanup_network_authoritative(container_name, veth.as_deref(), &mut logger);
+        cleanup_network_authoritative(container_name, veth.as_deref(), &mut logger)?;
         Ok(DeprovisionResult { metadata: None })
     }
 
@@ -1081,12 +1261,114 @@ mod tests {
         // firewall chain derived from it stays within the netfilter length bound
         // and is collision-resistant (a deterministic hash of the full name is
         // folded in; the mapping is not injective, only hard to collide).
-        let name = resolve_container_name(&ExecutionRequest::default()).unwrap();
+        let ContainerName::Minted(name) = resolve_container_name(&ExecutionRequest::default())
+            .expect("a default request carries an empty containerId")
+        else {
+            panic!("an empty containerId must mint a name rather than adopt one");
+        };
         assert!(
             is_valid_container_name(&name),
             "generated name {name:?} is invalid"
         );
         assert!(name.len() <= MAX_CONTAINER_NAME_LEN);
+    }
+
+    #[test]
+    fn a_minted_name_nobody_holds_is_the_one_used() {
+        let chosen =
+            mint_unused_container_name("mxc-first".to_string(), |_| Ok(false)).expect("free");
+        assert_eq!(
+            chosen, "mxc-first",
+            "a name that is free must be used as minted"
+        );
+    }
+
+    #[test]
+    fn a_minted_name_that_collides_is_re_minted_rather_than_adopted() {
+        // provision computed `created = !is_defined()` and skipped the create
+        // when the name was taken, so a collision on a 32-bit token silently
+        // handed the caller a container that was already in use.  Minting is
+        // the phase that has to resolve it: by start the name is all that is
+        // left, and a caller-supplied name is adopted on purpose.
+        let mut probes = 0;
+        let chosen = mint_unused_container_name("mxc-taken".to_string(), |_| {
+            probes += 1;
+            Ok(probes == 1)
+        })
+        .expect("a free name after one collision");
+
+        assert_ne!(
+            chosen, "mxc-taken",
+            "a name that is already defined must not be adopted"
+        );
+        assert!(
+            is_valid_container_name(&chosen),
+            "the re-minted name {chosen:?} must still be a valid container name"
+        );
+        assert!(chosen.len() <= MAX_CONTAINER_NAME_LEN);
+    }
+
+    #[test]
+    fn a_host_that_holds_every_name_is_an_error_not_an_adoption() {
+        let err = mint_unused_container_name("mxc-taken".to_string(), |_| Ok(true))
+            .expect_err("every candidate was taken");
+        assert!(
+            err.message.contains("Could not mint an unused"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_probe_that_cannot_answer_is_not_read_as_free() {
+        // The whole point of the retry is that "taken" is detected.  A probe
+        // that fails and is treated as "free" reinstates the adoption this
+        // guards against, so the failure has to propagate.
+        let err = mint_unused_container_name("mxc-unknown".to_string(), |_| {
+            Err(MxcError::backend_error("lxc-info could not be run"))
+        })
+        .expect_err("the probe failed");
+        assert!(
+            err.message.contains("lxc-info could not be run"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_start_lock_excludes_a_concurrent_start_and_releases_on_drop() {
+        // The lock is the whole of the fix for the check-then-act race, so
+        // this asserts exclusion directly rather than racing two threads and
+        // timing them: a second, non-blocking attempt must be refused while
+        // the lock is held, and must succeed once it is dropped.
+        let dir = std::env::temp_dir().join(format!("mxc-start-lock-{}", mint_random_token()));
+        let name = "locked";
+        std::fs::create_dir_all(dir.join(name)).expect("container directory");
+        let container = LxcContainer::new(name, Some(dir.to_str().expect("utf-8 temp dir")));
+
+        let held = StartLock::acquire(&container, name).expect("the first start takes the lock");
+
+        let path = dir.join(name).join(".mxc-start.lock");
+        let probe = || {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("the lock file the first start created");
+            nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        };
+
+        assert!(
+            probe().is_err(),
+            "a second start must not enter the phase while the first holds the lock"
+        );
+        drop(held);
+        assert!(
+            probe().is_ok(),
+            "the lock must be released when the start that took it returns"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

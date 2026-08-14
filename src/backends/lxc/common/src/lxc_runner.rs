@@ -157,8 +157,19 @@ impl LxcScriptRunner {
         let container = LxcContainer::new(&container_name, None);
         let mut container_created = false;
 
-        // Create the container if it doesn't exist
-        if !container.is_defined() {
+        // Create the container if it doesn't exist. A probe that could not run
+        // is not evidence of absence, so it aborts rather than creating a
+        // second container over a first one we simply failed to see.
+        let defined = match container.is_defined() {
+            Ok(defined) => defined,
+            Err(e) => {
+                return ScriptResponse::error(&format!(
+                    "Failed to determine whether the container exists: {}",
+                    e
+                ));
+            }
+        };
+        if !defined {
             let _ = writeln!(logger, "Creating LXC container...");
             if let Err(e) = container.create(&self.config.distribution, &self.config.release) {
                 return ScriptResponse::error(&format!("Failed to create container: {}", e));
@@ -179,8 +190,22 @@ impl LxcScriptRunner {
             return ScriptResponse::error(&format!("Failed to configure filesystem: {}", e));
         }
 
-        // Ensure the container is running so that the veth interface exists
-        if !container.is_running() {
+        // Ensure the container is running so that the veth interface exists. An
+        // unreadable probe aborts: starting a container that is already running
+        // is not harmless here, and neither is proceeding as though it were up.
+        let running = match container.is_running() {
+            Ok(running) => running,
+            Err(e) => {
+                if self.destroy_on_exit || container_created {
+                    let _ = container.destroy();
+                }
+                return ScriptResponse::error(&format!(
+                    "Failed to determine whether the container is running: {}",
+                    e
+                ));
+            }
+        };
+        if !running {
             let _ = writeln!(logger, "Starting LXC container...");
             if let Err(e) = container.start() {
                 if self.destroy_on_exit || container_created {
