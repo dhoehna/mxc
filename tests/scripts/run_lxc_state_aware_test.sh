@@ -35,8 +35,10 @@ CLEANED_UP=0
 # signal. A leaked container outlives the test run and breaks the next one, so
 # this is best-effort and deliberately ignores its own exit status.
 #
-# A signal fires this trap and then the shell exits, firing the EXIT trap as
-# well, so the guard makes the deprovision run at most once rather than twice.
+# Bash resumes the script after an INT or TERM handler returns, so those two
+# need handlers that clean up and then exit rather than letting the run carry
+# on with the work directory already gone. Each exit fires the EXIT trap as
+# well, so the guard keeps the deprovision to one run rather than two.
 cleanup() {
     if [ "$CLEANED_UP" -ne 0 ]; then
         return
@@ -48,7 +50,9 @@ cleanup() {
     fi
     rm -rf "$WORK_DIR"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # Emit a state-aware request for $1 (phase) with sandboxId $2, plus any extra
 # JSON members in $3, then run it. Envelope goes to stdout, diagnostics to

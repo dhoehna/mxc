@@ -1708,8 +1708,11 @@ raw-JSON caller that sends it is not rejected.
 > `"capabilities"` (the default `enforcementMode`), start therefore fails rather than
 > let the container run believing it is default-deny when no iptables rule enforces it
 > (`state_aware.rs: requires_firewall_enforcement`, `validate_start`).  A start that
-> supplies no `network.defaultPolicy`, or supplies `defaultPolicy: "allow"`, does not
-> set the presence bit and is unaffected.  To start a default-deny container, set
+> supplies no `network.defaultPolicy` does not set the presence bit.  An explicit
+> `defaultPolicy: "allow"` does set it, because the parser records every value the
+> wire request carried, but a permissive default needs no iptables rule to be honest
+> and so does not require firewall enforcement either way.  To start a default-deny
+> container, set
 > `enforcementMode` to `"firewall"` or `"both"`.
 
 - **Compile-time enforcement at the SDK.** Each per-(backend, phase) Config (§6.1)

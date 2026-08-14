@@ -173,7 +173,7 @@ export interface LxcStartConfig {
   version?: string;
   /** Filesystem mounts to apply before starting the container. */
   filesystem?: FilesystemConfig;
-  /** iptables policy to apply after the container starts. `proxy` is not supported by this backend. */
+  /** iptables policy to install before the container starts. `proxy` is not supported by this backend. */
   network?: LxcNetworkConfig;
 }
 
