@@ -1076,8 +1076,18 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         sandbox_id: &str,
         request: &ExecutionRequest,
         _config: Option<()>,
-        _consumer: ExecConsumer,
+        consumer: ExecConsumer,
     ) -> Result<ExecHandle, MxcError> {
+        // Before any work: `attach_run` relays to this process's stdio and
+        // returns no pipes, so it cannot serve an in-process caller. Refusing
+        // after running it would make the refusal describe output that has
+        // already gone somewhere the caller never asked for.
+        if consumer == ExecConsumer::Library {
+            return Err(wxc_common::state_aware_backend::unsupported_library_exec(
+                "LXC",
+            ));
+        }
+
         let container_name = extract_container_name(sandbox_id)?;
         reject_start_policy_on_other_phase("exec", &request.policy)?;
 
@@ -1475,6 +1485,32 @@ mod tests {
         assert_eq!(
             <LxcStateAwareRunner as StatefulSandboxBackend>::ID_PREFIX,
             "lxc"
+        );
+    }
+
+    /// A `Library` exec is refused before the sandbox id is even parsed.
+    ///
+    /// `attach_run` relays the workload's output to this process's stdio and
+    /// returns no pipes, so this backend cannot serve an in-process caller. The
+    /// refusal has to precede any work, and this id would otherwise fail as
+    /// `MalformedId` first — so any error but the refusal means the consumer
+    /// check came too late.
+    #[test]
+    fn a_library_exec_is_refused_before_the_workload_runs() {
+        let mut runner = LxcStateAwareRunner;
+        let err = runner
+            .exec(
+                "not-a-valid-sandbox-id",
+                &ExecutionRequest::default(),
+                None,
+                ExecConsumer::Library,
+            )
+            .expect_err("an in-process caller must be refused");
+        assert!(
+            err.message
+                .contains("does not support exec for an in-process caller"),
+            "expected the shared refusal ahead of the id check, got: {}",
+            err.message
         );
     }
 
