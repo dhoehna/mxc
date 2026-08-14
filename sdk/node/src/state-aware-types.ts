@@ -117,8 +117,11 @@ export interface LxcProvisionConfig {
  * - `removeRulesOnExit` is an SDK-only field emitted inside the top-level
  *   `network` object. Rust's `wire::Network` is `deny_unknown_fields`, so
  *   sending it fails the whole request.
- * - `allowLocalNetwork` deserializes, but the LXC backend never translates it
- *   into an iptables rule, so it would be silently ignored.
+ * - `allowLocalNetwork` deserializes, but start rejects it with a
+ *   policy-validation error whatever the enforcement mode
+ *   (`src/backends/lxc/common/src/state_aware.rs:322`). The container's
+ *   inbound chain can only open a source range, and opening every source is
+ *   broader than the local-network access requested.
  * - `enforcementMode` is restricted to the firewall modes. LXC has no
  *   capability-based network enforcement, so `'capabilities'` cannot enforce
  *   anything; start rejects it when the policy carries any restriction.
