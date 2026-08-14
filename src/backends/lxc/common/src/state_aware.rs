@@ -19,8 +19,8 @@ use wxc_common::models::{
 };
 use wxc_common::mxc_error::MxcError;
 use wxc_common::state_aware_backend::{
-    null_pipe_handle, DeprovisionResult, ExecConsumer, ExecHandle, ProvisionResult, StartResult,
-    StatefulSandboxBackend, StopResult,
+    null_pipe_handle, DeprovisionResult, ExecConsumer, ExecHandle, ExecOutcome, ProvisionResult,
+    StartResult, StatefulSandboxBackend, StopResult,
 };
 
 use crate::filesystem_mounts;
@@ -1113,10 +1113,14 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         // inherited by the next exec.
         let marker = mint_exec_marker();
         signal_cleanup::set_active_exec(container_name, &marker);
+        // Cleared unconditionally: an empty env would otherwise leave
+        // `lxc-attach` in keep-env mode, inheriting this process's environment
+        // and the credentials in it.
         let outcome = container.attach_run(
             &request.script_code,
             &request.working_directory,
             &request.env,
+            true,
             timeout,
             Some(&marker),
         );
@@ -1130,8 +1134,8 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             stdout: null_pipe_handle(),
             stderr: null_pipe_handle(),
             stdin: null_pipe_handle(),
-            waiter: Box::new(move || Ok(exit_code)),
-            terminator: Box::new(|| {}),
+            waiter: Box::new(move || Ok(ExecOutcome::Exited(exit_code))),
+            terminator: Box::new(|| Ok(())),
         })
     }
 

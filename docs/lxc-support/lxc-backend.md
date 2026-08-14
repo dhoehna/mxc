@@ -111,6 +111,8 @@ Filesystem policies are enforced via bind mounts in the container configuration:
 
 Network policy has two independent halves: outbound (egress) filtering on the host, described first, and inbound (ingress) filtering inside the container, described under [Inbound (ingress) policy](#inbound-ingress-policy).
 
+Both halves require `enforcementMode` to be `firewall` or `both`.  Under the default `capabilities` mode, MXC installs no iptables rules at all, so `defaultPolicy`, `allowedHosts`, and `blockedHosts` are parsed but never take effect.
+
 Outbound policies are enforced with parallel `iptables` and `ip6tables` chains scoped to the container's virtual ethernet (veth) interface:
 
 | Policy | Implementation |
@@ -118,9 +120,56 @@ Outbound policies are enforced with parallel `iptables` and `ip6tables` chains s
 | `defaultPolicy: "block"` | Final DROP rule in the container chain |
 | `defaultPolicy: "allow"` | Final ACCEPT rule in the container chain |
 | `allowedHosts` | ACCEPT rules for IP literals, CIDR blocks, or resolved hostnames |
-| `blockedHosts` | DROP rules for IP literals, CIDR blocks, or resolved hostnames |
+| `blockedHosts` | DROP rules for IP literals, CIDR blocks, or resolved hostnames, emitted *before* the ACCEPT rules |
 
-`allowedHosts` and `blockedHosts` entries may be bare IPv4/IPv6 literals, IPv4/IPv6 CIDR blocks, or hostnames. Hostnames are resolved to both A and AAAA records; IPv4 destinations are applied to the `iptables` chain and IPv6 destinations are applied to the `ip6tables` chain. Entries whose CIDR prefix is out of range for its family (or otherwise malformed) are reported as unresolved and skipped, leaving the rest of the policy in force. Host-list rules match all ports and protocols; port- and protocol-specific egress rules are not supported.
+**A deny wins over an overlapping allow.** `iptables` evaluates a chain top to
+bottom and stops at the first match, so precedence is decided purely by
+emission order. All `blockedHosts` rules are emitted ahead of all
+`allowedHosts` rules, which means a destination named by both lists is dropped.
+Without that ordering an allow entry broad enough to cover a blocked
+destination — `0.0.0.0/0`, or a CIDR containing the blocked address — silently
+defeats the block, and the resulting chain looks fully populated while
+filtering nothing.
+
+Three limits on that guarantee are worth stating plainly, because "deny always
+wins" is not true without them:
+
+- **An already-established flow is exempt.** The base chain accepts
+  `ESTABLISHED,RELATED` unconditionally and is installed ahead of the generated
+  policy rules. A flow that conntrack already knows keeps matching that rule
+  rather than its `blockedHosts` DROP, so the guarantee covers flows opened
+  after the chain exists — not one opened during the window between container
+  start and rule application, nor one surviving in the host's conntrack table
+  from an earlier run of a container with the same name.
+- **DNS is exempt.** The base chain accepts UDP and TCP destination port 53
+  unconditionally and is installed ahead of the generated policy rules, so
+  port-53 traffic to a blocked destination is accepted before its DROP rule is
+  reached. Narrowing that rule needs to know which resolver addresses are
+  legitimate, and no schema field carries them today.
+- **A hostname in both lists is resolved twice.** Each list entry is resolved
+  independently, so a name behind round-robin DNS can return one address for
+  the `blockedHosts` entry and a different one for the `allowedHosts` entry.
+  The guarantee holds for *addresses*, not for names. Use literal IPs or CIDRs
+  when a destination must be denied deterministically.
+
+`allowedHosts` and `blockedHosts` entries may be bare IPv4/IPv6 literals, IPv4/IPv6 CIDR blocks, or hostnames. Hostnames are resolved to both A and AAAA records; IPv4 destinations are applied to the `iptables` chain and IPv6 destinations are applied to the `ip6tables` chain. Host-list rules match all ports and protocols; port- and protocol-specific egress rules are not supported.
+
+An entry that resolves to nothing — an unknown hostname, or a CIDR prefix out
+of range for its family — cannot be turned into a rule. What that costs
+depends on the entry and on `defaultPolicy`:
+
+| Entry | `defaultPolicy` | Behavior |
+|-------|-----------------|----------|
+| `allowedHosts` | either | Reported as unresolved and skipped. Failing to write an ACCEPT rule can only make the policy more restrictive |
+| `blockedHosts` | `block` | Reported as unresolved and skipped. The closing DROP already denies the destination, so the unwritten rule was redundant |
+| `blockedHosts` | `allow` | **Fails firewall setup.** The chain ends in ACCEPT, so the unwritten DROP was the only thing that would have denied that destination, and skipping it silently converts a deny into an allow |
+
+One gap remains open and is not detected: under `defaultPolicy: "block"`, an
+`allowedHosts` entry broad enough to cover a destination whose `blockedHosts`
+rule went unwritten still reaches that destination. Detecting it would require
+the address the failed entry was *meant* to resolve to, which is by definition
+unavailable, so no check over the policy text can be complete — and a partial
+check would imply a guarantee this code cannot make.
 
 Before programming the IPv6 chain, MXC probes `ip6tables` with a read-only `ip6tables -S` and classifies the result three ways:
 
@@ -132,7 +181,40 @@ Before programming the IPv6 chain, MXC probes `ip6tables` with a read-only `ip6t
 
 Host IPv6 activity is read from `/proc/net/if_inet6`: a non-loopback interface with an IPv6 address counts as active, while loopback-only `::1` on `lo` (present even on IPv4-only hosts) does not. If that file cannot be read at all — as opposed to being absent, which means IPv6 is disabled — the state is treated as *unknown* rather than as a confirmed "IPv6 is off", so an unreadable IPv6 state fails closed instead of leaving IPv6 unfiltered.
 
-The chains are hooked into `FORWARD` for container egress by matching the host-side veth as the input interface. If MXC cannot discover the container veth, it skips the `FORWARD` hook with a warning rather than applying host-wide rules.
+The chains are hooked into `FORWARD` for container egress with **up to two
+rules per family**, because the input interface `FORWARD` sees depends on how
+the veth is attached:
+
+| Attachment | Rule that matches |
+|------------|-------------------|
+| veth routed directly by the host | `-i <veth>` |
+| veth attached to a bridge (the default LXC topology) | `-m physdev --physdev-in <veth>` |
+
+The two are mutually exclusive for any given packet, so nothing is counted
+twice. Installing only `-i <veth>` is what previously let a fully populated
+deny-all chain sit in the ruleset filtering nothing on the default bridged
+topology.
+
+The `physdev` rule is required only on a bridged veth. On a directly routed
+veth a host whose kernel lacks the `physdev` match logs a warning and
+continues with the interface rule alone, which is the rule that matches there;
+on a bridged veth the same failure is fatal, because `physdev` is the only
+rule that could ever match.
+
+A bridged veth additionally requires `br_netfilter` to be delivering bridged
+packets to iptables. With `/proc/sys/net/bridge/bridge-nf-call-iptables` absent
+or `0`, both hook rules install cleanly and neither ever fires. MXC reads that
+file and **fails firewall setup** rather than reporting success for a chain
+that could never be reached. When the IPv6 chain is programmed,
+`/proc/sys/net/bridge/bridge-nf-call-ip6tables` is checked separately and to
+the same standard.
+
+If MXC cannot discover the container veth at all, firewall setup **fails** and
+the partially created chains are rolled back. An unhooked chain is never
+traversed, so reporting success would hand the caller a deny-all chain that
+filters nothing — strictly worse than no firewall, because it looks enforced.
+Installing the rules host-wide instead is not an option either: unscoped, they
+would apply to every container and to the host's own traffic.
 
 Egress firewall state is torn down automatically with best-effort removal of the `FORWARD` hooks and both per-container chains; there is no egress network-policy opt-out field, and `preservePolicy` does not currently keep the egress chains alive. Setup failures after partial creation are rolled back before returning an error, so retries do not trip over leftover chains.
 
@@ -160,6 +242,67 @@ Inbound rules are installed after the container starts and after egress setup co
 Inbound default-deny is not a containment boundary against the sandboxed workload. Because the chain lives in the container's own network namespace, the workload can reach it: MXC creates containers from the stock `lxc-create -t download` template and never sets `lxc.cap.drop` or `lxc.cap.keep`, so LXC's defaults apply — the shared default drops only `mac_admin`, `mac_override`, `sys_time`, `sys_module`, and `sys_rawio`, and an unprivileged user-namespace container starts with a full capability set. `lxc-attach` is invoked without `-u` or `-g`, so the workload runs as container root and holds `CAP_NET_ADMIN` in the namespace the chain lives in, where it can flush or delete it. The egress chains are not exposed this way: they sit on the host and hook into `FORWARD` by the container's host-side veth, out of the workload's reach. The asymmetry follows from where each chain is installed. Inbound default-deny therefore closes off external reachability — including for services the workload itself starts — for any workload that does not deliberately tear it down, and does not survive one that does. Making inbound enforcement tamper-proof is tracked in issue #854.
 
 Unlike egress, the inbound chain honors the lifecycle's `preservePolicy`: when it is set *and* installation succeeded, the chain is deliberately left in place after the run for inspection. A partially installed chain from a failed run is always torn down regardless of the setting.
+
+### Cooperative proxy
+
+`network.proxy` puts the container in a "deny all except the proxy" posture:
+egress is restricted to the proxy endpoint, and `HTTP_PROXY`/`HTTPS_PROXY` are
+injected so a cooperating client uses it. The env vars are the routing hint;
+the firewall is the enforcement, so an application that ignores them cannot
+reach the internet directly.
+
+The chain is hooked into `FORWARD`, so what it governs is traffic the host
+*routes* on the container's behalf. Traffic addressed to the bridge gateway
+itself — where LXC's `dnsmasq` listens, and where a host-local proxy would run
+— is delivered locally and traverses `INPUT`, which this chain does not hook.
+Closing that path needs an INPUT hook and is tracked separately, so "reaches
+nothing" is accurate for forwarded egress and not for host-local destinations.
+
+Only the `{ "url": "http://proxy.example:8080" }` form is accepted. The LXC
+container has its own network namespace, so `{ "localhost": <port> }` names the
+*container's* loopback rather than the host's — the injected proxy would be
+unreachable and the firewall rule would never match. `{ "builtinTestServer":
+true }` is rejected for the same reason, as is a `url` whose host is a loopback
+literal.
+
+Two further constraints are enforced at parse time, both rejections rather than
+silent corrections:
+
+- **`enforcementMode` must be `firewall` or `both`.** Under the default
+  `capabilities` mode no iptables rules are installed, so the proxy env vars
+  would be injected while direct egress stayed open — a config that reads as
+  deny-all-except-proxy and enforces neither half. MXC refuses it rather than
+  auto-promoting the mode, so a stated enforcement level is never silently
+  rewritten.
+- **The `url` must not carry credentials.** LXC passes the proxy URL to
+  `lxc-attach` as a `--set-var` argument, and process arguments are
+  world-readable through `/proc/<pid>/cmdline`, so inline `user:pass@` would be
+  visible to every local user for the lifetime of the command. Supply the
+  credentials to the proxy itself instead.
+
+The chain a proxied container gets differs from the ordinary one in four ways,
+each of which would otherwise be a hole in the posture:
+
+| Ordinary chain | Proxied chain | Why |
+|----------------|---------------|-----|
+| Terminal rule follows `defaultPolicy` | Terminal rule is always DROP | An ACCEPT terminal would make the proxy rule above it meaningless |
+| Accepts UDP/TCP port 53 | No DNS rule | An unscoped port-53 accept is a standing DNS-tunnel exfil path through a deny-all posture |
+| Accepts `-i lo` and `ESTABLISHED,RELATED` | Neither | Neither describes traffic this chain sees, and the conntrack rule would carry flows the proxy never brokered |
+| Programs `allowedHosts` and `blockedHosts` | Programs neither | A block entry is redundant under the closing DROP, and an allow entry naming anything but the proxy contradicts the model |
+
+The IPv6 chain of a proxied container carries its closing DROP and nothing
+else, because the proxy rule is emitted with IPv4 `iptables` only. An IPv6
+proxy endpoint is therefore rejected outright rather than silently discarded.
+
+With DNS closed, a container handed a proxy URL naming a hostname has no
+resolver to find it with. MXC resolves the proxy once, when it builds the
+firewall rule, and writes that same mapping into the container's `/etc/hosts`
+before the script runs — so the name resolves, and it resolves to an address
+the chain allows. The URL itself is left alone: rewriting its host to an IP
+literal would break SNI and certificate validation for an `https://` proxy.
+Every address the proxy host resolved to is opened, since they all belong to
+that same proxy. If the hosts entry cannot be written, execution **fails**
+rather than running a container whose proxy is unreachable.
 
 ## Usage
 

@@ -357,7 +357,7 @@ mod tests {
         }
     }"#;
 
-    const APP_CONTAINER_FIELD_ALIAS_REQUEST_JSON: &str = r#"{
+    const APP_CONTAINER_SECTION_ALIAS_REQUEST_JSON: &str = r#"{
         "version": "0.6.0-alpha",
         "process": {
             "commandLine": "echo hello"
@@ -487,6 +487,7 @@ mod tests {
         format!(
             r#"{{
                 "version": "0.6.0-alpha",
+                "containment": "processcontainer",
                 "process": {{"commandLine": "echo hello"}},
                 "processContainer": {{"ui": {{"isolation": "{isolation}"}}}}
             }}"#
@@ -854,9 +855,9 @@ mod tests {
     }
 
     #[test]
-    fn app_container_field_alias_maps_expected_wire_fields() {
+    fn app_container_section_alias_maps_expected_wire_fields() {
         let request: super::contract::Request =
-            serde_json::from_str(APP_CONTAINER_FIELD_ALIAS_REQUEST_JSON).unwrap();
+            serde_json::from_str(APP_CONTAINER_SECTION_ALIAS_REQUEST_JSON).unwrap();
         let wire = super::into_wire(request);
         let process_container = wire
             .process_container
@@ -943,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn app_container_field_alias_matches_current_wire_deserialization() {
-        assert_matches_current_wire_deserialization(APP_CONTAINER_FIELD_ALIAS_REQUEST_JSON);
+    fn app_container_section_alias_matches_current_wire_deserialization() {
+        assert_matches_current_wire_deserialization(APP_CONTAINER_SECTION_ALIAS_REQUEST_JSON);
     }
 }
