@@ -301,6 +301,20 @@ fn reject_unenforceable_network_policy(policy: &ContainerPolicy) -> Result<(), M
         ));
     }
 
+    // `IngressManager` refuses this, but only once it is invoked, and it is
+    // invoked only in a firewall mode. With `enforcementMode` omitted both
+    // managers take their no-op paths, so without this the start reports
+    // success and the container gets unrestricted inbound traffic -- broader
+    // than the local-network access that was asked for. Rejecting before mode
+    // dispatch also means a dry run gives the same verdict as a real start.
+    if policy.allow_local_network {
+        return Err(MxcError::policy_validation(
+            "LXC state-aware start does not support network.allowLocalNetwork: the container's \
+             inbound chain can only open a source range, and opening every source is broader \
+             than the local-network access requested. See microsoft/mxc AB#63505947.",
+        ));
+    }
+
     // Reject a policy this backend cannot enforce, rather than reporting a
     // successful start that silently leaves the container unfiltered. LXC
     // enforces network policy only through iptables, and `apply_firewall_rules`
@@ -681,6 +695,16 @@ struct LifecycleLock {
     _guard: Option<nix::fcntl::Flock<std::fs::File>>,
 }
 
+/// How many times `acquire` will re-take a lock whose file was replaced under
+/// it before giving up.
+///
+/// Each retry costs one open and one `flock`, and the only thing that triggers
+/// one is a `deprovision` reclaiming the file, so the bound exists to stop an
+/// adversary spinning the loop rather than to absorb ordinary contention.
+/// Exhausting it refuses the phase, which is the safe direction.
+#[cfg(target_os = "linux")]
+const LOCK_ACQUIRE_ATTEMPTS: usize = 8;
+
 impl LifecycleLock {
     /// Take the lock, waiting for any concurrent transition of the same sandbox.
     ///
@@ -694,46 +718,116 @@ impl LifecycleLock {
                 container.lxc_path(),
                 container_name
             );
-            let file = match std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&path)
-            {
-                Ok(file) => file,
-                // No LXC root means no container directory under it, so
-                // nothing has passed the `is_defined` gate that every start
-                // clears before it touches host state — there is no transition
-                // to be serialized against. `stop` and `deprovision` are
-                // required to be idempotent, and refusing them here would make
-                // cleanup on a host that never had LXC an error. Any other
-                // failure, permission in particular, still refuses the phase.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(LifecycleLock { _guard: None })
+            for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
+                let file = match std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+                {
+                    Ok(file) => file,
+                    // No LXC root means no container directory under it, so
+                    // nothing has passed the `is_defined` gate that every start
+                    // clears before it touches host state — there is no
+                    // transition to be serialized against. `stop` and
+                    // `deprovision` are required to be idempotent, and refusing
+                    // them here would make cleanup on a host that never had LXC
+                    // an error. Any other failure, permission in particular,
+                    // still refuses the phase.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(LifecycleLock { _guard: None })
+                    }
+                    Err(e) => {
+                        return Err(MxcError::backend_error(format!(
+                            "Failed to open the lifecycle lock for LXC container \
+                             {container_name:?} at {path}: {e}"
+                        )))
+                    }
+                };
+                let guard = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+                    .map_err(|(_, errno)| {
+                        MxcError::backend_error(format!(
+                            "Failed to take the lifecycle lock for LXC container \
+                             {container_name:?}: {errno}"
+                        ))
+                    })?;
+                if Self::path_still_names(&guard, &path) {
+                    return Ok(LifecycleLock {
+                        _guard: Some(guard),
+                    });
                 }
-                Err(e) => {
-                    return Err(MxcError::backend_error(format!(
-                        "Failed to open the lifecycle lock for LXC container {container_name:?} at \
-                         {path}: {e}"
-                    )))
-                }
-            };
-            let guard = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
-                .map_err(|(_, errno)| {
-                    MxcError::backend_error(format!(
-                        "Failed to take the lifecycle lock for LXC container {container_name:?}: \
-                         {errno}"
-                    ))
-                })?;
-            Ok(LifecycleLock {
-                _guard: Some(guard),
-            })
+                // A `deprovision` reclaimed the file between the open and the
+                // lock, so this lock is on an inode nobody else can reach --
+                // which excludes nobody. Drop it and take the current one.
+                drop(guard);
+            }
+            Err(MxcError::backend_error(format!(
+                "Failed to take the lifecycle lock for LXC container {container_name:?}: the lock \
+                 file at {path} was replaced on every one of {LOCK_ACQUIRE_ATTEMPTS} attempts"
+            )))
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (container, container_name);
             Ok(LifecycleLock {})
         }
+    }
+
+    /// Whether `path` still names the inode `guard` holds a lock on.
+    ///
+    /// `flock` follows the open descriptor, not the name, so a lock taken on a
+    /// file that has since been unlinked excludes nothing: the next phase
+    /// creates a fresh file at the same path and locks that instead.  The
+    /// inode is what makes the two distinguishable.
+    ///
+    /// Any error reading either side answers `false`, which costs a retry and
+    /// eventually refuses the phase.  Answering `true` on an unreadable path
+    /// would hand out a lock that excludes nothing.
+    #[cfg(target_os = "linux")]
+    fn path_still_names(guard: &nix::fcntl::Flock<std::fs::File>, path: &str) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let (Ok(locked), Ok(named)) = (guard.metadata(), std::fs::metadata(path)) else {
+            return false;
+        };
+        locked.ino() == named.ino() && locked.dev() == named.dev()
+    }
+
+    /// Release the lock and remove its file.
+    ///
+    /// Only the terminal phase may call this, and only once the container is
+    /// gone: the file is a permanent inode per sandbox name otherwise, and a
+    /// host that provisions many short-lived sandboxes accumulates one for
+    /// every name it ever used.
+    ///
+    /// The unlink happens while the lock is still held, so no other phase can
+    /// be between its own open and its own `flock` and reach a state this did
+    /// not create.  A phase that is already blocked on the lock wakes holding
+    /// the now-unlinked inode, sees the path no longer names it, and retakes
+    /// the current one; see `path_still_names`.
+    ///
+    /// A failed unlink is not reported.  The container is already destroyed by
+    /// this point, so an error here would fail a `deprovision` that did
+    /// everything it was asked to, and the only consequence is the zero-byte
+    /// file this was trying to reclaim.
+    fn release_and_reclaim(self, container: &LxcContainer, container_name: &str) {
+        #[cfg(target_os = "linux")]
+        {
+            if self._guard.is_some() {
+                let path = format!(
+                    "{}/.mxc-lifecycle-{}.lock",
+                    container.lxc_path(),
+                    container_name
+                );
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (container, container_name);
+        }
+        // `self` is consumed, so the lock releases here -- after the unlink,
+        // which is the order that matters.
     }
 }
 
@@ -1033,12 +1127,11 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         // Discover the veth before teardown while the container may still be
         // running; it disappears once destroyed, but iptables can still delete
         // a FORWARD rule that names it.
-        let veth = NetworkIptablesManager::discover_veth_interface(container_name);
-        // A probe that could not answer must not be read as "already gone".
-        // Skipping the destroy and then running the authoritative network
-        // teardown below would strip filtering from a container that is still
-        // running, which is the fail-open this ordering exists to prevent. The
-        // `?` leaves the rules in place and lets the caller retry.
+        let veth = NetworkIptablesManager::discover_veth_interface(container_name); // A probe that could not answer must not be read as "already gone".
+                                                                                    // Skipping the destroy and then running the authoritative network
+                                                                                    // teardown below would strip filtering from a container that is still
+                                                                                    // running, which is the fail-open this ordering exists to prevent. The
+                                                                                    // `?` leaves the rules in place and lets the caller retry.
         if container
             .is_defined()
             .map_err(|e| probe_failed("exists", container_name, e))?
@@ -1052,6 +1145,11 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             })?;
         }
         cleanup_network_authoritative(container_name, veth.as_deref(), &mut logger)?;
+        // Terminal phase: the container is gone, so nothing will take this
+        // lock for that name again until something creates the container
+        // afresh. Reclaim the file rather than leave one zero-byte inode per
+        // sandbox name the host ever provisioned.
+        _lifecycle_lock.release_and_reclaim(&container, container_name);
         Ok(DeprovisionResult { metadata: None })
     }
 
@@ -1200,6 +1298,39 @@ mod tests {
         };
         assert!(requires_firewall_enforcement(&policy));
         assert!(!uses_firewall_mode(&policy));
+    }
+
+    #[test]
+    fn allow_local_network_is_rejected_whatever_the_enforcement_mode() {
+        // `IngressManager` refuses this, but it only gets the chance in a
+        // firewall mode. With `enforcementMode` omitted both managers take
+        // their no-op paths, so without a check here the start reports success
+        // and the container gets every inbound source -- broader than the
+        // local-network access that was asked for.
+        for mode in [
+            NetworkEnforcementMode::Capabilities,
+            NetworkEnforcementMode::Firewall,
+            NetworkEnforcementMode::Both,
+        ] {
+            let policy = ContainerPolicy {
+                network_enforcement_mode: mode,
+                allow_local_network: true,
+                ..Default::default()
+            };
+            let err = reject_unenforceable_network_policy(&policy)
+                .expect_err("allowLocalNetwork has no enforceable LXC implementation");
+            assert!(
+                format!("{err}").contains("allowLocalNetwork"),
+                "the refusal has to name the field the caller set, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_policy_that_leaves_allow_local_network_alone_is_not_rejected_for_it() {
+        // The negative control: the gate above must not swallow ordinary
+        // starts.
+        assert!(reject_unenforceable_network_policy(&ContainerPolicy::default()).is_ok());
     }
 
     #[test]
@@ -1493,6 +1624,63 @@ mod tests {
         assert!(
             LifecycleLock::acquire(&container, name).is_ok(),
             "a later phase must still be able to take the lock"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_terminal_phase_reclaims_the_lock_file() {
+        // One zero-byte inode per sandbox name, forever, on a host that
+        // provisions many short-lived sandboxes.
+        let dir =
+            std::env::temp_dir().join(format!("mxc-lifecycle-reclaim-{}", mint_random_token()));
+        let name = "reclaimed";
+        std::fs::create_dir_all(&dir).expect("lxc root");
+        let container = LxcContainer::new(name, Some(dir.to_str().expect("utf-8 temp dir")));
+        let path = dir.join(format!(".mxc-lifecycle-{name}.lock"));
+
+        let held = LifecycleLock::acquire(&container, name).expect("deprovision takes the lock");
+        assert!(path.exists(), "the lock file must exist while held");
+        held.release_and_reclaim(&container, name);
+        assert!(
+            !path.exists(),
+            "the terminal phase must not leave its lock file behind"
+        );
+
+        // And the next provision of the same name still works.
+        assert!(
+            LifecycleLock::acquire(&container, name).is_ok(),
+            "reclaiming must not wedge the name"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lock_on_a_replaced_file_is_not_accepted_as_held() {
+        // `flock` follows the descriptor, not the name. A lock taken on a file
+        // that has since been replaced excludes nobody, because the next phase
+        // opens the new inode and locks that instead. Accepting it would hand
+        // out two simultaneous "exclusive" locks on one sandbox.
+        let dir = std::env::temp_dir().join(format!("mxc-lifecycle-inode-{}", mint_random_token()));
+        std::fs::create_dir_all(&dir).expect("lxc root");
+        let name = "replaced";
+        let container = LxcContainer::new(name, Some(dir.to_str().expect("utf-8 temp dir")));
+        let path = dir.join(format!(".mxc-lifecycle-{name}.lock"));
+
+        let held = LifecycleLock::acquire(&container, name).expect("first acquire");
+        // Stand a different inode at the same path, exactly as an unlink plus a
+        // later create would.
+        std::fs::remove_file(&path).expect("unlink the locked inode");
+        std::fs::write(&path, b"").expect("a fresh inode at the same path");
+
+        let guard = held._guard.as_ref().expect("the lock is held on Linux");
+        assert!(
+            !LifecycleLock::path_still_names(guard, &path.to_string_lossy()),
+            "a lock on a replaced inode must not read as current"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

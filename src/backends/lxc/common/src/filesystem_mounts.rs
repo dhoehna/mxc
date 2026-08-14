@@ -206,16 +206,15 @@ pub fn configure_filesystem_mounts(
     policy: &ContainerPolicy,
     logger: &mut Logger,
 ) -> Result<(), String> {
-    // Clear the `lxc.mount.entry` lines MXC added on a previous start before
-    // deriving the current policy's mounts. `set_mxc_mount_entry` appends, and
-    // liblxc accumulates every entry across restarts, so without this a restart
-    // with a narrower policy would still inherit the earlier run's bind mounts.
-    // Only MXC's own entries are cleared: baseline mounts the distribution
-    // template or the user placed in the config are identified by the absence of
-    // MXC's marker comment and left intact.
-    container.clear_mxc_mount_entries()?;
-
+    // Derive the whole mount set first, then commit it in one config rewrite.
+    // liblxc accumulates `lxc.mount.entry` lines across restarts, so the
+    // previous run's MXC mounts have to go; committing the replacement one
+    // entry at a time meant a crash or a rejected path partway through left a
+    // durable config matching no policy anyone wrote. Only MXC's own entries
+    // are replaced -- baseline mounts the distribution template or the operator
+    // placed in the config carry no marker and survive.
     let mounts = resolve_mount_order(policy);
+    let mut entries: Vec<String> = Vec::with_capacity(mounts.len());
 
     // Container-side paths of every re-bound (rw/ro) mount, used to decide
     // whether a denied *directory* must be masked with a writable tmpfs so a
@@ -245,7 +244,7 @@ pub fn configure_filesystem_mounts(
                     "Adding rw bind mount: {} -> /{}",
                     host_path, container_path
                 ));
-                container.set_mxc_mount_entry(&mount_entry)?;
+                entries.push(mount_entry);
             }
             FsIntent::ReadOnly => {
                 let mount_entry = format!(
@@ -256,7 +255,7 @@ pub fn configure_filesystem_mounts(
                     "Adding ro bind mount: {} -> /{}",
                     host_path, container_path
                 ));
-                container.set_mxc_mount_entry(&mount_entry)?;
+                entries.push(mount_entry);
             }
             FsIntent::Denied => {
                 // Resolve the denied path through symlinks to its real host
@@ -310,12 +309,12 @@ pub fn configure_filesystem_mounts(
                     "Masking denied path: /{} ({})",
                     container_path, create_type
                 ));
-                container.set_mxc_mount_entry(&mount_entry)?;
+                entries.push(mount_entry);
             }
         }
     }
 
-    Ok(())
+    container.replace_mxc_mount_entries(&entries)
 }
 
 /// Remove filesystem mount configuration.

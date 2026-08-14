@@ -115,16 +115,41 @@ pub fn mint_exec_marker() -> String {
 ///
 /// The reaping shell is attached *without* the marker, so it cannot match
 /// itself.
+///
+/// `/proc/[0-9]*` is expanded once per pass, so a workload that forks after
+/// the expansion has a child the pass never sees.  The scan therefore stops
+/// what it finds before killing anything: a stopped process cannot fork again,
+/// so each pass shrinks the set that is still able to grow, and the loop
+/// repeats until a pass discovers no marked process it had not already seen.
+/// Only then is the collected set killed.  The pass count is bounded so a
+/// deliberate fork bomb cannot spin here forever.
+///
+/// That is containment by convergence, not by construction.  A per-exec cgroup
+/// or PID namespace would make it race-free outright, and `lxc-attach` offers
+/// neither.
 #[cfg(any(target_os = "linux", test))]
 fn build_reap_args(marker: &str) -> Vec<String> {
     vec![
         "--".to_string(),
         "/bin/sh".to_string(),
         "-c".to_string(),
-        "for d in /proc/[0-9]*; do \
-           e=$(cat \"$d/environ\" 2>/dev/null) || continue; \
-           case \"$e\" in *\"$1\"*) kill -9 \"${d#/proc/}\" 2>/dev/null ;; esac; \
+        "seen=\" \"; i=0; \
+         while [ \"$i\" -lt 8 ]; do \
+           found=0; \
+           for d in /proc/[0-9]*; do \
+             p=${d#/proc/}; \
+             case \"$seen\" in *\" $p \"*) continue ;; esac; \
+             e=$(cat \"$d/environ\" 2>/dev/null) || continue; \
+             case \"$e\" in *\"$1\"*) \
+               kill -STOP \"$p\" 2>/dev/null; \
+               seen=\"$seen$p \"; \
+               found=1 ;; \
+             esac; \
+           done; \
+           [ \"$found\" -eq 0 ] && break; \
+           i=$((i + 1)); \
          done; \
+         for p in $seen; do kill -KILL \"$p\" 2>/dev/null; done; \
          exit 0"
             .to_string(),
         "_".to_string(),
@@ -285,6 +310,59 @@ fn parse_net_interface_config(config_contents: &str) -> NetInterfaceConfig {
     }
 }
 
+/// Read an `lxc-info` run as "does this container exist?".
+///
+/// Split out as a pure function so the three-way answer is testable without
+/// `lxc-info` on the box.
+///
+/// A nonzero exit is ambiguous on its own: `lxc-info` reports a container it
+/// does not know that way, but so do a permission error, a transient runtime
+/// failure, and a malformed config.  "Defined" means LXC has a config file for
+/// the container, so that file settles the ambiguity, and `try_exists` reports
+/// `false` only when it can prove absence -- a directory it cannot read is an
+/// `Err`, not a `false`.
+///
+/// The layout assumption is `{lxc_path}/{name}/config`.  If that is ever wrong
+/// the failure lands on `Ok(true)` for the config probe and therefore on `Err`
+/// here, which refuses the phase; the old code returned `Ok(false)` and
+/// unfiltered a live container.  Wrong in the safe direction.
+fn interpret_defined_probe(
+    probe_succeeded: bool,
+    stderr: &str,
+    config: &std::path::Path,
+    name: &str,
+) -> Result<bool, String> {
+    if probe_succeeded {
+        return Ok(true);
+    }
+    let detail = stderr.trim();
+    match config.try_exists() {
+        Ok(false) => Ok(false),
+        Ok(true) => Err(format!(
+            "lxc-info failed for container {name:?} but its config file at {} is present, so \
+             whether the container is defined is unknown: {detail}",
+            config.display()
+        )),
+        Err(e) => Err(format!(
+            "lxc-info failed for container {name:?} and its config file at {} could not be \
+             checked ({e}), so whether the container is defined is unknown: {detail}",
+            config.display()
+        )),
+    }
+}
+
+/// The `lxc-info -s` states that still have a live container behind them.
+///
+/// `STOPPED` is the only state that does not.  `FROZEN` and `FREEZING` have
+/// processes that thaw straight back into a running container, so unfiltering
+/// one is the same fail-open as unfiltering a running one.  The transitional
+/// states count as live for the same reason: stopping a container that is
+/// already going down is harmless, and unfiltering one that is coming up is
+/// not.
+const LIVE_STATES: [&str; 7] = [
+    "RUNNING", "FROZEN", "FREEZING", "THAWED", "STARTING", "STOPPING", "ABORTING",
+];
+
 /// Read `lxc-info -s` output as "is this container running?".
 ///
 /// Split out as a pure function so the three-way answer is testable without a
@@ -299,14 +377,24 @@ fn interpret_state_output(stdout: &str) -> Result<bool, String> {
             continue;
         };
         if key.trim() == "State" {
-            return Ok(value.trim() == "RUNNING");
+            let state = value.trim();
+            if state == "STOPPED" {
+                return Ok(false);
+            }
+            if LIVE_STATES.contains(&state) {
+                return Ok(true);
+            }
+            return Err(format!(
+                "lxc-info -s named an unrecognized state {state:?}, so whether the container is \
+                 running is unknown"
+            ));
         }
     }
-    // No `State:` line. If the word shows up anyway, answer in the safe
-    // direction rather than give up: reporting "running" only ever costs a
+    // No `State:` line. If a live-state name shows up anyway, answer in the
+    // safe direction rather than give up: reporting "running" only ever costs a
     // refused operation, whereas reporting "stopped" is what unfilters a live
     // container.
-    if stdout.contains("RUNNING") {
+    if LIVE_STATES.iter().any(|s| stdout.contains(s)) {
         return Ok(true);
     }
     Err(format!(
@@ -377,20 +465,27 @@ impl LxcContainer {
 
     /// Whether the container exists.
     ///
-    /// `Err` means the probe could not be run at all, which is not evidence of
+    /// `Err` means the probe could not answer, which is not evidence of
     /// absence.  Collapsing that into `false` reads "the probe broke" as "the
     /// container is gone", which let deprovision skip the destroy and then
     /// strip the firewall from a container that was still running.
     ///
-    /// A nonzero exit *is* read as absence: that is how `lxc-info` reports a
-    /// container it does not know, and it is the only signal available short of
-    /// parsing its diagnostics.
+    /// See [`interpret_defined_probe`] for why a nonzero exit is not an answer
+    /// on its own.
     pub fn is_defined(&self) -> Result<bool, String> {
         let output = self
             .lxc_command("lxc-info")
             .output()
             .map_err(|e| format!("failed to run lxc-info: {e}"))?;
-        Ok(output.status.success())
+        let config = std::path::Path::new(&self.lxc_path)
+            .join(&self.name)
+            .join("config");
+        interpret_defined_probe(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stderr),
+            &config,
+            &self.name,
+        )
     }
 
     /// Whether the container is running.
@@ -453,8 +548,9 @@ impl LxcContainer {
     }
 
     /// Marker comment written immediately above every `lxc.mount.entry` line
-    /// that MXC itself adds, so [`clear_mxc_mount_entries`](Self::clear_mxc_mount_entries)
-    /// can remove only MXC's own mounts and leave baseline entries the distro
+    /// that MXC itself adds, so
+    /// [`replace_mxc_mount_entries`](Self::replace_mxc_mount_entries) can
+    /// rewrite only MXC's own mounts and leave baseline entries the distro
     /// template or the user placed in the config untouched. It is a real LXC
     /// comment (`#`), so liblxc ignores it when parsing the file.
     const MXC_MOUNT_MARKER: &'static str = "# mxc-managed-mount";
@@ -569,72 +665,88 @@ impl LxcContainer {
         })
     }
 
-    /// Append an `lxc.mount.entry` that MXC owns, tagged with a marker comment
-    /// so it can later be removed without disturbing baseline mounts.
+    /// Replace MXC's whole mount set in one atomic config rewrite.
     ///
-    /// Writes [`MXC_MOUNT_MARKER`](Self::MXC_MOUNT_MARKER) on its own line
-    /// immediately before the `lxc.mount.entry = value` line. liblxc treats the
+    /// Each entry is written as [`MXC_MOUNT_MARKER`](Self::MXC_MOUNT_MARKER) on
+    /// its own line followed by `lxc.mount.entry = value`.  liblxc treats the
     /// marker as a comment and the entry exactly as if it had been added with
-    /// [`set_config_item`](Self::set_config_item);
-    /// [`clear_mxc_mount_entries`](Self::clear_mxc_mount_entries) keys off the
-    /// marker to reclaim only these lines on a restart.
-    pub fn set_mxc_mount_entry(&self, value: &str) -> Result<(), String> {
-        let config_path = self.config_file_path();
-        let entry = format!("{}\nlxc.mount.entry = {}\n", Self::MXC_MOUNT_MARKER, value);
-
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&config_path)
-            .and_then(|mut f| {
-                use std::io::Write;
-                f.write_all(entry.as_bytes())
-            })
-            .map_err(|e| {
-                format!(
-                    "Failed to set MXC mount entry {}: {} (config file: {})",
-                    value, e, config_path
-                )
-            })
-    }
-
-    /// Remove only the `lxc.mount.entry` lines MXC itself added, identified by
-    /// the [`MXC_MOUNT_MARKER`](Self::MXC_MOUNT_MARKER) comment written above
-    /// each one by [`set_mxc_mount_entry`](Self::set_mxc_mount_entry).
+    /// [`set_config_item`](Self::set_config_item).
     ///
-    /// Unlike [`clear_config_item`](Self::clear_config_item), which drops *every*
-    /// line for a key, this preserves foreign `lxc.mount.entry` lines that the
-    /// distribution template or the user placed in the config. `set_mxc_mount_entry`
-    /// appends and liblxc accumulates every entry across restarts, so a caller
-    /// that re-derives its mounts from policy on each start must reclaim the
-    /// previous run's MXC lines first — but clearing unrelated baseline mounts
-    /// would silently delete container storage the operator relies on.
+    /// The set is the unit that matters: a container configured with half of
+    /// its policy's bind mounts is not a weaker sandbox, it is a different one.
+    /// Clearing and then appending each entry separately committed a config
+    /// per mount, so a crash, a signal, or a rejected path partway through left
+    /// a durable config that matched no policy anyone wrote.  One rewrite means
+    /// a reader sees either the previous run's mounts or this run's, never a
+    /// prefix of this run's.
     ///
-    /// A marker line and the `lxc.mount.entry` line immediately following it are
-    /// dropped together. An orphaned marker (no entry after it) is dropped on its
-    /// own so a partial write cannot accumulate stray comments. A missing config
-    /// file is treated as already-clear (`Ok`).
-    pub fn clear_mxc_mount_entries(&self) -> Result<(), String> {
+    /// Only MXC's own entries are replaced.  Each is tagged with
+    /// [`MXC_MOUNT_MARKER`](Self::MXC_MOUNT_MARKER) on the line above it, which
+    /// liblxc treats as a comment; foreign `lxc.mount.entry` lines placed by the
+    /// distribution template or the operator carry no marker and survive
+    /// untouched.  Clearing those instead would silently detach container
+    /// storage nobody asked us to manage.
+    ///
+    /// A missing config file is already free of MXC mounts, so an empty set
+    /// succeeds against one.  A non-empty set does not: writing mount entries
+    /// into a config that liblxc never created would produce a container
+    /// definition with no template behind it.
+    pub fn replace_mxc_mount_entries(&self, values: &[String]) -> Result<(), String> {
         let config_path = self.config_file_path();
         let contents = match std::fs::read_to_string(&config_path) {
             Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if values.is_empty() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "Failed to set {} MXC mount entries: no config file at {}",
+                    values.len(),
+                    config_path
+                ));
+            }
             Err(e) => {
                 return Err(format!(
-                    "Failed to read config to clear MXC mounts: {} (config file: {})",
+                    "Failed to read config to rewrite MXC mounts: {} (config file: {})",
                     e, config_path
                 ))
             }
         };
 
+        let mut out = Self::strip_mxc_mount_entries(&contents);
+        for value in values {
+            out.push_str(Self::MXC_MOUNT_MARKER);
+            out.push('\n');
+            out.push_str("lxc.mount.entry = ");
+            out.push_str(value);
+            out.push('\n');
+        }
+
+        Self::write_config_atomically(&config_path, &out).map_err(|e| {
+            format!(
+                "Failed to rewrite config with {} MXC mount entries: {} (config file: {})",
+                values.len(),
+                e,
+                config_path
+            )
+        })
+    }
+
+    /// `contents` with every MXC-added mount line removed.
+    ///
+    /// A marker line and the `lxc.mount.entry` line immediately following it are
+    /// dropped together.  An orphaned marker -- one left by a config written
+    /// before the rewrite became atomic -- is dropped on its own so stray
+    /// comments cannot accumulate.
+    ///
+    /// Pure so the line-pairing is testable without a container on the box.
+    fn strip_mxc_mount_entries(contents: &str) -> String {
         let lines: Vec<&str> = contents.lines().collect();
         let mut out = String::with_capacity(contents.len());
         let mut i = 0;
         while i < lines.len() {
             let line = lines[i];
             if line.trim() == Self::MXC_MOUNT_MARKER {
-                // Drop the marker, and the MXC mount entry it tags if one
-                // directly follows. A marker with no following entry is simply
-                // dropped so a half-written pair leaves nothing behind.
                 let next_is_entry = lines
                     .get(i + 1)
                     .map(|l| {
@@ -650,13 +762,7 @@ impl LxcContainer {
             out.push('\n');
             i += 1;
         }
-
-        Self::write_config_atomically(&config_path, &out).map_err(|e| {
-            format!(
-                "Failed to rewrite config to clear MXC mounts: {} (config file: {})",
-                e, config_path
-            )
-        })
+        out
     }
 
     /// Start the container.
@@ -1101,12 +1207,181 @@ mod tests {
             interpret_state_output("State:          STOPPED\n"),
             Ok(false)
         );
-        // Any other liblxc state is still an answer, and the answer is "not
-        // running".
+    }
+
+    #[test]
+    fn stripping_drops_mxc_mounts_and_keeps_baseline_ones() {
+        let config = concat!(
+            "lxc.uts.name = box\n",
+            "lxc.mount.entry = /srv /srv none bind 0 0\n",
+            "# mxc-managed-mount\n",
+            "lxc.mount.entry = /tmp/a a none bind,create=dir 0 0\n",
+            "lxc.rootfs.path = /var/lib/lxc/box/rootfs\n",
+        );
+        let out = LxcContainer::strip_mxc_mount_entries(config);
+        assert!(
+            out.contains("/srv /srv none bind 0 0"),
+            "a baseline mount the operator placed must survive, got {out:?}"
+        );
+        assert!(
+            !out.contains("/tmp/a"),
+            "MXC's own mount must go, got {out:?}"
+        );
+        assert!(!out.contains("mxc-managed-mount"), "got {out:?}");
+        assert!(out.contains("lxc.rootfs.path"), "got {out:?}");
+    }
+
+    #[test]
+    fn stripping_drops_a_marker_left_without_its_entry() {
+        // Configs written before the rewrite became atomic can hold a marker
+        // whose entry never landed. Left behind, those accumulate one stray
+        // comment per interrupted start.
+        let out = LxcContainer::strip_mxc_mount_entries("# mxc-managed-mount\nlxc.uts.name = b\n");
+        assert_eq!(out, "lxc.uts.name = b\n");
+    }
+
+    #[test]
+    fn a_mount_set_replaces_the_previous_one_in_a_single_config() {
+        let dir = std::env::temp_dir().join(format!("mxc-mountset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("box")).expect("test temp dir");
+        let config = dir.join("box").join("config");
+        std::fs::write(
+            &config,
+            "lxc.uts.name = box\n# mxc-managed-mount\nlxc.mount.entry = /old old none bind 0 0\n",
+        )
+        .expect("seed config");
+
+        let container = LxcContainer::new("box", Some(&dir.to_string_lossy()));
+        container
+            .replace_mxc_mount_entries(&[
+                "/new new none bind,create=dir 0 0".to_string(),
+                "/two two none bind,ro,create=dir 0 0".to_string(),
+            ])
+            .expect("rewrite must succeed");
+
+        let after = std::fs::read_to_string(&config).expect("read back");
+        assert!(
+            !after.contains("/old"),
+            "the previous run's mounts must not accumulate, got {after:?}"
+        );
+        assert!(after.contains("/new new"), "got {after:?}");
+        assert!(after.contains("/two two"), "got {after:?}");
+        assert!(after.contains("lxc.uts.name = box"), "got {after:?}");
         assert_eq!(
-            interpret_state_output("State:          FROZEN\n"),
+            after.matches("# mxc-managed-mount").count(),
+            2,
+            "one marker per entry, got {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_mount_set_clears_the_previous_one() {
+        let dir = std::env::temp_dir().join(format!("mxc-mountclear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("box")).expect("test temp dir");
+        let config = dir.join("box").join("config");
+        std::fs::write(
+            &config,
+            "lxc.uts.name = box\n# mxc-managed-mount\nlxc.mount.entry = /old old none bind 0 0\n",
+        )
+        .expect("seed config");
+
+        LxcContainer::new("box", Some(&dir.to_string_lossy()))
+            .replace_mxc_mount_entries(&[])
+            .expect("an empty set is a valid policy");
+
+        let after = std::fs::read_to_string(&config).expect("read back");
+        assert!(!after.contains("/old"), "got {after:?}");
+        assert!(after.contains("lxc.uts.name = box"), "got {after:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_probe_answers_defined_without_touching_the_filesystem() {
+        // The common path: `lxc-info` knows the container, so the config file
+        // never needs consulting.
+        assert_eq!(
+            interpret_defined_probe(
+                true,
+                "",
+                std::path::Path::new("/nonexistent/box/config"),
+                "b"
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_failed_probe_with_no_config_file_means_absent() {
+        let dir = std::env::temp_dir().join(format!("mxc-defined-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let config = dir.join("no-such-container").join("config");
+        assert_eq!(
+            interpret_defined_probe(false, "container not found", &config, "no-such-container"),
             Ok(false)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_probe_with_a_config_file_present_is_unknown_rather_than_absent() {
+        // The fail-open this closes: a permission or transient error made
+        // deprovision skip `destroy()` and then authoritatively strip the
+        // firewall from a container that was still running. The config file
+        // proves the container is defined, so the honest answer is "unknown".
+        let dir = std::env::temp_dir().join(format!("mxc-defined-live-{}", std::process::id()));
+        let container = dir.join("box");
+        std::fs::create_dir_all(&container).expect("temp dir");
+        let config = container.join("config");
+        std::fs::write(&config, "lxc.uts.name = box\n").expect("config file");
+
+        let answer = interpret_defined_probe(false, "permission denied", &config, "box");
+        assert!(
+            answer.is_err(),
+            "a present config file must not read as absent, got {answer:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_frozen_container_is_live_not_stopped() {
+        // A frozen container still has processes; thawing resumes them. Reading
+        // it as stopped is what lets `stop` skip `lxc-stop`, tear the firewall
+        // down as authoritative, and leave a thawable container unfiltered.
+        assert_eq!(interpret_state_output("State:          FROZEN\n"), Ok(true));
+        assert_eq!(
+            interpret_state_output("State:          FREEZING\n"),
+            Ok(true)
+        );
+        assert_eq!(interpret_state_output("State:          THAWED\n"), Ok(true));
+    }
+
+    #[test]
+    fn a_transitional_state_is_live_not_stopped() {
+        // STOPPED is the only state with nothing left to unfilter. Stopping a
+        // container that is already going down costs an idempotent `lxc-stop`;
+        // unfiltering one that is coming up costs the isolation.
+        assert_eq!(
+            interpret_state_output("State:          STARTING\n"),
+            Ok(true)
+        );
+        assert_eq!(
+            interpret_state_output("State:          STOPPING\n"),
+            Ok(true)
+        );
+        assert_eq!(
+            interpret_state_output("State:          ABORTING\n"),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_state_name_we_do_not_know_is_unknown_rather_than_stopped() {
+        // A state added by a future liblxc must not default into the answer
+        // that unfilters a container.
+        assert!(interpret_state_output("State:          MARVELLOUS\n").is_err());
     }
 
     #[test]
@@ -1640,7 +1915,7 @@ mod tests {
         let args = build_reap_args("t'; rm -rf /; #");
         let script = args
             .iter()
-            .find(|a| a.contains("kill -9"))
+            .find(|a| a.contains("/proc/"))
             .expect("reap script should be present");
         assert!(
             !script.contains("rm -rf"),
@@ -1660,11 +1935,59 @@ mod tests {
         // already finished; a nonzero exit there would be read as a failed
         // reap and reported to the caller as possibly-still-running work.
         let args = build_reap_args("tok123");
-        let script = args.iter().find(|a| a.contains("kill -9")).unwrap();
+        let script = args.iter().find(|a| a.contains("/proc/")).unwrap();
         assert!(
             script.trim_end().ends_with("exit 0"),
             "reap script must end with an unconditional success, got {:?}",
             script
         );
+    }
+
+    #[test]
+    fn the_reaper_stops_a_process_before_it_kills_anything() {
+        // The `/proc` glob expands once per pass, so a workload that forks
+        // after the expansion has a child that pass never sees. Stopping first
+        // means a process that has been found cannot fork again, so the set
+        // that can still grow only shrinks.
+        let script = build_reap_args("tok123")
+            .into_iter()
+            .find(|a| a.contains("/proc/"))
+            .expect("reap script should be present");
+        let stop = script.find("kill -STOP").expect("must stop what it finds");
+        let kill = script.find("kill -KILL").expect("must then kill it");
+        assert!(
+            stop < kill,
+            "the stop pass has to precede the kill pass, got {script:?}"
+        );
+    }
+
+    #[test]
+    fn the_reaper_rescans_until_it_finds_nothing_new() {
+        // One pass cannot see a process forked after its glob expanded, so a
+        // single pass leaves that child alive to outlive the exec.
+        let script = build_reap_args("tok123")
+            .into_iter()
+            .find(|a| a.contains("/proc/"))
+            .expect("reap script should be present");
+        assert!(
+            script.contains("while ["),
+            "the scan must repeat, got {script:?}"
+        );
+        assert!(
+            script.contains("break"),
+            "the scan must stop once a pass finds nothing new, got {script:?}"
+        );
+    }
+
+    #[test]
+    fn the_reaper_names_its_signals_rather_than_numbering_them() {
+        // SIGSTOP is 19 on x86 and ARM but 17 on Alpha and SPARC and 23 on
+        // MIPS. A number here would stop the wrong thing on those hosts.
+        let script = build_reap_args("tok123")
+            .into_iter()
+            .find(|a| a.contains("/proc/"))
+            .expect("reap script should be present");
+        assert!(!script.contains("kill -9"), "got {script:?}");
+        assert!(!script.contains("kill -19"), "got {script:?}");
     }
 }

@@ -103,10 +103,13 @@ export async function startSandbox<C extends StateAwareContainmentBackend>(
 /**
  * Streams a script execution inside a started sandbox. Returns an
  * `IPty` for live stdout/stderr/exit handling, mirroring `spawnSandbox`.
- * On dispatch failure the executor emits a single error envelope on stderr,
- * because stdout is carrying the container's raw output; the SDK does not
- * parse it here — callers consuming `IPty.onData` see the raw bytes. Use
- * `execInSandboxAsync` when typed-error throwing is needed.
+ * On dispatch failure the executor emits a single error envelope; the SDK does
+ * not parse it here — callers consuming `IPty.onData` see the raw bytes. The
+ * channel is backend-specific: LXC puts it on stderr, because stdout is
+ * carrying the container's raw output, while Windows Sandbox, IsolationSession,
+ * and WSLc keep stdout as the executor's own channel and emit it there. Use
+ * `execInSandboxAsync` when typed-error throwing is needed — it already selects
+ * the right channel per backend.
  */
 export function execInSandbox<C extends StateAwareContainmentBackend>(
   sandboxId: SandboxId<C>,

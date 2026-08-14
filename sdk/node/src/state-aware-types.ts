@@ -166,6 +166,14 @@ export interface LxcUnrestrictedNetworkConfig {
    * list as a restriction when it is non-empty, so `[]` is no restriction and
    * `never` here rejected a value the backend accepts: `{ allowedHosts: [] }`
    * matched neither arm.
+   *
+   * This is the literal `[]` only, and deliberately so. A `string[]` whose
+   * length is not known until runtime might hold a restriction, and widening
+   * this to accept one would let `{ allowedHosts: ['evil.com'] }` through with
+   * no `enforcementMode` -- which starts a container the backend never
+   * filters. Build a list at runtime and you belong in
+   * {@link LxcRestrictedNetworkConfig}: set `enforcementMode`, which is valid
+   * whether or not the list turns out to be empty.
    */
   allowedHosts?: [];
   blockedHosts?: [];

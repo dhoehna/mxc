@@ -753,15 +753,30 @@ impl NetworkIptablesManager {
 
     /// Whether `chain` currently exists in `tool`'s filter table.
     ///
-    /// `-S <chain>` is read-only and fails when the chain is absent, so the
-    /// exit status alone answers the question. A host without the tool at all
-    /// reports absent, which is the right answer for teardown: a chain that
-    /// cannot be addressed cannot be removed, and there is nothing to remove.
-    fn chain_exists(tool: &str, chain: &str) -> bool {
-        matches!(
-            Command::new(tool).args(["-S", chain]).output(),
-            Ok(o) if o.status.success()
-        )
+    /// `-S <chain>` fails the same way for a chain that is absent and for a
+    /// ruleset that cannot be read at all, so the exit status alone does not
+    /// answer the question. FORWARD always exists, so it separates the two: if
+    /// FORWARD reads, the tool works and this chain is genuinely gone. If it
+    /// does not, the answer is unknown, and reporting "absent" there would let
+    /// authoritative teardown declare a clean host while the chain survives.
+    ///
+    /// A host without the tool at all reports absent, which is the right answer
+    /// for teardown: a chain that cannot be addressed cannot be removed, and
+    /// there is nothing to remove.
+    fn chain_exists(tool: &str, chain: &str) -> Result<bool, String> {
+        match Command::new(tool).args(["-S", chain]).output() {
+            Ok(o) if o.status.success() => Ok(true),
+            Ok(o) if Self::read_forward_chain(tool).is_some() => {
+                let _ = o;
+                Ok(false)
+            }
+            Ok(o) => Err(format!(
+                "{tool} could not read chain {chain} and could not read FORWARD either, so \
+                 whether the chain exists is unknown: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
+            Err(_) => Ok(false),
+        }
     }
 
     /// Build an ownership record from what is actually installed right now,
@@ -784,15 +799,15 @@ impl NetworkIptablesManager {
     /// ownership that schedules a pointless retry in `Drop`. Probing reports
     /// exactly what is present, so an already-clean container issues no
     /// commands at all and a half-installed one removes only its own half.
-    fn observe_existing(chain_name: &str) -> CreatedResources {
+    fn observe_existing(chain_name: &str) -> Result<CreatedResources, String> {
         let hooked =
             |tool: &str| Self::hook_present(Self::read_forward_chain(tool).as_deref(), chain_name);
-        CreatedResources {
-            v4_chain: Self::chain_exists("iptables", chain_name),
-            v6_chain: Self::chain_exists("ip6tables", chain_name),
+        Ok(CreatedResources {
+            v4_chain: Self::chain_exists("iptables", chain_name)?,
+            v6_chain: Self::chain_exists("ip6tables", chain_name)?,
             v4_hook: hooked("iptables"),
             v6_hook: hooked("ip6tables"),
-        }
+        })
     }
 
     /// Whether a FORWARD jump to `chain` should be treated as installed, given
@@ -1571,7 +1586,7 @@ impl NetworkIptablesManager {
         let mut mgr = Self::new(container_name);
         // Ask the host what is installed instead of asserting it, so a
         // container with nothing left issues no commands and logs no failures.
-        let observed = Self::observe_existing(&mgr.chain_name);
+        let observed = Self::observe_existing(&mgr.chain_name)?;
         if observed.is_empty() {
             return Ok(());
         }
@@ -1590,12 +1605,14 @@ impl NetworkIptablesManager {
         // false alarm every time the retry succeeded.
         let chain_name = mgr.chain_name.clone();
         drop(mgr);
-        if Self::observe_existing(&chain_name).is_empty() {
-            return Ok(());
+        match Self::observe_existing(&chain_name) {
+            Ok(o) if o.is_empty() => Ok(()),
+            Ok(_) => Err(attempt.err().unwrap_or_else(|| {
+                format!("iptables state for chain {chain_name} survived authoritative cleanup")
+            })),
+            // A probe that could not answer is not evidence of a clean host.
+            Err(e) => Err(attempt.err().unwrap_or(e)),
         }
-        Err(attempt.err().unwrap_or_else(|| {
-            format!("iptables state for chain {chain_name} survived authoritative cleanup")
-        }))
     }
 }
 
