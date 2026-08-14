@@ -24,8 +24,6 @@ use nix::sys::signal::{SigSet, Signal};
 
 #[cfg(target_os = "linux")]
 use crate::lxc_bindings::LxcContainer;
-#[cfg(target_os = "linux")]
-use crate::network_ingress::IngressManager;
 use crate::network_iptables::CreatedResources;
 #[cfg(target_os = "linux")]
 use crate::network_iptables::NetworkIptablesManager;
@@ -70,11 +68,6 @@ enum RollbackStep {
     StopContainer,
     /// Remove the firewall chain and hooks this process created.
     RemoveFirewall,
-    /// Remove the inbound INPUT rules the runner installed inside the
-    /// container's own network namespace.  Reaching them means entering that
-    /// namespace through the container's init PID, so it is only possible
-    /// while the container is still alive.
-    RemoveIngress,
     /// Discard the container entirely.
     DestroyContainer,
     /// Kill the processes one exec started inside the container, found by the
@@ -131,11 +124,12 @@ fn rollback_plan(rollback: SignalRollback, owns_firewall: bool) -> Vec<RollbackS
             }
         }
         SignalRollback::DestroyContainer => {
-            // Ingress first: those rules live inside the container's own netns,
-            // so a destroy would take the namespace away and leave nothing to
-            // enter. The firewall goes last, after the destroy has actually
-            // succeeded -- see `execute_rollback`.
-            plan.push(RollbackStep::RemoveIngress);
+            // No ingress step: those rules live inside the container's own
+            // netns, so the destroy takes them with it. Running one first would
+            // buy nothing when the destroy succeeds and cost real exposure when
+            // it fails -- a container left running with its inbound deny
+            // already stripped off. The firewall goes last, after the destroy
+            // has actually succeeded -- see `execute_rollback`.
             plan.push(RollbackStep::DestroyContainer);
             if owns_firewall {
                 plan.push(RollbackStep::RemoveFirewall);
@@ -158,9 +152,6 @@ fn rollback_plan(rollback: SignalRollback, owns_firewall: bool) -> Vec<RollbackS
 /// A failed `DestroyContainer` abandons the rest for the same reason. The only
 /// step that follows it is `RemoveFirewall`, and a destroy that failed may well
 /// have left the container running, so continuing would unfilter it.
-/// `RemoveIngress` runs ahead of the destroy because it needs a namespace to
-/// enter, and it is deliberately not a gate: those rules die with the namespace
-/// either way, so a failure there cannot leave the container exposed.
 ///
 /// Bailing out leaks the chain rather than exposing the container, which is the
 /// same trade the ordinary stop path already makes deliberately: it propagates
@@ -212,7 +203,6 @@ struct ActiveSandbox {
     /// whole window in which the resource exists is covered and no wider.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     created: CreatedResources,
-    netns_pid: Option<u32>,
     /// The marker stamped on the exec currently running in `name`, when one is
     /// running, so a signal can reap the processes it started inside the
     /// container.
@@ -242,7 +232,6 @@ pub fn set_active(name: &str) {
     slot.veth = None;
     slot.rollback = SignalRollback::DestroyContainer;
     slot.created = CreatedResources::default();
-    slot.netns_pid = None;
     slot.exec_marker = None;
 }
 
@@ -290,7 +279,6 @@ pub fn set_active_exec(name: &str, marker: &str) {
     slot.veth = None;
     slot.rollback = SignalRollback::ReapExec;
     slot.created = CreatedResources::default();
-    slot.netns_pid = None;
     slot.exec_marker = Some(marker.to_owned());
 }
 
@@ -341,33 +329,12 @@ pub fn set_active_veth(veth: &str) {
     }
 }
 
-/// Records the container's init PID for the active container so the watchdog
-/// can remove the container-netns iptables INPUT (inbound) rules on a fatal
-/// signal, before the container is destroyed. No-op if no container is
-/// currently registered.
-pub fn set_active_pid(pid: u32) {
-    let mut slot = lock_slot();
-    if slot.name.is_some() {
-        slot.netns_pid = Some(pid);
-    }
-}
-
 /// Reads back what the watchdog would act on. Test-only: production code has
 /// exactly one reader, and it is the watchdog itself.
 #[cfg(test)]
-fn active_snapshot() -> (
-    Option<String>,
-    Option<String>,
-    CreatedResources,
-    Option<u32>,
-) {
+fn active_snapshot() -> (Option<String>, Option<String>, CreatedResources) {
     let slot = lock_slot();
-    (
-        slot.name.clone(),
-        slot.veth.clone(),
-        slot.created,
-        slot.netns_pid,
-    )
+    (slot.name.clone(), slot.veth.clone(), slot.created)
 }
 
 /// Block SIGHUP/SIGTERM/SIGINT in the calling thread and spawn a watchdog
@@ -435,7 +402,7 @@ fn run_watchdog(mask: SigSet) -> ! {
             let mut buf_logger = Logger::new(Mode::Buffer);
             let plan = rollback_plan(active.rollback, !active.created.is_empty());
             execute_rollback(&plan, &mut |step| match step {
-                RollbackStep::StopContainer => LxcContainer::new(&name, None).stop().is_ok(),
+                RollbackStep::StopContainer => LxcContainer::new(&name, None).kill().is_ok(),
                 RollbackStep::RemoveFirewall => {
                     NetworkIptablesManager::force_cleanup(
                         &name,
@@ -443,14 +410,6 @@ fn run_watchdog(mask: SigSet) -> ! {
                         active.created,
                         &mut buf_logger,
                     );
-                    true
-                }
-                // Without the init PID the container netns is unaddressable, so
-                // there is nothing to enter and nothing to clean.
-                RollbackStep::RemoveIngress => {
-                    if let Some(pid) = active.netns_pid {
-                        IngressManager::force_cleanup(&name, pid, &mut buf_logger);
-                    }
                     true
                 }
                 RollbackStep::DestroyContainer => LxcContainer::new(&name, None).destroy().is_ok(),
@@ -548,11 +507,7 @@ mod tests {
         let plan = rollback_plan(SignalRollback::DestroyContainer, true);
         assert_eq!(
             run_plan(&plan, &[]),
-            vec![
-                RollbackStep::RemoveIngress,
-                RollbackStep::DestroyContainer,
-                RollbackStep::RemoveFirewall
-            ],
+            vec![RollbackStep::DestroyContainer, RollbackStep::RemoveFirewall],
             "a destroy rollback must still remove the firewall it created"
         );
     }
@@ -568,7 +523,7 @@ mod tests {
         let plan = rollback_plan(SignalRollback::DestroyContainer, true);
         assert_eq!(
             run_plan(&plan, &[RollbackStep::DestroyContainer]),
-            vec![RollbackStep::RemoveIngress, RollbackStep::DestroyContainer],
+            vec![RollbackStep::DestroyContainer],
             "a failed destroy must not be followed by removing the firewall"
         );
     }
@@ -599,10 +554,14 @@ mod tests {
         // only through its init PID, so the sole moment this plan could remove
         // them is before the stop -- which is the unfiltered-and-still-running
         // state the ordering above exists to prevent. Stopping discards them
-        // anyway, so there is nothing to gain for the exposure.
+        // anyway, so there is nothing to gain for the exposure. No plan removes
+        // them for that reason, which is why there is no step left to name.
         assert!(
-            !plan.contains(&RollbackStep::RemoveIngress),
-            "a stop rollback must not unfilter inbound traffic to a running container"
+            !plan.contains(&RollbackStep::StopContainer)
+                || plan
+                    .iter()
+                    .all(|s| !matches!(s, RollbackStep::DestroyContainer)),
+            "a stop rollback must not also destroy the container"
         );
 
         // A process that created no chain must remove none: the name depends
@@ -622,15 +581,15 @@ mod tests {
         // it, which once argued for removing the chain first, while the name
         // still unambiguously referred to this container. But `lxc-destroy` can
         // fail, and that order would then have unfiltered a container that is
-        // still running. Inbound goes first because it needs a namespace to
-        // enter, and the destroy is what takes that namespace away.
+        // still running.
+        //
+        // Inbound is not a step at all. Those rules live inside the container's
+        // own netns, so the destroy takes them with it: removing them first
+        // would change nothing on success and would strip the inbound deny off
+        // a still-running container on failure.
         assert_eq!(
             rollback_plan(SignalRollback::DestroyContainer, true),
-            vec![
-                RollbackStep::RemoveIngress,
-                RollbackStep::DestroyContainer,
-                RollbackStep::RemoveFirewall
-            ],
+            vec![RollbackStep::DestroyContainer, RollbackStep::RemoveFirewall],
         );
 
         // Same ownership rule, and the destroy is unconditional: a one-shot
@@ -638,7 +597,7 @@ mod tests {
         // ever created.
         assert_eq!(
             rollback_plan(SignalRollback::DestroyContainer, false),
-            vec![RollbackStep::RemoveIngress, RollbackStep::DestroyContainer],
+            vec![RollbackStep::DestroyContainer],
         );
     }
 
@@ -740,8 +699,7 @@ mod tests {
         // Bubblewrap builds the same firewall manager but never registers, so
         // its resources must not become something the watchdog would remove.
         set_active_created(CreatedResources::for_test(true, true, true, true));
-        set_active_pid(4242);
-        let (name, veth, created, netns_pid) = active_snapshot();
+        let (name, veth, created) = active_snapshot();
         assert_eq!(name, None, "no container should be registered yet");
         assert_eq!(
             created,
@@ -749,15 +707,10 @@ mod tests {
             "ownership published with no registered container must be discarded"
         );
         assert_eq!(veth, None);
-        assert_eq!(
-            netns_pid, None,
-            "a netns PID published with no registered container must be discarded"
-        );
 
         // Registering a container opens the slot.
         set_active("ctr-a");
         set_active_veth("veth-a");
-        set_active_pid(1234);
         let v4_chain_only = CreatedResources::for_test(true, false, false, false);
         set_active_created(v4_chain_only);
         assert_eq!(
@@ -766,7 +719,6 @@ mod tests {
                 Some("ctr-a".to_owned()),
                 Some("veth-a".to_owned()),
                 v4_chain_only,
-                Some(1234)
             ),
             "a registered container must see its own identity and ownership"
         );
@@ -788,13 +740,8 @@ mod tests {
         set_active("ctr-b");
         assert_eq!(
             active_snapshot(),
-            (
-                Some("ctr-b".to_owned()),
-                None,
-                CreatedResources::default(),
-                None
-            ),
-            "registering a new container must reset veth, ownership, and netns PID"
+            (Some("ctr-b".to_owned()), None, CreatedResources::default()),
+            "registering a new container must reset both veth and ownership"
         );
 
         clear_active();

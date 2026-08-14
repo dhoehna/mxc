@@ -281,12 +281,6 @@ impl LxcScriptRunner {
         match container.init_pid() {
             Some(pid) => {
                 let _ = writeln!(logger, "Container init PID: {}", pid);
-                if self.destroy_on_exit {
-                    // Tell the watchdog about the netns PID so signal-time
-                    // cleanup can remove the container's INPUT rules before it's
-                    // destroyed.
-                    signal_cleanup::set_active_pid(pid);
-                }
                 let mut mgr = IngressManager::new(&container_name, pid);
                 match mgr.apply_firewall_rules(&request.policy, logger) {
                     Ok(true) => {}

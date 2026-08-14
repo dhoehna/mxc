@@ -141,22 +141,28 @@ const NAME_MINT_ATTEMPTS: usize = 8;
 
 /// Re-mint until the name is free, rather than adopting whatever is there.
 ///
-/// `is_taken` is injected so the decision can be tested without an LXC host.
-/// A probe that cannot answer propagates: "unknown" must not be read as
-/// "free", because that is how a collision becomes an adoption.
+/// `claim` is injected so the decision can be tested without an LXC host. A
+/// probe that cannot answer propagates: "unknown" must not be read as "free",
+/// because that is how a collision becomes an adoption.
 ///
-/// This narrows the collision window but does not close it -- another process
-/// can define the name between the probe and the create.  That is the safe
-/// direction: `create` fails on a name that now exists, so the caller gets an
-/// error rather than someone else's container.
-fn mint_unused_container_name(
+/// The claim closes the collision window rather than merely narrowing it. An
+/// earlier version probed for a free name and returned it, leaving the caller
+/// to create it afterwards; two provisions that minted the same candidate could
+/// both see it free, and the loser would then adopt the winner's container --
+/// handing two callers who each asked for a fresh sandbox the same one. Taking
+/// the lifecycle lock inside the claim makes the probe and the create one
+/// critical section, and a candidate found defined under the lock is re-minted
+/// rather than adopted. Adoption remains correct for a name the caller supplied,
+/// which is a request for *that* container; it is never correct for a name MXC
+/// invented precisely because nobody else was using it.
+fn mint_unused_container_name<T>(
     first: String,
-    mut is_taken: impl FnMut(&str) -> Result<bool, MxcError>,
-) -> Result<String, MxcError> {
+    mut claim: impl FnMut(&str) -> Result<Option<T>, MxcError>,
+) -> Result<(String, T), MxcError> {
     let mut candidate = first;
     for _ in 0..NAME_MINT_ATTEMPTS {
-        if !is_taken(&candidate)? {
-            return Ok(candidate);
+        if let Some(claimed) = claim(&candidate)? {
+            return Ok((candidate, claimed));
         }
         candidate = format!("mxc-{}", mint_random_token());
     }
@@ -194,7 +200,13 @@ fn probe_failed(question: &str, container_name: &str, detail: String) -> MxcErro
 }
 
 fn has_filesystem_policy(policy: &ContainerPolicy) -> bool {
-    !policy.readwrite_paths.is_empty()
+    // `filesystem_specified` is the outermost bit, and it is here for the same
+    // reason `network_specified` is below: an empty `filesystem: {}` block
+    // leaves all three lists empty, indistinguishable from a caller who sent no
+    // filesystem section at all. Without it, a phase that documents "no
+    // filesystem section" silently accepts one and ignores it.
+    policy.filesystem_specified
+        || !policy.readwrite_paths.is_empty()
         || !policy.readonly_paths.is_empty()
         || !policy.denied_paths.is_empty()
 }
@@ -859,25 +871,46 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         reject_start_policy_on_other_phase("provision", &request.policy)?;
 
         let config = config.expect("validated above");
-        let container_name = match resolve_container_name(request)? {
-            ContainerName::Supplied(name) => name,
-            ContainerName::Minted(first) => mint_unused_container_name(first, |candidate| {
-                LxcContainer::new(candidate, None)
-                    .is_defined()
-                    .map_err(|e| probe_failed("exists", candidate, e))
-            })?,
-        };
-        let container = LxcContainer::new(&container_name, None);
-        // Same lock the other phases take. Minting probes for an unused name
-        // and then creates it, so without this two provisions that mint the
-        // same name both see it free and both create; and a supplied name can
-        // race the same way. Holding the lock across the probe and the create
-        // makes the loser adopt, which is what a second provision of a name
-        // that already exists is supposed to do.
-        let _lifecycle_lock = LifecycleLock::acquire(&container, &container_name)?;
-        let created = !container
-            .is_defined()
-            .map_err(|e| probe_failed("exists", &container_name, e))?;
+        // The lock has to be held across the "does this name exist" probe and
+        // whatever that answer leads to, or the answer is stale before it is
+        // used: two provisions both see the name free and both create.
+        //
+        // What a name found defined under the lock *means* differs by origin. A
+        // supplied name is a request for that specific container, so finding it
+        // already there is the adoption the caller asked for. A minted name was
+        // invented because nobody was using it, so finding it defined means the
+        // mint lost a race -- adopting there would hand two callers who each
+        // asked for a fresh sandbox the same container, and the loser would
+        // report `created: false` and never reclaim it.
+        let (container_name, container, _lifecycle_lock, created) =
+            match resolve_container_name(request)? {
+                ContainerName::Supplied(name) => {
+                    let container = LxcContainer::new(&name, None);
+                    let lock = LifecycleLock::acquire(&container, &name)?;
+                    let created = !container
+                        .is_defined()
+                        .map_err(|e| probe_failed("exists", &name, e))?;
+                    (name, container, lock, created)
+                }
+                ContainerName::Minted(first) => {
+                    let (name, (container, lock)) =
+                        mint_unused_container_name(first, |candidate| {
+                            let container = LxcContainer::new(candidate, None);
+                            let lock = LifecycleLock::acquire(&container, candidate)?;
+                            if container
+                                .is_defined()
+                                .map_err(|e| probe_failed("exists", candidate, e))?
+                            {
+                                // Releases as it falls out of scope, so the
+                                // next candidate is not taken while holding a
+                                // lock on this one.
+                                return Ok(None);
+                            }
+                            Ok(Some((container, lock)))
+                        })?;
+                    (name, container, lock, true)
+                }
+            };
         if created {
             container
                 .create(&config.distribution, &config.release)
@@ -976,11 +1009,15 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
                 // The container is up and its inbound deny is not in force, so
                 // leaving it running is exactly the fail-open this guard exists
                 // to prevent. Discover the veth while the container still has
-                // one, then stop it -- which also discards the netns holding any
+                // one, then kill it -- which also discards the netns holding any
                 // partial ingress chain -- and remove the egress state this
                 // start installed.
+                //
+                // Kill, not stop: a graceful `lxc-stop` waits up to 60 s and can
+                // fail outright under systemd-in-userns, and every second of
+                // that wait is a running container with no inbound filtering.
                 let veth = NetworkIptablesManager::discover_veth_interface(container_name);
-                let stopped = container.stop();
+                let stopped = container.kill();
                 signal_cleanup::clear_active();
                 if let Err(stop_err) = stopped {
                     // The container is still up, and the egress chain is the
@@ -1485,9 +1522,36 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_filesystem_block_still_counts_as_a_filesystem_policy() {
+        // An empty `filesystem: {}` leaves all three path lists empty, exactly
+        // as an absent block does, so the lists alone cannot tell a caller who
+        // said nothing from one who said "nothing in particular".  Without the
+        // presence bit, provision/exec/stop/deprovision accepted and ignored a
+        // block the phase matrix says they reject.  Twin of `network_specified`.
+        let policy = ContainerPolicy {
+            filesystem_specified: true,
+            ..Default::default()
+        };
+        assert!(
+            has_filesystem_policy(&policy),
+            "a supplied but empty filesystem block must still be seen"
+        );
+    }
+
+    #[test]
+    fn no_filesystem_block_at_all_is_not_a_filesystem_policy() {
+        // Negative control for the test above: if presence alone always
+        // answered true, every plain provision would be refused.
+        assert!(
+            !has_filesystem_policy(&ContainerPolicy::default()),
+            "a policy with no filesystem section must not look like one"
+        );
+    }
+
+    #[test]
     fn a_minted_name_nobody_holds_is_the_one_used() {
-        let chosen =
-            mint_unused_container_name("mxc-first".to_string(), |_| Ok(false)).expect("free");
+        let (chosen, ()) =
+            mint_unused_container_name("mxc-first".to_string(), |_| Ok(Some(()))).expect("free");
         assert_eq!(
             chosen, "mxc-first",
             "a name that is free must be used as minted"
@@ -1502,9 +1566,9 @@ mod tests {
         // the phase that has to resolve it: by start the name is all that is
         // left, and a caller-supplied name is adopted on purpose.
         let mut probes = 0;
-        let chosen = mint_unused_container_name("mxc-taken".to_string(), |_| {
+        let (chosen, ()) = mint_unused_container_name("mxc-taken".to_string(), |_| {
             probes += 1;
-            Ok(probes == 1)
+            Ok(if probes == 1 { None } else { Some(()) })
         })
         .expect("a free name after one collision");
 
@@ -1520,8 +1584,25 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_that_succeeds_hands_back_what_it_took() {
+        // The claim exists so the caller can hold a lock across it. If the
+        // payload were dropped on the way out, the lock would release before
+        // the create it is meant to cover and the race would be back with the
+        // retry loop still passing its own tests.
+        let (chosen, payload) = mint_unused_container_name("mxc-first".to_string(), |candidate| {
+            Ok(Some(format!("locked:{candidate}")))
+        })
+        .expect("free");
+        assert_eq!(chosen, "mxc-first");
+        assert_eq!(
+            payload, "locked:mxc-first",
+            "the value the claim produced must reach the caller"
+        );
+    }
+
+    #[test]
     fn a_host_that_holds_every_name_is_an_error_not_an_adoption() {
-        let err = mint_unused_container_name("mxc-taken".to_string(), |_| Ok(true))
+        let err = mint_unused_container_name("mxc-taken".to_string(), |_| Ok(None::<()>))
             .expect_err("every candidate was taken");
         assert!(
             err.message.contains("Could not mint an unused"),
@@ -1536,7 +1617,7 @@ mod tests {
         // that fails and is treated as "free" reinstates the adoption this
         // guards against, so the failure has to propagate.
         let err = mint_unused_container_name("mxc-unknown".to_string(), |_| {
-            Err(MxcError::backend_error("lxc-info could not be run"))
+            Err::<Option<()>, _>(MxcError::backend_error("lxc-info could not be run"))
         })
         .expect_err("the probe failed");
         assert!(

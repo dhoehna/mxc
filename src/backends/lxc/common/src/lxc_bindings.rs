@@ -876,7 +876,9 @@ impl LxcContainer {
                 // Killing lxc-attach ended the caller's view of the work, not
                 // the work.  Reap before reporting, and if the reap fails say
                 // so: a bare timeout message would tell the caller the script
-                // stopped when it may still be running.
+                // stopped when it may still be running.  A reap that succeeds
+                // is not a containment guarantee either — see
+                // `reap_marked_processes` for what escapes it.
                 if let Some(token) = marker {
                     if let Err(e) = self.reap_marked_processes(token) {
                         return Err(format!(
@@ -900,6 +902,16 @@ impl LxcContainer {
     /// stopping and restarting the container — would discard the ingress chain
     /// that lives in its network namespace and the rest of the start-time
     /// enforcement, so it trades an orphaned process for an unfiltered sandbox.
+    ///
+    /// The guarantee is exactly what the sentence above says and no more: this
+    /// reaps processes *carrying the marker*, not every descendant of the exec.
+    /// The marker is inherited across `fork`/`exec`, so it reaches descendants
+    /// at any depth — but a process that scrubs its own environment (`env -i`,
+    /// an explicit `unsetenv`) drops off the list and survives the reap.
+    /// Returning `Ok(())` therefore means every *marked* process was killed, not
+    /// that the container is quiet.  Closing that hole needs a per-exec PID
+    /// namespace, which `lxc-attach` does not offer; it is tracked separately
+    /// rather than worked around here.
     #[cfg(target_os = "linux")]
     pub(crate) fn reap_marked_processes(&self, marker: &str) -> Result<(), String> {
         let mut cmd = self.lxc_command("lxc-attach");
@@ -921,8 +933,31 @@ impl LxcContainer {
     }
 
     /// Stop the container.
+    ///
+    /// Graceful: `lxc-stop` asks init to shut down and waits. That is right for
+    /// an explicit lifecycle stop, and wrong for every rollback -- see
+    /// [`kill`](Self::kill).
     pub fn stop(&self) -> Result<(), String> {
         Self::run_status(self.lxc_command("lxc-stop"), "lxc-stop")
+    }
+
+    /// Stop the container immediately, without waiting for a graceful shutdown.
+    ///
+    /// `lxc-stop` on its own waits up to 60 s for init to respond, and on
+    /// distros running systemd as PID 1 in an unprivileged userns init never
+    /// cleanly responds to SIGPWR at all -- so the wait can be the full timeout
+    /// and the stop can still fail.
+    ///
+    /// That is merely slow when a caller asked to stop a sandbox. It is a hole
+    /// when a rollback is stopping a container *because its isolation is not in
+    /// force*: the container keeps running, and keeps accepting traffic, for as
+    /// long as the graceful stop takes. Rollback paths use this instead, so the
+    /// exposure ends now rather than after a shutdown negotiation the guest can
+    /// decline.
+    pub fn kill(&self) -> Result<(), String> {
+        let mut cmd = self.lxc_command("lxc-stop");
+        cmd.arg("-k");
+        Self::run_status(cmd, "lxc-stop -k")
     }
 
     /// Destroy the container (removes rootfs and config).

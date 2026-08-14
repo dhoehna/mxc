@@ -61,6 +61,26 @@ impl FirewallRuleArgs {
 /// container name, so a chain already present under our name belongs to an
 /// earlier or concurrent run and is not ours to remove.
 ///
+/// What `<tool> -S FORWARD` was able to tell us.
+///
+/// The two failure cases are not the same question. A tool that is not
+/// installed cannot be holding a hook, and answering "present" for it invents a
+/// residual that teardown can never remove: every attempt fails, ownership is
+/// retained, and stop and deprovision report an error after doing everything
+/// right. A tool that is installed but whose ruleset would not read is
+/// genuinely unknown, and that one has to fail closed.
+///
+/// The distinction matters on any IPv6-disabled host, where setup deliberately
+/// permits a missing `ip6tables` and installs only v4 state.
+enum ForwardProbe {
+    /// `-S FORWARD` succeeded; this is its output.
+    Dump(String),
+    /// The tool could not be spawned, so it holds no rules at all.
+    ToolAbsent,
+    /// The tool ran and refused, so its ruleset is unknown.
+    Unreadable,
+}
+
 /// Visible to the crate (with private fields) purely so `signal_cleanup` can
 /// carry the value from the runner thread to the watchdog thread. The watchdog
 /// never inspects it; it only hands it back to [`NetworkIptablesManager::force_cleanup`].
@@ -743,11 +763,15 @@ impl NetworkIptablesManager {
         Self::run_firewall_command("ip6tables", args, logger)
     }
 
-    /// Read `<tool> -S FORWARD`, or `None` when the ruleset cannot be read.
-    fn read_forward_chain(tool: &str) -> Option<String> {
+    /// Read `<tool> -S FORWARD`, distinguishing a missing tool from a ruleset
+    /// that would not read.
+    fn probe_forward_chain(tool: &str) -> ForwardProbe {
         match Command::new(tool).args(["-S", "FORWARD"]).output() {
-            Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
-            _ => None,
+            Ok(o) if o.status.success() => {
+                ForwardProbe::Dump(String::from_utf8_lossy(&o.stdout).into_owned())
+            }
+            Ok(_) => ForwardProbe::Unreadable,
+            Err(_) => ForwardProbe::ToolAbsent,
         }
     }
 
@@ -766,15 +790,14 @@ impl NetworkIptablesManager {
     fn chain_exists(tool: &str, chain: &str) -> Result<bool, String> {
         match Command::new(tool).args(["-S", chain]).output() {
             Ok(o) if o.status.success() => Ok(true),
-            Ok(o) if Self::read_forward_chain(tool).is_some() => {
-                let _ = o;
-                Ok(false)
-            }
-            Ok(o) => Err(format!(
-                "{tool} could not read chain {chain} and could not read FORWARD either, so \
-                 whether the chain exists is unknown: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            )),
+            Ok(o) => match Self::probe_forward_chain(tool) {
+                ForwardProbe::Dump(_) | ForwardProbe::ToolAbsent => Ok(false),
+                ForwardProbe::Unreadable => Err(format!(
+                    "{tool} could not read chain {chain} and could not read FORWARD either, so \
+                     whether the chain exists is unknown: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )),
+            },
             Err(_) => Ok(false),
         }
     }
@@ -800,8 +823,7 @@ impl NetworkIptablesManager {
     /// exactly what is present, so an already-clean container issues no
     /// commands at all and a half-installed one removes only its own half.
     fn observe_existing(chain_name: &str) -> Result<CreatedResources, String> {
-        let hooked =
-            |tool: &str| Self::hook_present(Self::read_forward_chain(tool).as_deref(), chain_name);
+        let hooked = |tool: &str| Self::hook_present(&Self::probe_forward_chain(tool), chain_name);
         Ok(CreatedResources {
             v4_chain: Self::chain_exists("iptables", chain_name)?,
             v6_chain: Self::chain_exists("ip6tables", chain_name)?,
@@ -811,7 +833,7 @@ impl NetworkIptablesManager {
     }
 
     /// Whether a FORWARD jump to `chain` should be treated as installed, given
-    /// the `-S FORWARD` dump or `None` when it could not be read.
+    /// what [`probe_forward_chain`](Self::probe_forward_chain) could learn.
     ///
     /// An unreadable FORWARD answers `true`, the same verdict
     /// [`remove_forward_hooks`](Self::remove_forward_hooks) gives it. Answering
@@ -823,12 +845,19 @@ impl NetworkIptablesManager {
     /// container. Being wrong this way strands a chain for a later pass to
     /// reclaim; being wrong the other way removes the filtering.
     ///
+    /// A tool that is not installed is the one case where `false` is not a
+    /// guess but the answer: it holds no rules, so it holds no hook. Reporting
+    /// `true` there would record a residual on every IPv6-disabled host, and
+    /// teardown would then fail forever against an `ip6tables` that does not
+    /// exist -- turning a clean stop into a reported error.
+    ///
     /// Pure so that fail-open-versus-fail-closed decision can be unit-tested
     /// without iptables or a privileged host.
-    fn hook_present(forward_dump: Option<&str>, chain: &str) -> bool {
-        match forward_dump {
-            Some(dump) => !Self::forward_hook_deletions(dump, chain).is_empty(),
-            None => true,
+    fn hook_present(forward: &ForwardProbe, chain: &str) -> bool {
+        match forward {
+            ForwardProbe::Dump(dump) => !Self::forward_hook_deletions(dump, chain).is_empty(),
+            ForwardProbe::ToolAbsent => false,
+            ForwardProbe::Unreadable => true,
         }
     }
 
@@ -877,13 +906,18 @@ impl NetworkIptablesManager {
     /// referenced chain simply fails and the chain stays, owned and filtering,
     /// for a later teardown to retry.
     ///
-    /// An unreadable FORWARD (no privilege, no iptables) answers `false`: the
-    /// question was not answered, so it is read as still hooked. Being wrong
-    /// that way costs a retry; being wrong the other way unfilters a live
-    /// container.
+    /// An unreadable FORWARD answers `false`: the question was not answered, so
+    /// it is read as still hooked. Being wrong that way costs a retry; being
+    /// wrong the other way unfilters a live container. A tool that is not
+    /// installed answers `true`, for the same reason
+    /// [`hook_present`](Self::hook_present) reports no hook for it -- it holds
+    /// no rules, so there is no hook left to remove, and answering `false`
+    /// would schedule a retry that can never succeed.
     fn remove_forward_hooks(tool: &str, chain_name: &str, logger: &mut Logger) -> bool {
-        let Some(dump) = Self::read_forward_chain(tool) else {
-            return false;
+        let dump = match Self::probe_forward_chain(tool) {
+            ForwardProbe::Dump(dump) => dump,
+            ForwardProbe::ToolAbsent => return true,
+            ForwardProbe::Unreadable => return false,
         };
         for deletion in Self::forward_hook_deletions(&dump, chain_name) {
             let args: Vec<&str> = deletion.iter().map(String::as_str).collect();
@@ -892,10 +926,7 @@ impl NetworkIptablesManager {
         // Re-read rather than trust the deletes. A `-D` can fail for a rule
         // another process is also tearing down, and the exit code does not say
         // whether the rule is gone -- only whether this call removed it.
-        match Self::read_forward_chain(tool) {
-            Some(after) => Self::forward_hook_deletions(&after, chain_name).is_empty(),
-            None => false,
-        }
+        !Self::hook_present(&Self::probe_forward_chain(tool), chain_name)
     }
 
     /// Classify whether `ip6tables` is usable, given whether the read-only
@@ -1950,13 +1981,13 @@ mod tests {
 
     #[test]
     fn an_unreadable_forward_is_read_as_still_hooked() {
-        // The dump goes missing when iptables could not be run at all -- a
-        // transient fork/exec failure, or another process holding the xtables
-        // lock. Reading that silence as "no hook" clears the gate in
-        // teardown_created, skips hook removal, and sends teardown on to flush
-        // a chain FORWARD may still jump to, unfiltering a live container.
+        // A tool that ran and refused leaves the question unanswered -- another
+        // process holding the xtables lock, or no privilege to read. Reading
+        // that silence as "no hook" clears the gate in teardown_created, skips
+        // hook removal, and sends teardown on to flush a chain FORWARD may
+        // still jump to, unfiltering a live container.
         assert!(
-            NetworkIptablesManager::hook_present(None, "MXC-abc123"),
+            NetworkIptablesManager::hook_present(&ForwardProbe::Unreadable, "MXC-abc123"),
             "an unanswered probe must not be read as an absent hook"
         );
 
@@ -1965,7 +1996,9 @@ mod tests {
         // by always answering true and stranding every chain.
         assert!(
             !NetworkIptablesManager::hook_present(
-                Some("-P FORWARD ACCEPT\n-A FORWARD -i veth0 -j SOMEONE-ELSE\n"),
+                &ForwardProbe::Dump(
+                    "-P FORWARD ACCEPT\n-A FORWARD -i veth0 -j SOMEONE-ELSE\n".to_string()
+                ),
                 "MXC-abc123"
             ),
             "a readable FORWARD without our jump must report not hooked"
@@ -1973,10 +2006,26 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_that_is_not_installed_holds_no_hook() {
+        // Distinct from the unreadable case above, and the distinction is the
+        // whole point. On an IPv6-disabled host setup deliberately permits a
+        // missing ip6tables and installs only v4 state. Calling that absence
+        // "hooked" records a v6 residual that no teardown can ever clear: every
+        // removal attempt fails against a binary that is not there, ownership is
+        // retained, and a stop that did everything right reports an error.
+        assert!(
+            !NetworkIptablesManager::hook_present(&ForwardProbe::ToolAbsent, "MXC-abc123"),
+            "a tool that cannot be spawned holds no rules, so it holds no hook"
+        );
+    }
+
+    #[test]
     fn a_readable_forward_carrying_our_jump_is_read_as_hooked() {
         assert!(
             NetworkIptablesManager::hook_present(
-                Some("-P FORWARD ACCEPT\n-A FORWARD -i veth0 -j MXC-abc123\n"),
+                &ForwardProbe::Dump(
+                    "-P FORWARD ACCEPT\n-A FORWARD -i veth0 -j MXC-abc123\n".to_string()
+                ),
                 "MXC-abc123"
             ),
             "a FORWARD dump containing our jump must report hooked"

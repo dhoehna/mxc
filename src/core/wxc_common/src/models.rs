@@ -478,6 +478,16 @@ pub struct ContainerPolicy {
     pub readwrite_paths: Vec<String>,
     pub readonly_paths: Vec<String>,
     pub denied_paths: Vec<String>,
+    /// Whether the caller supplied a `filesystem` block on the wire (any field
+    /// present), captured at parse time. The twin of `network_specified`, and
+    /// necessary for the same reason: an empty `filesystem: {}` leaves all three
+    /// path lists empty, exactly as an absent block does, so the lists alone
+    /// cannot tell a caller who said nothing from one who said "nothing in
+    /// particular". Backends that reject a filesystem policy on a phase where
+    /// the mount set is immutable need the difference. Parse-derived, never on
+    /// the wire.
+    #[serde(skip)]
+    pub filesystem_specified: bool,
     pub fallback: FallbackPolicy,
     pub default_network_policy: NetworkPolicy,
     /// Whether the wire config carried an explicit `network.defaultPolicy`.

@@ -949,7 +949,12 @@ fn convert_wire_config(
         }
     }
 
-    // Filesystem section
+    // Filesystem section. Capture presence before the typed mapping consumes
+    // `cfg.filesystem`, for the same reason the network section does it: an
+    // empty block leaves the path lists exactly as an absent one does, so a
+    // phase that documents "no filesystem section" cannot otherwise tell them
+    // apart.
+    policy.filesystem_specified = cfg.filesystem.is_some();
     if let Some(fscfg) = cfg.filesystem {
         if let Some(v) = fscfg.denied_paths {
             policy.denied_paths = v;
