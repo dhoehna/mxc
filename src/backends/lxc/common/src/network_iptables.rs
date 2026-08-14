@@ -785,16 +785,35 @@ impl NetworkIptablesManager {
     /// exactly what is present, so an already-clean container issues no
     /// commands at all and a half-installed one removes only its own half.
     fn observe_existing(chain_name: &str) -> CreatedResources {
-        let hooked = |tool: &str| {
-            Self::read_forward_chain(tool)
-                .map(|dump| !Self::forward_hook_deletions(&dump, chain_name).is_empty())
-                .unwrap_or(false)
-        };
+        let hooked =
+            |tool: &str| Self::hook_present(Self::read_forward_chain(tool).as_deref(), chain_name);
         CreatedResources {
             v4_chain: Self::chain_exists("iptables", chain_name),
             v6_chain: Self::chain_exists("ip6tables", chain_name),
             v4_hook: hooked("iptables"),
             v6_hook: hooked("ip6tables"),
+        }
+    }
+
+    /// Whether a FORWARD jump to `chain` should be treated as installed, given
+    /// the `-S FORWARD` dump or `None` when it could not be read.
+    ///
+    /// An unreadable FORWARD answers `true`, the same verdict
+    /// [`remove_forward_hooks`](Self::remove_forward_hooks) gives it. Answering
+    /// `false` would clear the `created.*_hook` gate in
+    /// [`teardown_created`](Self::teardown_created), skip hook removal
+    /// entirely, and let `teardown_chain` flush a chain whose jump is still
+    /// installed -- and an emptied chain that is still hooked returns to its
+    /// caller instead of reaching its own closing DROP, which unfilters a live
+    /// container. Being wrong this way strands a chain for a later pass to
+    /// reclaim; being wrong the other way removes the filtering.
+    ///
+    /// Pure so that fail-open-versus-fail-closed decision can be unit-tested
+    /// without iptables or a privileged host.
+    fn hook_present(forward_dump: Option<&str>, chain: &str) -> bool {
+        match forward_dump {
+            Some(dump) => !Self::forward_hook_deletions(dump, chain).is_empty(),
+            None => true,
         }
     }
 
@@ -1885,6 +1904,41 @@ mod tests {
             fake.issued().is_empty(),
             "...and must not issue a single command, got: {:?}",
             fake.issued()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_forward_is_read_as_still_hooked() {
+        // The dump goes missing when iptables could not be run at all -- a
+        // transient fork/exec failure, or another process holding the xtables
+        // lock. Reading that silence as "no hook" clears the gate in
+        // teardown_created, skips hook removal, and sends teardown on to flush
+        // a chain FORWARD may still jump to, unfiltering a live container.
+        assert!(
+            NetworkIptablesManager::hook_present(None, "MXC-abc123"),
+            "an unanswered probe must not be read as an absent hook"
+        );
+
+        // Negative control: a FORWARD that really is free of our jump must
+        // still report not-hooked, so the assertion above cannot be satisfied
+        // by always answering true and stranding every chain.
+        assert!(
+            !NetworkIptablesManager::hook_present(
+                Some("-P FORWARD ACCEPT\n-A FORWARD -i veth0 -j SOMEONE-ELSE\n"),
+                "MXC-abc123"
+            ),
+            "a readable FORWARD without our jump must report not hooked"
+        );
+    }
+
+    #[test]
+    fn a_readable_forward_carrying_our_jump_is_read_as_hooked() {
+        assert!(
+            NetworkIptablesManager::hook_present(
+                Some("-P FORWARD ACCEPT\n-A FORWARD -i veth0 -j MXC-abc123\n"),
+                "MXC-abc123"
+            ),
+            "a FORWARD dump containing our jump must report hooked"
         );
     }
 

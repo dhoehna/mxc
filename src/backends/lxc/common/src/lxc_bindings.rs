@@ -329,6 +329,43 @@ impl LxcContainer {
             })
     }
 
+    /// Replace the container's config file with `contents` in one atomic step.
+    ///
+    /// [`std::fs::write`] truncates in place, so a signal, crash, or OOM between
+    /// the truncate and the last byte leaves the container's durable config
+    /// partial or empty. liblxc re-reads that file on every start, so a
+    /// half-written rewrite silently drops the entries a tightened policy
+    /// depends on -- the failure lands on the next start, far from the write
+    /// that caused it. Writing a sibling temporary and renaming it over the
+    /// target makes the swap atomic: a concurrent reader observes either the
+    /// whole old config or the whole new one, never a truncated prefix.
+    ///
+    /// The temporary is created beside the target so the rename stays inside one
+    /// filesystem, and it is flushed before the rename so the bytes are durable
+    /// before anything points at them. It carries the process id so two
+    /// processes rewriting the same config cannot clobber each other's
+    /// temporary, and it is removed on every failure path so a failed rewrite
+    /// leaves no residue.
+    fn write_config_atomically(config_path: &str, contents: &str) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let temp_path = format!("{}.mxc-tmp-{}", config_path, std::process::id());
+        let write_temp = || -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&temp_path)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        };
+        if let Err(e) = write_temp() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&temp_path, config_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Remove every configuration line for `key` from the container's config
     /// file.
     ///
@@ -369,7 +406,7 @@ impl LxcContainer {
             }
         }
 
-        std::fs::write(&config_path, out).map_err(|e| {
+        Self::write_config_atomically(&config_path, &out).map_err(|e| {
             format!(
                 "Failed to rewrite config to clear {}: {} (config file: {})",
                 key, e, config_path
@@ -459,7 +496,7 @@ impl LxcContainer {
             i += 1;
         }
 
-        std::fs::write(&config_path, out).map_err(|e| {
+        Self::write_config_atomically(&config_path, &out).map_err(|e| {
             format!(
                 "Failed to rewrite config to clear MXC mounts: {} (config file: {})",
                 e, config_path
@@ -659,6 +696,66 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    #[test]
+    fn an_atomic_config_rewrite_replaces_the_file_and_leaves_no_temporary() {
+        let dir = std::env::temp_dir().join(format!("mxc-atomic-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test temp dir");
+        let target = dir.join("config");
+        let path = target.to_string_lossy().to_string();
+
+        std::fs::write(&target, "lxc.mount.entry = old\nlxc.mount.entry = stale\n")
+            .expect("seed the original config");
+        LxcContainer::write_config_atomically(&path, "lxc.mount.entry = new\n")
+            .expect("rewrite must succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read the rewritten config"),
+            "lxc.mount.entry = new\n",
+            "the rewrite must fully replace the previous contents"
+        );
+
+        // The swap must not leave its sibling behind. liblxc reads the config
+        // directory, and a surviving *.mxc-tmp-* is a second copy of a policy
+        // that was meant to be replaced, not merely litter.
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("list the config directory")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "config")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a successful write must leave no temporary, found: {:?}",
+            leftovers
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_atomic_config_rewrite_reports_failure_without_touching_the_original() {
+        // A directory standing where the config should be makes both the
+        // temporary create and the rename fail. The original must survive an
+        // unwritable target rather than being truncated on the way to an error,
+        // which is the whole reason the write does not go in place.
+        let dir = std::env::temp_dir().join(format!("mxc-atomic-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).expect("test temp dir");
+
+        let err = LxcContainer::write_config_atomically(
+            &dir.join("config").to_string_lossy(),
+            "lxc.mount.entry = new\n",
+        );
+        assert!(err.is_err(), "writing over a directory must report failure");
+        assert!(
+            dir.join("config").is_dir(),
+            "the failed write must not have replaced the target"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
