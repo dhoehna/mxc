@@ -215,6 +215,19 @@ $null = $results.Add((Run-WslcTest "wslc_stderr.json" -OutputContains "stdout me
 $null = $results.Add((Run-WslcTest "wslc_large_output.json"))
 
 Write-Host "`n--- Filesystem Tests ---" -ForegroundColor Cyan
+
+# Seed the readonly fixture the same way the LXC and bubblewrap suites do
+# (run_lxc_filesystem_test.sh:21, run_bwrap_filesystem_test.sh:25).  Without
+# this, wslc_readonly_mount.json cats a file that was never created and fails
+# for a missing fixture rather than for a mount defect.
+$readonlyFixtureDir = "C:\workspace"
+$readonlyFixture = Join-Path $readonlyFixtureDir "test.txt"
+if (-not (Test-Path $readonlyFixtureDir))
+{
+    $null = New-Item -ItemType Directory -Path $readonlyFixtureDir -Force
+}
+Set-Content -Path $readonlyFixture -Value "test content" -Encoding ascii
+
 # wslc_filesystem.json also asserts cpuCount + memoryMb enforcement via nproc and /proc/meminfo.
 $null = $results.Add((Run-WslcTest "wslc_filesystem.json" `
     -OutputMatches "(?s)PASS: filesystem mount visible.*PASS: cpuCount enforced.*PASS: memoryMb enforced"))
