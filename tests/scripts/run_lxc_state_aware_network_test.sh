@@ -11,7 +11,9 @@
 # default-deny policy, and they differ only in whether the field was present in
 # the wire request, so together they pin presence-driven behavior rather than
 # value-driven behavior. Case 4 completes the pair by showing presence alone is
-# not enough. Case 8 covers `filesystem_specified`, the other presence bit.
+# not enough. Case 9 does the same job for `filesystem_specified`: an empty
+# filesystem block leaves every path list empty, so only the recorded presence
+# of the block distinguishes it from a request that carried no block at all.
 #
 # Case 3 is quarantined, not weakened; see the comment at its call site.
 #
@@ -137,14 +139,31 @@ CONFIG_EMPTY_ALLOWED="$CONFIG_DIR/lxc_state_aware_start_empty_allowed_hosts.json
 CONFIG_NONEMPTY_ALLOWED="$CONFIG_DIR/lxc_state_aware_start_nonempty_allowed_hosts_capabilities.json"
 CONFIG_PROVISION_NETWORK="$CONFIG_DIR/lxc_state_aware_start_network_at_provision_rejected.json"
 CONFIG_PROVISION_FILESYSTEM="$CONFIG_DIR/lxc_state_aware_start_filesystem_at_provision_rejected.json"
+CONFIG_PROVISION_FILESYSTEM_EMPTY="$CONFIG_DIR/lxc_state_aware_start_filesystem_empty_at_provision_rejected.json"
 RESULTS=""
 
 verify_fixture_contracts() {
     for cfg in "$CONFIG_NO_NETWORK" "$CONFIG_BLOCK_CAPS" "$CONFIG_BLOCK_FIREWALL" \
         "$CONFIG_ALLOW_CAPS" "$CONFIG_EMPTY_ALLOWED" "$CONFIG_NONEMPTY_ALLOWED" \
-        "$CONFIG_PROVISION_NETWORK" "$CONFIG_PROVISION_FILESYSTEM"; do
+        "$CONFIG_PROVISION_NETWORK" "$CONFIG_PROVISION_FILESYSTEM" \
+        "$CONFIG_PROVISION_FILESYSTEM_EMPTY"; do
         [ -f "$cfg" ] || fail_now "fixture not found: $cfg"
     done
+
+    # Case 9's fixture must stay EMPTY. A filesystem block carrying any path
+    # list satisfies has_filesystem_policy through that list, so the case would
+    # pass with the presence bit deleted and would pin nothing. This guard is
+    # the only thing keeping the case honest.
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import json,sys
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+if cfg.get("filesystem") != {}:
+    raise SystemExit("fixture drift in %s: filesystem block must be exactly {} so the case isolates the presence bit" % sys.argv[1])' \
+            "$CONFIG_PROVISION_FILESYSTEM_EMPTY" || fail_now "fixture drift in $CONFIG_PROVISION_FILESYSTEM_EMPTY"
+    else
+        grep -q '"filesystem"[[:space:]]*:[[:space:]]*{}' "$CONFIG_PROVISION_FILESYSTEM_EMPTY" \
+            || fail_now "fixture drift in $CONFIG_PROVISION_FILESYSTEM_EMPTY: filesystem block must be exactly {}"
+    fi
 
     # Case 8's fixture is guarded here rather than in the block below so the
     # existing seven keep their positional indices.
@@ -437,14 +456,17 @@ run_provision_rejection_case "7" "$CONFIG_PROVISION_NETWORK" \
     'network.defaultPolicy=block sent at provision' \
     'matrix marks network as rejected at provision'
 
-# Clause: the LXC matrix marks filesystem as rejected at provision. This is the
-# observable surface of `filesystem_specified`, the PR's other new presence bit:
-# a filesystem block present in the wire request is what the phase refuses. Its
-# empty-block semantics are deliberately not asserted -- no doc states them, and
-# an undocumented effect must not be invented and pinned.
+# Clause: the LXC matrix marks filesystem as rejected at provision. Case 8 sends
+# a populated block, which the path lists alone are enough to refuse; case 9
+# sends an empty one, where the lists are all empty and only the recorded
+# presence of the block can tell the phase that a caller sent it at all.
 run_provision_rejection_case "8" "$CONFIG_PROVISION_FILESYSTEM" \
     'filesystem block sent at provision' \
     'matrix marks filesystem as rejected at provision'
+
+run_provision_rejection_case "9" "$CONFIG_PROVISION_FILESYSTEM_EMPTY" \
+    'empty filesystem block sent at provision' \
+    'matrix rejects the filesystem field on presence, not on content'
 
 echo "================================"
 echo "Results: $PASSED passed, $FAILED failed, $QUARANTINED quarantined"
