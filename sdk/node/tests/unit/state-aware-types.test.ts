@@ -268,7 +268,7 @@ describe('LxcStartConfig', () => {
   it('rejects allowLocalNetwork, which the LXC backend never enforces', () => {
     const cfg: StartConfigFor<'lxc'> = {
       network: {
-        // @ts-expect-error — accepted by the wire type but ignored by LXC.
+        // @ts-expect-error — start rejects it with a policy-validation error.
         allowLocalNetwork: true,
       },
     };
@@ -285,45 +285,33 @@ describe('LxcStartConfig', () => {
     assert.ok(cfg);
   });
 
-  it('requires an explicit firewall mode when the policy carries a restriction', () => {
-    // Rust treats an omitted enforcementMode as `Capabilities` and rejects any
-    // restriction it cannot enforce, so an optional mode made these compile and
-    // then fail at run time. See `requires_firewall_enforcement`,
-    // src/backends/lxc/common/src/state_aware.rs:166.
+  it('leaves the mode/restriction rule to start, which is where it can be evaluated', () => {
+    // `requires_firewall_enforcement` turns on whether the host lists are empty
+    // (src/backends/lxc/common/src/state_aware.rs:249), and a `string[]`
+    // assembled at run time has no compile-time length.  Every policy below
+    // must therefore type check; a restrictive one without `enforcementMode` is
+    // refused at start by `reject_unenforceable_network_policy`
+    // (state_aware.rs:309), covered by the Rust test
+    // `capabilities_mode_cannot_carry_lxc_network_restrictions`.
+    const restrictive: LxcNetworkConfig[] = [
+      { defaultPolicy: 'block' },
+      { allowedHosts: ['example.com'] },
+      { blockedHosts: ['blocked.example.com'] },
+    ];
 
-    // @ts-expect-error — an explicit default-deny is a restriction, so the mode is required.
-    const defaultDeny: LxcNetworkConfig = { defaultPolicy: 'block' };
+    // Not restrictions, so they run without a firewall mode.  The policy-free
+    // start is the one run_lxc_state_aware_test.sh exercises.
+    const permitted: LxcNetworkConfig[] = [
+      { defaultPolicy: 'allow' },
+      {},
+      { allowedHosts: [] },
+      { blockedHosts: [] },
+    ];
 
-    // @ts-expect-error — allowedHosts is a restriction, so the mode is required.
-    const allowed: LxcNetworkConfig = { allowedHosts: ['example.com'] };
-
-    // @ts-expect-error — blockedHosts is a restriction, so the mode is required.
-    const blocked: LxcNetworkConfig = { blockedHosts: ['blocked.example.com'] };
-
-    assert.ok(defaultDeny);
-    assert.ok(allowed);
-    assert.ok(blocked);
-  });
-
-  it('still accepts the policies Rust does not treat as restrictive', () => {
-    // `requires_firewall_enforcement` counts only a non-empty allowedHosts, a
-    // non-empty blockedHosts, or an explicit `defaultPolicy: 'block'`. An
-    // explicit 'allow' and a policy-free start are not restrictions and must
-    // keep compiling without an enforcementMode; the latter is the plain start
-    // exercised by run_lxc_state_aware_test.sh, which must not be rejected.
-    const explicitAllow: LxcNetworkConfig = { defaultPolicy: 'allow' };
-    const policyFree: LxcNetworkConfig = {};
-
-    // An empty list is not a restriction either — `requires_firewall_enforcement`
-    // asks `!is_empty()`. Declaring these `never` rejected a value the backend
-    // accepts: `{ allowedHosts: [] }` matched neither arm of the union.
-    const emptyAllowed: LxcNetworkConfig = { allowedHosts: [] };
-    const emptyBlocked: LxcNetworkConfig = { blockedHosts: [] };
-
-    assert.strictEqual(explicitAllow.defaultPolicy, 'allow');
-    assert.ok(policyFree);
-    assert.deepStrictEqual(emptyAllowed.allowedHosts, []);
-    assert.deepStrictEqual(emptyBlocked.blockedHosts, []);
+    assert.deepStrictEqual(restrictive[0], { defaultPolicy: 'block' });
+    assert.deepStrictEqual(restrictive[1], { allowedHosts: ['example.com'] });
+    assert.deepStrictEqual(permitted[1], {});
+    assert.deepStrictEqual(permitted[2], { allowedHosts: [] });
   });
 });
 

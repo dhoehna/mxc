@@ -108,83 +108,48 @@ export interface LxcProvisionConfig {
 /**
  * Network policy accepted by LXC state-aware `start`.
  *
- * Deliberately narrowed to the fields this backend actually honors, rather
- * than derived from `NetworkConfig`, so configurations that would fail or be
- * silently ignored are caught at compile time:
+ * Narrowed to the fields an LXC caller can usefully set, rather than derived
+ * from `NetworkConfig`:
  *
  * - `proxy` is rejected at start (`apply_network_policy` returns a
  *   policy-validation error).
  * - `removeRulesOnExit` is an SDK-only field emitted inside the top-level
  *   `network` object. Rust's `wire::Network` is `deny_unknown_fields`, so
  *   sending it fails the whole request.
- * - `allowLocalNetwork` deserializes, but start rejects it with a
- *   policy-validation error whatever the enforcement mode
- *   (`src/backends/lxc/common/src/state_aware.rs:322`). The container's
- *   inbound chain can only open a source range, and opening every source is
- *   broader than the local-network access requested.
- * - `enforcementMode` is restricted to the firewall modes. LXC has no
+ * - `allowLocalNetwork` deserializes, but start rejects
+ *   `allowLocalNetwork: true` with a policy-validation error whatever the
+ *   enforcement mode (`src/backends/lxc/common/src/state_aware.rs:322`). The
+ *   container's inbound chain can only open a source range, and opening every
+ *   source is broader than the local-network access requested.
+ * - `enforcementMode` is restricted to the firewall modes.  LXC has no
  *   capability-based network enforcement, so `'capabilities'` cannot enforce
- *   anything; start rejects it when the policy carries any restriction.
+ *   anything.
  *
- * The union below is what makes that last bullet true at compile time. An
- * optional `enforcementMode` alone did not: `{ defaultPolicy: 'block' }` type
- * checked, then failed at run time, because Rust treats an omitted mode as
- * `Capabilities` and rejects a restriction it cannot enforce.
- *
- * The split mirrors `requires_firewall_enforcement`
- * (`src/backends/lxc/common/src/state_aware.rs:166`) exactly. A restriction is
- * a non-empty `allowedHosts`, a non-empty `blockedHosts`, or an explicit
- * `defaultPolicy: 'block'` — and nothing else. An explicit
- * `defaultPolicy: 'allow'`, an omitted `defaultPolicy`, and an *empty*
- * `allowedHosts` or `blockedHosts` are *not* restrictions, so they must keep
- * working without an `enforcementMode`; the plain start in
- * `run_lxc_state_aware_test.sh` is exactly that case.
+ * Whether a given policy *needs* a firewall mode is deliberately not expressed
+ * here.  `requires_firewall_enforcement`
+ * (`src/backends/lxc/common/src/state_aware.rs:249`) turns on whether
+ * `allowedHosts` and `blockedHosts` are *empty*, which TypeScript cannot see:
+ * a `string[]` assembled at run time may hold a restriction or none.  A type
+ * that tried to mirror that predicate both rejected configurations the backend
+ * accepts and admitted ones it refuses, so the rule lives where it can
+ * actually be evaluated.  Omit `enforcementMode` on a policy carrying a
+ * restriction and start fails with a policy-validation error naming the fix
+ * (`reject_unenforceable_network_policy`, state_aware.rs:309).
  */
-type LxcFirewallEnforcementMode = 'firewall' | 'both';
-
-/**
- * A policy carrying at least one restriction LXC can only deliver through
- * iptables. `enforcementMode` is mandatory here.
- */
-export interface LxcRestrictedNetworkConfig {
+export interface LxcNetworkConfig {
   /** LXC enforces network policy only via iptables. */
-  enforcementMode: LxcFirewallEnforcementMode;
+  enforcementMode?: 'firewall' | 'both';
+  /**
+   * An explicit `'block'` is a restriction, so start refuses it without a
+   * firewall mode rather than let the container run believing it is
+   * default-deny while no iptables rule enforces that.
+   */
   defaultPolicy?: NetworkConfig['defaultPolicy'];
+  /** A non-empty list is a restriction and requires `enforcementMode`. */
   allowedHosts?: NetworkConfig['allowedHosts'];
+  /** A non-empty list is a restriction and requires `enforcementMode`. */
   blockedHosts?: NetworkConfig['blockedHosts'];
 }
-
-/**
- * A policy expressing no restriction. `enforcementMode` may be omitted, and
- * the restrictive fields are forbidden rather than optional so that adding one
- * moves the value to `LxcRestrictedNetworkConfig`, where the mode is required.
- */
-export interface LxcUnrestrictedNetworkConfig {
-  /** LXC enforces network policy only via iptables. */
-  enforcementMode?: LxcFirewallEnforcementMode;
-  /** Only the non-restrictive default is expressible without a firewall mode. */
-  defaultPolicy?: Extract<NetworkConfig['defaultPolicy'], 'allow'>;
-  /**
-   * Only an empty list is expressible without a firewall mode. Rust counts a
-   * list as a restriction when it is non-empty, so `[]` is no restriction and
-   * `never` here rejected a value the backend accepts: `{ allowedHosts: [] }`
-   * matched neither arm.
-   *
-   * This is the literal `[]` only, and deliberately so. A `string[]` whose
-   * length is not known until runtime might hold a restriction, and widening
-   * this to accept one would let `{ allowedHosts: ['evil.com'] }` through with
-   * no `enforcementMode` -- which starts a container the backend never
-   * filters. Build a list at runtime and you belong in
-   * {@link LxcRestrictedNetworkConfig}: set `enforcementMode`, which is valid
-   * whether or not the list turns out to be empty.
-   */
-  allowedHosts?: [];
-  blockedHosts?: [];
-}
-
-export type LxcNetworkConfig =
-  | LxcRestrictedNetworkConfig
-  | LxcUnrestrictedNetworkConfig;
 
 export interface LxcStartConfig {
   /** Schema version (semver). */

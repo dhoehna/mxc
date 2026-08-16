@@ -1384,6 +1384,35 @@ mod tests {
         };
         assert!(requires_firewall_enforcement(&policy));
         assert!(!uses_firewall_mode(&policy));
+
+        // Assert the refusal itself, not only the two predicates behind it.
+        // The SDK once restated this rule as a TypeScript union, which could
+        // not hold: the predicate turns on whether a host list is empty, and a
+        // list assembled at run time has no compile-time length.  This gate is
+        // the only control, so every restriction source is checked here.
+        for restriction in [
+            restrictive_policy(),
+            ContainerPolicy {
+                allowed_hosts: vec!["example.com".to_string()],
+                ..Default::default()
+            },
+            ContainerPolicy {
+                default_network_policy: NetworkPolicy::Block,
+                default_network_policy_present: true,
+                ..Default::default()
+            },
+        ] {
+            let policy = ContainerPolicy {
+                network_enforcement_mode: NetworkEnforcementMode::Capabilities,
+                ..restriction
+            };
+            let err = reject_unenforceable_network_policy(&policy)
+                .expect_err("a restriction under Capabilities has no enforceable implementation");
+            assert!(
+                format!("{err}").contains("enforcementMode"),
+                "the refusal has to name the field the caller must set, got {err}"
+            );
+        }
     }
 
     #[test]

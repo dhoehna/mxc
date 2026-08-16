@@ -1717,8 +1717,9 @@ raw-JSON caller that sends it is not rejected.
 | `ui` | ignored | ignored | ignored | ignored | ignored |
 
 > **LXC `network` constraints.** `network.proxy` is rejected at start. LXC enforces
-> network policy only through iptables, so a policy carrying `allowedHosts` or
-> `blockedHosts` must set `enforcementMode` to `"firewall"` or `"both"`; under
+> network policy only through iptables, so a policy carrying a *non-empty*
+> `allowedHosts` or `blockedHosts` must set `enforcementMode` to `"firewall"` or
+> `"both"`; an empty list is not a restriction and needs no mode. Under
 > `"capabilities"` (the default when the field is omitted) start fails rather than
 > silently leaving the container unfiltered. In a firewall mode the veth is not
 > discovered after start: the name is derived from the container name and pinned to
