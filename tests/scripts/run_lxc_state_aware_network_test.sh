@@ -142,13 +142,23 @@ CONFIG_NONEMPTY_ALLOWED="$CONFIG_DIR/lxc_state_aware_start_nonempty_allowed_host
 CONFIG_PROVISION_NETWORK="$CONFIG_DIR/lxc_state_aware_start_network_at_provision_rejected.json"
 CONFIG_PROVISION_FILESYSTEM="$CONFIG_DIR/lxc_state_aware_start_filesystem_at_provision_rejected.json"
 CONFIG_PROVISION_FILESYSTEM_EMPTY="$CONFIG_DIR/lxc_state_aware_start_filesystem_empty_at_provision_rejected.json"
+CONFIG_BLOCK_BOTH="$CONFIG_DIR/lxc_state_aware_start_default_block_both.json"
+CONFIG_ALLOWED_FIREWALL="$CONFIG_DIR/lxc_state_aware_start_allowed_hosts_firewall.json"
+CONFIG_BLOCKED_CAPS="$CONFIG_DIR/lxc_state_aware_start_blocked_hosts_capabilities.json"
+CONFIG_ALLOW_LOCAL="$CONFIG_DIR/lxc_state_aware_start_allow_local_network.json"
+CONFIG_PROXY="$CONFIG_DIR/lxc_state_aware_start_proxy.json"
+CONFIG_PROXY_EXTERNAL="$CONFIG_DIR/lxc_state_aware_start_proxy_external.json"
+CONFIG_FILESYSTEM_PATHS="$CONFIG_DIR/lxc_state_aware_start_filesystem_paths.json"
 RESULTS=""
 
 verify_fixture_contracts() {
     for cfg in "$CONFIG_NO_NETWORK" "$CONFIG_BLOCK_CAPS" "$CONFIG_BLOCK_FIREWALL" \
         "$CONFIG_ALLOW_CAPS" "$CONFIG_EMPTY_ALLOWED" "$CONFIG_NONEMPTY_ALLOWED" \
         "$CONFIG_PROVISION_NETWORK" "$CONFIG_PROVISION_FILESYSTEM" \
-        "$CONFIG_PROVISION_FILESYSTEM_EMPTY"; do
+        "$CONFIG_PROVISION_FILESYSTEM_EMPTY" "$CONFIG_BLOCK_BOTH" \
+        "$CONFIG_ALLOWED_FIREWALL" "$CONFIG_BLOCKED_CAPS" \
+        "$CONFIG_ALLOW_LOCAL" "$CONFIG_PROXY" "$CONFIG_PROXY_EXTERNAL" \
+        "$CONFIG_FILESYSTEM_PATHS"; do
         [ -f "$cfg" ] || fail_now "fixture not found: $cfg"
     done
 
@@ -208,6 +218,7 @@ if cases[6].get("network") != {"defaultPolicy": "block"}:
 if "sandboxId" in cases[6]:
     fail(6, "case 7 must not hard-code a sandboxId")
 PY
+        [ $? -eq 0 ] || fail_now "fixture drift in the case 1-7 configs"
     else
         grep -q '"network"' "$CONFIG_NO_NETWORK" && fail_now "fixture drift in $CONFIG_NO_NETWORK: case 1 must have no network block"
         grep -q '"defaultPolicy"[[:space:]]*:[[:space:]]*"block"' "$CONFIG_BLOCK_CAPS" || fail_now "fixture drift in $CONFIG_BLOCK_CAPS: missing defaultPolicy=block"
@@ -222,7 +233,57 @@ PY
         grep -q '"defaultPolicy"[[:space:]]*:[[:space:]]*"block"' "$CONFIG_PROVISION_NETWORK" || fail_now "fixture drift in $CONFIG_PROVISION_NETWORK: missing defaultPolicy=block"
         grep -q '"sandboxId"' "$CONFIG_PROVISION_NETWORK" && fail_now "fixture drift in $CONFIG_PROVISION_NETWORK: must not hard-code sandboxId"
     fi
-    echo "Fixture drift guard passed for all seven LXC state-aware network configs."
+
+    # Guarded in its own block so the seven above keep their positional indices.
+    # Each of these fixtures isolates one field, and a field that drifts into a
+    # neighbouring fixture would let a case pass while pinning nothing.
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$CONFIG_BLOCK_BOTH" "$CONFIG_ALLOWED_FIREWALL" "$CONFIG_BLOCKED_CAPS" \
+            "$CONFIG_ALLOW_LOCAL" "$CONFIG_PROXY" "$CONFIG_FILESYSTEM_PATHS" \
+            "$CONFIG_PROXY_EXTERNAL" <<'PY'
+import json
+import sys
+
+paths = sys.argv[1:]
+cases = [json.load(open(path, encoding="utf-8")) for path in paths]
+
+def fail(index, message):
+    raise SystemExit(f"fixture drift in {paths[index]}: {message}")
+
+for i, case in enumerate(cases):
+    if case.get("phase") != "start" or case.get("sandboxId") != "__SANDBOX_ID__":
+        fail(i, "must be a start request carrying the sandbox id placeholder")
+
+if cases[0].get("network") != {"defaultPolicy": "block", "enforcementMode": "both"}:
+    fail(0, "case 11 must carry defaultPolicy=block with enforcementMode=both")
+if cases[1].get("network") != {"allowedHosts": ["example.com"], "enforcementMode": "firewall"}:
+    fail(1, "case 12 must carry one allowedHosts entry with enforcementMode=firewall")
+if cases[2].get("network") != {"blockedHosts": ["evil.example.com"]}:
+    fail(2, "case 13 must carry one blockedHosts entry and no enforcementMode")
+if cases[3].get("network", {}).get("allowLocalNetwork") is not True:
+    fail(3, "case 14 must request allowLocalNetwork=true")
+if cases[4].get("network") != {"proxy": {"builtinTestServer": True}}:
+    fail(4, "case 15 must carry exactly the builtin-test-server proxy and nothing else: an "
+            "external proxy url, a host list, or an enforcementMode is refused earlier by a "
+            "shared parse-time rule, so the case would pass without ever reaching the LXC "
+            "start verdict it exists to pin")
+if cases[5].get("filesystem") != {
+    "readonlyPaths": ["/mxc-e2e-ro"],
+    "deniedPaths": ["/mxc-e2e-denied"],
+}:
+    fail(5, "case 16 must carry exactly the readonly and denied paths the case creates on the host")
+if "network" in cases[5]:
+    fail(5, "case 16 must carry no network block so it isolates the filesystem fields")
+if not cases[6].get("network", {}).get("proxy", {}).get("url"):
+    fail(6, "case 15's second half must carry an external proxy url, which is the form a "
+            "production config uses")
+if cases[6].get("network", {}).get("proxy", {}).get("builtinTestServer"):
+    fail(6, "case 15's second half must not be the builtin form; the two halves exist to cover "
+            "the two different refusal routes")
+PY
+        [ $? -eq 0 ] || fail_now "fixture drift in the field-isolation configs"
+    fi
+    echo "Fixture drift guard passed for all LXC state-aware network configs."
 }
 
 make_request_from_config() {
@@ -488,6 +549,158 @@ run_provision_rejection_case() {
     record_result "$case_no" "$config" "$cause" "$expected" "$actual" "$status"
 }
 
+FS_RO_DIR="/mxc-e2e-ro"
+FS_DENIED_DIR="/mxc-e2e-denied"
+FS_SENTINEL="MXC_E2E_FS_SENTINEL"
+
+# The filesystem lists are the one part of the start policy whose effect is not
+# visible in iptables, so this case reads it where it does show: from inside the
+# container. Host directories are created first because the parser refuses paths
+# that do not exist (roadmap item 8), and each carries a sentinel file so a mount
+# that silently did not happen cannot be mistaken for one that did.
+run_filesystem_start_case() {
+    local case_no="$1"
+    local config="$2"
+    local cause="$3"
+    local clause="$4"
+    local expected='start succeeds, the readonly path is readable but not writable, and the denied path is masked'
+    local req="$WORK_DIR/case_${case_no}.json"
+    local out rc actual status probe
+
+    rm -rf "$FS_RO_DIR" "$FS_DENIED_DIR"
+    mkdir -p "$FS_RO_DIR" "$FS_DENIED_DIR" || fail_now "case $case_no could not create its host fixture directories"
+    echo "$FS_SENTINEL" > "$FS_RO_DIR/sentinel"
+    echo "$FS_SENTINEL" > "$FS_DENIED_DIR/sentinel"
+
+    start_fresh_sandbox "case $case_no"
+    make_request_from_config "$config" "$req"
+
+    echo "=== case $case_no start: $cause ==="
+    out="$($LXC_EXEC "$req" 2>&1)"
+    rc=$?
+    echo "$out"
+
+    if [ "$rc" -eq 0 ]; then
+        check "case $case_no start succeeds for input $config -- $clause" 0
+        SANDBOX_STARTED=1
+        actual="start exited 0"
+        status="PASS"
+    else
+        check "case $case_no start succeeds for input $config -- $clause" 1
+        actual="start exited $rc: $(echo "$out" | tr '\n' ' ' | sed 's/|/ /g')"
+        status="FAIL"
+    fi
+
+    if [ "$rc" -eq 0 ]; then
+        echo "=== case $case_no probe: read the mounts from inside the container ==="
+        probe="cat $FS_RO_DIR/sentinel 2>/dev/null; touch $FS_RO_DIR/probe 2>/dev/null && echo RO_WRITABLE || echo RO_READONLY; cat $FS_DENIED_DIR/sentinel 2>/dev/null && echo DENIED_VISIBLE || echo DENIED_HIDDEN"
+        out="$(run_phase exec "$SANDBOX_ID" '"process": { "commandLine": "'"$probe"'" }' 2>&1)"
+        rc=$?
+        echo "$out"
+
+        if [ "$rc" -eq 0 ] && echo "$out" | grep -Fq "$FS_SENTINEL"; then
+            check "case $case_no readonlyPaths mounts the host directory into the container -- $clause" 0
+            actual="$actual; readonly path carries the host sentinel"
+        else
+            check "case $case_no readonlyPaths mounts the host directory into the container -- $clause" 1
+            actual="$actual; readonly path did not carry the host sentinel (exec rc=$rc)"
+            status="FAIL"
+        fi
+
+        if echo "$out" | grep -Fq "RO_READONLY"; then
+            check "case $case_no readonlyPaths is mounted read-only -- $clause" 0
+            actual="$actual; readonly path refused a write"
+        else
+            check "case $case_no readonlyPaths is mounted read-only -- $clause" 1
+            actual="$actual; readonly path accepted a write"
+            status="FAIL"
+        fi
+
+        if echo "$out" | grep -Fq "DENIED_HIDDEN"; then
+            check "case $case_no deniedPaths masks the host directory -- $clause" 0
+            actual="$actual; denied path is masked"
+        else
+            check "case $case_no deniedPaths masks the host directory -- $clause" 1
+            actual="$actual; denied path still exposed the host sentinel"
+            status="FAIL"
+        fi
+    fi
+
+    finish_current_sandbox "case $case_no" "$config"
+    rm -rf "$FS_RO_DIR" "$FS_DENIED_DIR"
+    record_result "$case_no" "$config" "$cause" "$expected" "$actual" "$status"
+}
+
+LXC_PROXY_REFUSAL='LXC state-aware start does not support network.proxy'
+
+# The proxy field needs its own case because neither wire form reaches the LXC
+# verdict by the route the other cases use.
+#
+# A state-aware start may not carry `containment` -- the backend is fixed at
+# provision and later phases route by sandboxId -- so the shared parser applies
+# its backend-specific rules under the default backend. An external proxy url is
+# refused there, before any LXC code runs. The builtin-test-server form skips
+# that rule but is testing-only scaffolding gated centrally for every backend,
+# so it needs --allow-testing-features to get past the gate.
+#
+# Both halves are asserted. The first opens the testing gate and requires LXC's
+# own refusal *by its message*, because a case that accepted any non-zero exit
+# would pass on the central gate alone and would still pass with LXC's refusal
+# deleted. The second sends the production-shaped external form and requires only
+# that it is refused -- which layer refuses it is not LXC's contract to state,
+# but silently accepting it would leave the container talking past a proxy the
+# caller believed was in force.
+run_proxy_start_case() {
+    local case_no="$1"
+    local cause="$2"
+    local clause="$3"
+    local expected='start is refused, and the builtin form is refused by LXC itself'
+    local req="$WORK_DIR/case_${case_no}.json"
+    local out rc actual status
+
+    start_fresh_sandbox "case $case_no"
+    make_request_from_config "$CONFIG_PROXY" "$req"
+
+    echo "=== case $case_no start: $cause ==="
+    out="$($LXC_EXEC --allow-testing-features "$req" 2>&1)"
+    rc=$?
+    echo "$out"
+
+    if [ "$rc" -ne 0 ] && expect_error_code "$out" "policy_validation" \
+        && echo "$out" | grep -Fq "$LXC_PROXY_REFUSAL"; then
+        check "case $case_no start refuses the builtin proxy with LXC's own verdict -- $clause" 0
+        actual="start exited $rc with LXC's policy_validation refusal"
+        status="PASS"
+    else
+        check "case $case_no start refuses the builtin proxy with LXC's own verdict -- $clause" 1
+        actual="start rc=$rc output=$(echo "$out" | tr '\n' ' ' | sed 's/|/ /g')"
+        status="FAIL"
+        if [ "$rc" -eq 0 ]; then
+            SANDBOX_STARTED=1
+        fi
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        make_request_from_config "$CONFIG_PROXY_EXTERNAL" "$req"
+        echo "=== case $case_no start: external proxy url ==="
+        out="$($LXC_EXEC "$req" 2>&1)"
+        rc=$?
+        echo "$out"
+        if [ "$rc" -ne 0 ]; then
+            check "case $case_no start refuses an external proxy url rather than accepting it -- $clause" 0
+            actual="$actual; external url refused"
+        else
+            check "case $case_no start refuses an external proxy url rather than accepting it -- $clause" 1
+            actual="$actual; external url started the container"
+            status="FAIL"
+            SANDBOX_STARTED=1
+        fi
+    fi
+
+    finish_current_sandbox "case $case_no" "$CONFIG_PROXY"
+    record_result "$case_no" "$CONFIG_PROXY" "$cause" "$expected" "$actual" "$status"
+}
+
 print_case_table() {
     echo "| Case | Config file | Cause | Expected effect | Actual result | Status |"
     echo "|---|---|---|---|---|---|"
@@ -588,6 +801,68 @@ run_provision_rejection_case "8" "$CONFIG_PROVISION_FILESYSTEM" \
 run_provision_rejection_case "9" "$CONFIG_PROVISION_FILESYSTEM_EMPTY" \
     'empty filesystem block sent at provision' \
     'matrix rejects the filesystem field on presence, not on content'
+
+# Clause: roadmap item 13 (N1) names firewall enforcement, and the schema offers
+# `both` alongside `firewall`. Case 3 pins `firewall`; nothing pinned `both`, so
+# a mode that parsed but enforced nothing would have gone unnoticed. This asserts
+# the same host-visible default-deny for it.
+run_start_case "11" "$CONFIG_BLOCK_BOTH" \
+    'defaultPolicy=block with enforcementMode=both at start' \
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    "1" "1" \
+    '(N1) default-deny outbound is enforced under enforcementMode=both' \
+    "1"
+
+# Clause: case 6 shows a non-empty allowedHosts is refused when no mode can
+# enforce it. That leaves the accepting half unpinned -- a build that refused the
+# list under every mode would still pass case 6. This is the other half: with
+# firewall enforcement the same list starts and the default-deny hook lands.
+run_start_case "12" "$CONFIG_ALLOWED_FIREWALL" \
+    'allowedHosts non-empty with enforcementMode=firewall at start' \
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    "1" "1" \
+    '(N3) a non-empty allowedHosts is enforceable under firewall mode' \
+    "1"
+
+# Clause: roadmap item 16 (N4) treats deny rules as first-class alongside allow
+# rules. blockedHosts is a restriction exactly as allowedHosts is, so it must
+# demand an enforcement mode for the same reason -- otherwise a caller could pass
+# a block list under capabilities and receive no enforcement and no error.
+run_start_case "13" "$CONFIG_BLOCKED_CAPS" \
+    'blockedHosts non-empty with enforcementMode omitted at start' \
+    'start fails with policy_validation' \
+    "0" "0" \
+    '(N4) a policy carrying a non-empty blockedHosts must set enforcementMode'
+
+# Clause: roadmap item 14 (N2) is explicit -- "reject `hostLoopback: "allow"`
+# rather than guessing ports or exposing the container IP." The roadmap records
+# `allowLocalNetwork` as "parsed but silently ignored", which is the behavior the
+# item asks to replace. A silent ignore and a refusal both exit non-zero on
+# nothing, so only asserting the error code separates them.
+run_start_case "14" "$CONFIG_ALLOW_LOCAL" \
+    'allowLocalNetwork=true at start' \
+    'start fails with policy_validation' \
+    "0" "0" \
+    '(N2) allowLocalNetwork is rejected rather than silently ignored'
+
+# Clause: roadmap item 17 (N5) records the proxy field as one the backend
+# ignores, and asks for env-var injection plus egress restriction to the proxy
+# port. That work is not in this PR. What is in scope is item 13 (N1)'s posture:
+# fail fast rather than silently skip. A start that accepted a proxy it cannot
+# enforce would report success while the container talked past it, so it is
+# refused until the enforcement item 17 describes exists. See
+# run_proxy_start_case for why this case needs both wire forms.
+run_proxy_start_case "15" \
+    'network.proxy set at start' \
+    '(N5) an unenforceable proxy is refused rather than silently ignored'
+
+# Clause: the start phase accepts the filesystem lists it rejects at provision
+# (cases 8 and 9), and D1/D4 ask that readonly be readable-not-writable and that
+# denied be masked. Cases 8 and 9 only pin the provision-time refusal; without
+# this, no case shows the lists ever take effect anywhere.
+run_filesystem_start_case "16" "$CONFIG_FILESYSTEM_PATHS" \
+    'readonlyPaths and deniedPaths sent at start' \
+    'the start phase applies the filesystem lists it refuses at provision'
 
 echo "================================"
 echo "Results: $PASSED passed, $FAILED failed, $QUARANTINED quarantined"
