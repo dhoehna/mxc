@@ -324,27 +324,35 @@ run_start_case() {
         fi
 
         if [ "$assert_default_deny" = "1" ] && [ "$rc" -eq 0 ]; then
-            local veth chain terminal
+            local veth chain direct terminal
             # The roadmap asks that the hook be applied, which a zero exit does
             # not show: a run that skipped enforcement and still reported success
             # would look identical here. Read the host instead, and read it
             # through the interface the container actually ended up with rather
             # than a name this test derived, so a hook aimed at the wrong
             # interface cannot pass.
+            #
+            # The physdev form is the one that decides the case. lxcbr0 is a
+            # bridge, and on a bridged veth the plain `-i` rule installs cleanly
+            # and never matches, so asserting only that form would accept a
+            # container whose traffic walks past the chain untouched.
             veth="$(lxc-info -n "${SANDBOX_ID#lxc:}" 2>/dev/null | awk '/^Link:/ { print $2; exit }')"
             chain=""
+            direct=""
             if [ -n "$veth" ]; then
                 chain="$(iptables -S FORWARD 2>/dev/null \
+                    | awk -v v="$veth" 'index($0, "--physdev-in " v " -j ") { for (i = 1; i <= NF; i++) if ($i == "-j") { print $(i + 1); exit } }')"
+                direct="$(iptables -S FORWARD 2>/dev/null \
                     | awk -v v="$veth" 'index($0, "-i " v " -j ") { for (i = 1; i <= NF; i++) if ($i == "-j") { print $(i + 1); exit } }')"
             fi
 
-            echo "=== case $case_no default-deny: live veth=${veth:-<none>} chain=${chain:-<none>} ==="
-            if [ -n "$veth" ] && [ -n "$chain" ]; then
-                check "case $case_no installs a FORWARD hook for live veth $veth -- (N1) default-deny outbound" 0
-                actual="$actual; FORWARD hooks $veth to $chain"
+            echo "=== case $case_no default-deny: live veth=${veth:-<none>} physdev->${chain:-<none>} direct->${direct:-<none>} ==="
+            if [ -n "$veth" ] && [ -n "$chain" ] && [ "$direct" = "$chain" ]; then
+                check "case $case_no hooks live veth $veth into $chain on both the physdev and direct paths -- (N1) default-deny outbound" 0
+                actual="$actual; FORWARD hooks $veth to $chain on both paths"
             else
-                check "case $case_no installs a FORWARD hook for live veth ${veth:-<none>} -- (N1) default-deny outbound" 1
-                actual="$actual; no FORWARD hook found for veth ${veth:-<none>}"
+                check "case $case_no hooks live veth ${veth:-<none>} into a chain on both the physdev and direct paths -- (N1) default-deny outbound" 1
+                actual="$actual; physdev hook=${chain:-<none>} direct hook=${direct:-<none>} for veth ${veth:-<none>}"
                 status="FAIL"
             fi
 
