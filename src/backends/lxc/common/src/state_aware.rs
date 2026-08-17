@@ -406,10 +406,10 @@ fn apply_network_policy(
             )));
         }
         // Zero is refused for the mirror-image reason. There is no interface to
-        // pin or hook, so the veth pin would write a property for an interface
-        // that does not exist and the run would either fail later or install a
-        // chain nothing routes through. Either way the caller asked for enforced
-        // networking on a container that has no network to enforce.
+        // enforce against, so the pin hook would find nothing to rename and the
+        // run would either fail later or install a chain nothing routes
+        // through. Either way the caller asked for enforced networking on a
+        // container that has no network to enforce.
         if net.count == 0 {
             return Err(MxcError::policy_validation(format!(
                 "Container {:?} has no configured network interface, \
@@ -962,8 +962,8 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
                 // is safe -- an unreadable probe is not, so it is treated as
                 // live.
                 if container.is_running().unwrap_or(true) {
-                    // Discover the veth while the container still has one, then
-                    // kill it. Kill, not stop, for the reason the failed-ingress
+                    // Name the veth the rules were scoped to, then kill the
+                    // container. Kill, not stop, for the reason the failed-ingress
                     // rollback below gives: a graceful stop waits up to 60 s,
                     // and every second of it is a container whose start already
                     // failed sitting there with a half-applied policy.
@@ -1001,8 +1001,8 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             if let Err(e) = apply_ingress_policy(&container, container_name, request, &mut logger) {
                 // The container is up and its inbound deny is not in force, so
                 // leaving it running is exactly the fail-open this guard exists
-                // to prevent. Discover the veth while the container still has
-                // one, then kill it -- which also discards the netns holding any
+                // to prevent. Name the veth the rules were scoped to, then kill
+                // the container -- which also discards the netns holding any
                 // partial ingress chain -- and remove the egress state this
                 // start installed.
                 //
@@ -1138,9 +1138,10 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         }
 
         let mut logger = Logger::new(Mode::Buffer);
-        // Discover the veth while the container is still running; it disappears
-        // once stopped, but iptables can still delete a FORWARD rule that names
-        // it. Stop the container *before* tearing down its firewall rules so no
+        // Name the veth the rules were scoped to. The interface disappears once
+        // the container stops, but iptables can still delete a FORWARD rule that
+        // names it. Stop the container *before* tearing down its firewall rules
+        // so no
         // process runs without egress filtering during the shutdown drain. If
         // the stop fails, propagate the error and leave the rules in place
         // rather than exposing a still-running container.

@@ -561,10 +561,10 @@ run_start_case "6" "$CONFIG_NONEMPTY_ALLOWED" \
 
 # Clause: roadmap item 13 (N1) asks that default-deny outbound be enforced.  It
 # says nothing about how the container numbers its interfaces, and an interface
-# at lxc.net.3 is exactly as filterable as one at lxc.net.0 -- the veth pin just
-# has to be written where the interface actually is.  This is the only case that
-# separates "MXC located the interface" from "MXC assumed index 0", so it is the
-# one that fails if the index-0 assumption is ever reintroduced.
+# at lxc.net.3 is exactly as filterable as one at lxc.net.0 -- enforcement must
+# not read the index at all.  This is the only case that separates "MXC enforced
+# whichever interface the container has" from "MXC assumed index 0", so it is
+# the one that fails if any index assumption is ever reintroduced.
 run_start_case "10" "$CONFIG_BLOCK_FIREWALL" \
     'defaultPolicy=block with enforcementMode=firewall on a container whose only interface is at lxc.net.3' \
     'start succeeds, exec proves the container runs, and FORWARD drops by default' \

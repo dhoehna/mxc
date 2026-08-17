@@ -1722,17 +1722,20 @@ raw-JSON caller that sends it is not rejected.
 > `"both"`; an empty list is not a restriction and needs no mode. Under
 > `"capabilities"` (the default when the field is omitted) start fails rather than
 > silently leaving the container unfiltered. In a firewall mode the veth is not
-> discovered after start: the name is derived from the container name and pinned to
-> `lxc.net.<N>.veth.pair` before start, so the chain is scoped before the interface
-> exists. The interface set comes from liblxc rather than from the container's
+> discovered after start: the name is derived from the container name and pinned by
+> a container-global `lxc.hook.start-host` installed before start, so the chain is
+> scoped before the interface exists. The hook resolves the container's peer
+> interface from `$LXC_PID` and renames it to that name; if it cannot find one it
+> exits nonzero, which aborts the start rather than leaving the container
+> unfiltered. The interface set comes from liblxc rather than from the container's
 > own config file, so an `lxc.include` that declares interfaces elsewhere is
-> resolved rather than guessed at, and `<N>` is whichever index liblxc reports the
-> interface at — a container numbering its only interface `lxc.net.3` is enforced
-> exactly as one using `lxc.net.0`. Start fails instead when that pin cannot be
+> resolved rather than guessed at, and no interface index is read at all — a
+> container numbering its only interface `lxc.net.3` is enforced exactly as one
+> using `lxc.net.0`, as is one at any index liblxc accepts. Start fails instead
+> when that pin cannot be
 > trusted to cover the container's traffic — when the container declares
-> anything other than exactly one interface, does not declare that interface's
-> type as `veth`, or numbers it beyond `lxc.net.31`, past which MXC stops
-> searching for it. An
+> anything other than exactly one interface, or does not declare that interface's
+> type as `veth`. An
 > undeclared type is refused alongside a wrong one, because absence is not
 > evidence of a veth, and a `macvlan` or `phys` interface would take a hook
 > pinned to a veth name that never appears while its traffic ran unfiltered.

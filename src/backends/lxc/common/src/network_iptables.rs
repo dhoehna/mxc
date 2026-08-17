@@ -484,6 +484,36 @@ impl NetworkIptablesManager {
         None
     }
 
+    /// The container's host-side veth as it exists on the host right now.
+    ///
+    /// [`discover_veth_interface`](Self::discover_veth_interface) reports the
+    /// name liblxc recorded when it created the interface, which stops being
+    /// the live name once MXC's pin hook has renamed it. That hook is written
+    /// into the container's own config and outlives the process that added it,
+    /// so any later start of that container renames the interface again --
+    /// including a start by a caller that never installed the hook and would
+    /// otherwise scope its rules to a name no interface answers to, leaving the
+    /// container unfiltered.
+    ///
+    /// The pinned name is preferred only when an interface actually answers to
+    /// it, so this asks the host rather than assuming the hook ran.
+    pub fn live_veth_interface(container_name: &str) -> Option<String> {
+        let pinned = Self::deterministic_veth_name(container_name);
+        if Self::host_interface_exists(&pinned) {
+            return Some(pinned);
+        }
+        Self::discover_veth_interface(container_name)
+    }
+
+    /// Whether an interface of this name is present on the host.
+    fn host_interface_exists(iface: &str) -> bool {
+        Command::new("ip")
+            .args(["link", "show", iface])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     /// Set the veth interface name for the container.
     pub fn set_veth_interface(&mut self, iface: &str) {
         self.veth_interface = Some(iface.to_string());
@@ -1528,7 +1558,7 @@ impl NetworkIptablesManager {
     /// start again, since the next start fails on the chain it finds.
     ///
     /// Observing live state keeps that authoritative teardown honest. An
-    /// all-true record would assume four resources exist, then fail `-X`
+    /// all-true record would assume every resource exists, then fail `-X`
     /// against chains that never did, log those failures, and retain residual
     /// ownership that schedules a pointless retry in `Drop`. Probing reports
     /// exactly what is present, so an already-clean container issues no
@@ -1558,6 +1588,20 @@ impl NetworkIptablesManager {
             let targets = |name: &str| tokens.windows(2).any(|w| w[0] == "-j" && w[1] == name);
             let matches_iface =
                 |opt: &str, val: &str| tokens.windows(2).any(|w| w[0] == opt && w[1] == val);
+            // The return rules this backend installs are the only ones it may
+            // claim. An interface-scoped ACCEPT that carries no connection-state
+            // match belongs to someone else, and claiming it would have teardown
+            // submit our fuller specification against it -- a delete that cannot
+            // match, reported forever as a residual nothing can clear.
+            let accepts_established = || {
+                tokens.windows(2).any(|w| {
+                    w[0] == "--state" && {
+                        let mut states: Vec<&str> = w[1].split(',').collect();
+                        states.sort_unstable();
+                        states == ["ESTABLISHED", "RELATED"]
+                    }
+                })
+            };
 
             if targets(chain) {
                 if tokens.contains(&"--physdev-in") {
@@ -1567,7 +1611,7 @@ impl NetworkIptablesManager {
                 }
             }
             if let Some(i) = iface {
-                if targets("ACCEPT") {
+                if targets("ACCEPT") && accepts_established() {
                     if matches_iface("--physdev-out", i) {
                         found.physdev_return = true;
                     } else if matches_iface("-o", i) {
@@ -1594,12 +1638,19 @@ impl NetworkIptablesManager {
                 ForwardProbe::ToolAbsent => FamilyResources::default(),
                 // Fail closed on an unreadable FORWARD, for the reason
                 // `hook_present` gives: claiming no hook would let the chain be
-                // flushed while a jump into it still stands, which unfilters a
-                // live container. Only the plain hook is claimed, because a
-                // delete for a rule that never existed would report a residual
-                // that no later pass can clear.
+                // flushed while a jump into it still stands, and an emptied
+                // chain that is still hooked returns to its caller instead of
+                // reaching its own closing DROP, which unfilters a live
+                // container. Both hook forms are claimed, not just the plain
+                // one, because either alone gates the flush: clearing the plain
+                // hook would otherwise open that gate while an unobserved
+                // physdev hook still referenced the chain. A delete for a rule
+                // that never existed fails and holds the resource as residual,
+                // which reports the stop as failed and retries -- the losing
+                // side of a trade whose other side is an unfiltered container.
                 ForwardProbe::Unreadable => FamilyResources {
                     hook: true,
+                    physdev_hook: true,
                     ..FamilyResources::default()
                 },
             };
@@ -3456,10 +3507,11 @@ mod tests {
 
     #[test]
     fn the_two_hook_forms_are_claimed_independently() {
-        // The physdev hook is installed only on a bridged topology. Claiming it
-        // where it was never installed makes teardown issue a delete that
-        // fails, and a failed delete is reported as a residual that no later
-        // pass can ever clear.
+        // Installing the physdev hook is attempted on either topology and can
+        // fail without failing the apply, so a chain may carry one form and not
+        // the other. Claiming a form that was never installed makes teardown
+        // issue a delete that fails, and a failed delete is held as a residual
+        // that reports the stop as failed.
         let dump = "-A FORWARD -i mxcvjdmbp6vwk6m -j MXC-solo";
 
         let observed = NetworkIptablesManager::observe_forward_rules(
@@ -3472,6 +3524,81 @@ mod tests {
         assert!(
             !observed.physdev_hook,
             "a hook form that is absent must not be claimed"
+        );
+
+        let physdev_only = "-A FORWARD -m physdev --physdev-in mxcvjdmbp6vwk6m -j MXC-solo";
+
+        let observed = NetworkIptablesManager::observe_forward_rules(
+            physdev_only,
+            "MXC-solo",
+            Some("mxcvjdmbp6vwk6m"),
+        );
+
+        assert!(
+            observed.physdev_hook,
+            "the physdev hook that is present must be claimed"
+        );
+        assert!(
+            !observed.hook,
+            "a physdev hook must not also be claimed as a plain hook"
+        );
+    }
+
+    #[test]
+    fn the_two_return_forms_are_claimed_independently() {
+        // Same trade as the hooks: one form present must not be read as both,
+        // or teardown deletes a rule that was never installed.
+        let plain_only =
+            "-A FORWARD -o mxcvjdmbp6vwk6m -m state --state RELATED,ESTABLISHED -j ACCEPT";
+
+        let observed = NetworkIptablesManager::observe_forward_rules(
+            plain_only,
+            "MXC-solo",
+            Some("mxcvjdmbp6vwk6m"),
+        );
+
+        assert!(observed.return_rule, "the -o return rule must be claimed");
+        assert!(
+            !observed.physdev_return,
+            "a plain return rule must not also be claimed as a physdev one"
+        );
+
+        let physdev_only = "-A FORWARD -m physdev --physdev-out mxcvjdmbp6vwk6m \
+                            -m state --state RELATED,ESTABLISHED -j ACCEPT";
+
+        let observed = NetworkIptablesManager::observe_forward_rules(
+            physdev_only,
+            "MXC-solo",
+            Some("mxcvjdmbp6vwk6m"),
+        );
+
+        assert!(
+            observed.physdev_return,
+            "the --physdev-out return rule must be claimed"
+        );
+        assert!(
+            !observed.return_rule,
+            "a physdev return rule must not also be claimed as a plain one"
+        );
+    }
+
+    #[test]
+    fn an_accept_without_the_connection_state_match_is_not_ours() {
+        // The interface name alone does not make a rule ours. A host rule
+        // accepting everything on the same interface would be claimed on the
+        // name and then deleted with our fuller specification -- a delete that
+        // cannot match, held as a residual no later pass can ever clear.
+        let dump = "-A FORWARD -o mxcvjdmbp6vwk6m -j ACCEPT";
+
+        let observed = NetworkIptablesManager::observe_forward_rules(
+            dump,
+            "MXC-solo",
+            Some("mxcvjdmbp6vwk6m"),
+        );
+
+        assert!(
+            !observed.return_rule && !observed.physdev_return,
+            "an ACCEPT carrying no connection-state match must not be claimed, got: {observed:?}"
         );
     }
 

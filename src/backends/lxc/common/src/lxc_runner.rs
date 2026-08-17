@@ -277,9 +277,9 @@ impl LxcScriptRunner {
         let mut fw_manager = NetworkIptablesManager::new(&container_name);
         fw_manager.set_preserve_policy(!self.cleanup_policy);
 
-        // Try to discover the container's veth interface for scoped rules
-        if let Some(veth) = NetworkIptablesManager::discover_veth_interface(&container_name) {
-            let _ = writeln!(logger, "Discovered veth interface: {}", veth);
+        // Resolve the container's veth interface for scoped rules
+        if let Some(veth) = NetworkIptablesManager::live_veth_interface(&container_name) {
+            let _ = writeln!(logger, "Resolved veth interface: {}", veth);
             fw_manager.set_veth_interface(&veth);
             if self.destroy_on_exit {
                 // Tell the watchdog about the veth so signal-time cleanup
