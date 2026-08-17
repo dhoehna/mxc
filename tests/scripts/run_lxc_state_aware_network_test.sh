@@ -15,7 +15,9 @@
 # filesystem block leaves every path list empty, so only the recorded presence
 # of the block distinguishes it from a request that carried no block at all.
 #
-# Case 3 proves the default-deny hook reaches a stock provisioned container.
+# Case 3 proves the default-deny hook reaches a stock provisioned container,
+# and reads the host's own iptables state to show the hook was applied rather
+# than merely reported.
 #
 # The start fixtures keep a __SANDBOX_ID__ placeholder because the live LXC
 # sandboxId is the container name returned by this test's own provision call.
@@ -279,7 +281,8 @@ run_start_case() {
     local expect_success="$5"
     local must_exec="$6"
     local clause="$7"
-    local quarantine="${8:-}"
+    local assert_default_deny="${8:-}"
+    local quarantine="${9:-}"
     local req="$WORK_DIR/case_${case_no}.json"
     local out rc actual status sentinel
 
@@ -316,6 +319,43 @@ run_start_case() {
             else
                 check "case $case_no exec observes running container for input $config -- $clause" 1
                 actual="$actual; exec rc=$rc output=$(echo "$out" | tr '\n' ' ' | sed 's/|/ /g')"
+                status="FAIL"
+            fi
+        fi
+
+        if [ "$assert_default_deny" = "1" ] && [ "$rc" -eq 0 ]; then
+            local veth chain terminal
+            # The roadmap asks that the hook be applied, which a zero exit does
+            # not show: a run that skipped enforcement and still reported success
+            # would look identical here. Read the host instead, and read it
+            # through the interface the container actually ended up with rather
+            # than a name this test derived, so a hook aimed at the wrong
+            # interface cannot pass.
+            veth="$(lxc-info -n "${SANDBOX_ID#lxc:}" 2>/dev/null | awk '/^Link:/ { print $2; exit }')"
+            chain=""
+            if [ -n "$veth" ]; then
+                chain="$(iptables -S FORWARD 2>/dev/null \
+                    | awk -v v="$veth" 'index($0, "-i " v " -j ") { for (i = 1; i <= NF; i++) if ($i == "-j") { print $(i + 1); exit } }')"
+            fi
+
+            echo "=== case $case_no default-deny: live veth=${veth:-<none>} chain=${chain:-<none>} ==="
+            if [ -n "$veth" ] && [ -n "$chain" ]; then
+                check "case $case_no installs a FORWARD hook for live veth $veth -- (N1) default-deny outbound" 0
+                actual="$actual; FORWARD hooks $veth to $chain"
+            else
+                check "case $case_no installs a FORWARD hook for live veth ${veth:-<none>} -- (N1) default-deny outbound" 1
+                actual="$actual; no FORWARD hook found for veth ${veth:-<none>}"
+                status="FAIL"
+            fi
+
+            terminal="$(iptables -S "$chain" 2>/dev/null | tail -1)"
+            echo "=== case $case_no terminal rule: ${terminal:-<none>} ==="
+            if [ -n "$chain" ] && [ "${terminal##* }" = "DROP" ]; then
+                check "case $case_no hooked chain ends in DROP -- (N1) default-deny outbound" 0
+                actual="$actual; chain ends in DROP"
+            else
+                check "case $case_no hooked chain ends in DROP -- (N1) default-deny outbound" 1
+                actual="$actual; terminal rule was ${terminal:-<none>}"
                 status="FAIL"
             fi
         fi
@@ -423,9 +463,10 @@ run_start_case "2" "$CONFIG_BLOCK_CAPS" \
 # already resolved the include.
 run_start_case "3" "$CONFIG_BLOCK_FIREWALL" \
     'defaultPolicy=block with enforcementMode=firewall at start' \
-    'start succeeds and exec proves the container runs' \
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
     "1" "1" \
-    'To start a default-deny container, set enforcementMode to firewall or both'
+    'To start a default-deny container, set enforcementMode to firewall or both' \
+    "1"
 
 # Clause: "A permissive default needs no iptables rule to be honest."
 run_start_case "4" "$CONFIG_ALLOW_CAPS" \
