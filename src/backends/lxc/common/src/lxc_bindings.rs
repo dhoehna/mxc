@@ -1601,6 +1601,17 @@ mod tests {
     }
 
     #[test]
+    fn a_netdev_of_type_empty_still_counts_as_an_interface() {
+        // A config that declares lxc.net.0 properties without a type does not
+        // leave the type undeclared -- liblxc supplies `empty`, a real netdev
+        // type that gives the container only a loopback. The absence signal is
+        // an empty value, so reading the word as absence would report no
+        // interface for a container that has one and refuse it for the wrong
+        // reason.
+        assert_eq!(interpret_net_summary("lxc.net = empty\n"), 1);
+    }
+
+    #[test]
     fn trailing_blank_lines_are_not_counted_as_interfaces() {
         // Counting them would report a second interface that does not exist and
         // refuse a container MXC can fully filter.
@@ -1626,6 +1637,17 @@ mod tests {
     #[test]
     fn a_key_with_an_empty_value_reports_no_value() {
         assert_eq!(interpret_config_query("lxc.net.0.type =\n"), None);
+    }
+
+    #[test]
+    fn a_type_of_empty_is_read_back_as_a_declared_type() {
+        // Distinguishing this from an absent key is what sends a loopback-only
+        // container to the refusal that names its type rather than to the one
+        // that claims it has no interface at lxc.net.0.
+        assert_eq!(
+            interpret_config_query("lxc.net.0.type = empty\n"),
+            Some("empty".to_string())
+        );
     }
 
     #[test]
