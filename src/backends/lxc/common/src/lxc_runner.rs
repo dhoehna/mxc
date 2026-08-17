@@ -277,8 +277,29 @@ impl LxcScriptRunner {
         let mut fw_manager = NetworkIptablesManager::new(&container_name);
         fw_manager.set_preserve_policy(!self.cleanup_policy);
 
-        // Resolve the container's veth interface for scoped rules
-        if let Some(veth) = NetworkIptablesManager::live_veth_interface(&container_name) {
+        // Resolve the container's veth interface for scoped rules. The pin hook
+        // persists in a container's config, so a container this runner did not
+        // pin may still have been renamed by an earlier state-aware start; the
+        // container itself is the only thing that knows which.
+        let pinned = NetworkIptablesManager::deterministic_veth_name(&container_name);
+        let pin_hook_present = match container.has_veth_pin_hook(&pinned) {
+            Ok(present) => present,
+            Err(e) => {
+                // Guessing here picks between two names, one of which filters
+                // nothing. Report it and resolve nothing rather than scope the
+                // rules to a name that may already be stale.
+                let _ = writeln!(logger, "Could not read the veth pin hook: {}", e);
+                if self.destroy_on_exit || container_created {
+                    let _ = container.destroy();
+                }
+                return ScriptResponse::error(
+                    "Failed to resolve the container's network interface.",
+                );
+            }
+        };
+        if let Some(veth) =
+            NetworkIptablesManager::live_veth_interface(&container_name, pin_hook_present)
+        {
             let _ = writeln!(logger, "Resolved veth interface: {}", veth);
             fw_manager.set_veth_interface(&veth);
             if self.destroy_on_exit {

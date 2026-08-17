@@ -495,23 +495,18 @@ impl NetworkIptablesManager {
     /// otherwise scope its rules to a name no interface answers to, leaving the
     /// container unfiltered.
     ///
-    /// The pinned name is preferred only when an interface actually answers to
-    /// it, so this asks the host rather than assuming the hook ran.
-    pub fn live_veth_interface(container_name: &str) -> Option<String> {
-        let pinned = Self::deterministic_veth_name(container_name);
-        if Self::host_interface_exists(&pinned) {
-            return Some(pinned);
+    /// `pin_hook_present` is that container's own answer to whether it carries
+    /// the hook, from
+    /// [`has_veth_pin_hook`](crate::lxc_bindings::LxcContainer::has_veth_pin_hook).
+    /// The question has to be asked of the container: an interface answering to
+    /// the pinned name proves only that the name is taken, not that it is taken
+    /// by this container, and a host that cannot be asked would answer "no" and
+    /// send teardown back to the stale name.
+    pub fn live_veth_interface(container_name: &str, pin_hook_present: bool) -> Option<String> {
+        if pin_hook_present {
+            return Some(Self::deterministic_veth_name(container_name));
         }
         Self::discover_veth_interface(container_name)
-    }
-
-    /// Whether an interface of this name is present on the host.
-    fn host_interface_exists(iface: &str) -> bool {
-        Command::new("ip")
-            .args(["link", "show", iface])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
     }
 
     /// Set the veth interface name for the container.
@@ -1602,6 +1597,23 @@ impl NetworkIptablesManager {
                     }
                 })
             };
+            // The same trap one qualifier further out. A foreign rule can carry
+            // the interface, the state match, and a narrowing this backend never
+            // writes -- `-p tcp`, an address, a port, a negation -- and the
+            // delete rebuilt from our own specification would not name it, so it
+            // could not match. Anything outside the vocabulary these rules are
+            // built from is therefore somebody else's rule.
+            let only_our_vocabulary = || {
+                tokens.iter().all(|t| {
+                    if *t == "!" {
+                        return false;
+                    }
+                    if !t.starts_with('-') {
+                        return true;
+                    }
+                    matches!(*t, "-A" | "-o" | "-m" | "--physdev-out" | "--state" | "-j")
+                })
+            };
 
             if targets(chain) {
                 if tokens.contains(&"--physdev-in") {
@@ -1611,7 +1623,7 @@ impl NetworkIptablesManager {
                 }
             }
             if let Some(i) = iface {
-                if targets("ACCEPT") && accepts_established() {
+                if targets("ACCEPT") && accepts_established() && only_our_vocabulary() {
                     if matches_iface("--physdev-out", i) {
                         found.physdev_return = true;
                     } else if matches_iface("-o", i) {
@@ -2663,6 +2675,15 @@ impl NetworkIptablesManager {
                     &mut residual.v6,
                     logger,
                 );
+                // A delete that reported success removed one matching rule.
+                // iptables holds duplicates, and a jump may carry qualifiers
+                // this backend never writes, so that exit code is evidence
+                // about one rule rather than about the chain -- and the flush
+                // below is gated on the chain. Read FORWARD back and let a
+                // surviving jump hold the gate shut. It can only hold it, not
+                // open it, so a failed delete still counts.
+                Self::hold_flush_if_hooks_survive("iptables", chain_name, iface, &mut residual.v4);
+                Self::hold_flush_if_hooks_survive("ip6tables", chain_name, iface, &mut residual.v6);
             }
             None => {
                 if created.v4.hooks_remain()
@@ -2768,6 +2789,50 @@ impl NetworkIptablesManager {
             .is_ok()
         {
             residual.physdev_return = false;
+        }
+    }
+
+    /// Re-read FORWARD and let a jump that is still there hold the flush gate
+    /// shut, whatever the deletes reported.
+    ///
+    /// Strictly inhibitory: it can only set a hook bit, never clear one. A
+    /// delete that reported success removed one matching rule, and iptables
+    /// holds duplicates -- the recovery path in
+    /// [`force_cleanup_authoritative`](Self::force_cleanup_authoritative)
+    /// reconstructs ownership for a container whose state was lost, which is
+    /// where a second jump is likeliest to have accumulated. A jump may also
+    /// carry qualifiers this backend never writes and still reach the chain.
+    /// So the exit code is evidence about one rule, and the flush is gated on
+    /// the chain.
+    ///
+    /// Letting it clear a bit instead would make it authoritative, and it is
+    /// not: it would then overrule a delete that genuinely failed on the word
+    /// of a probe that can be a moment stale, opening the gate this exists to
+    /// hold shut.
+    ///
+    /// Only the hook bits are touched. They are the ones that gate the flush.
+    /// The return-path rules jump to `ACCEPT`, reference no chain, and gate
+    /// nothing.
+    fn hold_flush_if_hooks_survive(
+        tool: &str,
+        chain_name: &str,
+        iface: &str,
+        residual: &mut FamilyResources,
+    ) {
+        match Self::probe_forward_chain(tool) {
+            ForwardProbe::Dump(dump) => {
+                let live = Self::observe_forward_rules(&dump, chain_name, Some(iface));
+                residual.hook |= live.hook;
+                residual.physdev_hook |= live.physdev_hook;
+            }
+            // A tool that is not installed holds no FORWARD chain, so nothing
+            // in it jumps here and there is nothing to add.
+            ForwardProbe::ToolAbsent => {}
+            // Unreadable establishes nothing, so it may not open the gate.
+            ForwardProbe::Unreadable => {
+                residual.hook = true;
+                residual.physdev_hook = true;
+            }
         }
     }
 
@@ -3580,6 +3645,33 @@ mod tests {
             !observed.return_rule,
             "a physdev return rule must not also be claimed as a plain one"
         );
+    }
+
+    #[test]
+    fn a_stateful_accept_carrying_a_qualifier_we_never_write_is_not_ours() {
+        // The interface and the connection-state match together are still not
+        // enough. A foreign rule can carry both and narrow further, and the
+        // delete this backend rebuilds names no such narrowing -- so it cannot
+        // match, and the rule is held as a residual no later pass can clear.
+        for foreign in [
+            "-A FORWARD -o mxcvjdmbp6vwk6m -p tcp -m state --state RELATED,ESTABLISHED -j ACCEPT",
+            "-A FORWARD -o mxcvjdmbp6vwk6m -d 10.0.0.0/8 \
+             -m state --state RELATED,ESTABLISHED -j ACCEPT",
+            "-A FORWARD -m physdev --physdev-out mxcvjdmbp6vwk6m -p udp \
+             -m state --state RELATED,ESTABLISHED -j ACCEPT",
+        ] {
+            let observed = NetworkIptablesManager::observe_forward_rules(
+                foreign,
+                "MXC-solo",
+                Some("mxcvjdmbp6vwk6m"),
+            );
+
+            assert!(
+                !observed.return_rule && !observed.physdev_return,
+                "a rule narrowed by something this backend never writes must not be claimed: \
+                 {foreign}"
+            );
+        }
     }
 
     #[test]

@@ -1167,15 +1167,40 @@ impl LxcContainer {
                 .map_err(|e| format!("Failed to chmod veth pin hook script {script_path}: {e}"))?;
         }
 
+        if self.has_veth_pin_hook(target_veth)? {
+            return Ok(());
+        }
+        self.set_config_item(
+            "lxc.hook.start-host",
+            &veth_pin_hook_command(&script_path, target_veth),
+        )
+    }
+
+    /// Whether this container's own config already pins its veth to
+    /// `target_veth`.
+    ///
+    /// A container carrying this hook has had its host-side veth renamed by the
+    /// time its init execs, because the hook runs before that and a nonzero
+    /// exit aborts the start. So the answer decides which name describes the
+    /// live interface: with the hook, the pinned name; without it, whatever
+    /// liblxc recorded when it created the pair.
+    ///
+    /// This asks the container rather than the host on purpose. Asking the host
+    /// whether an interface of the pinned name exists answers a different
+    /// question -- it cannot tell this container's interface from a stranger's
+    /// that happens to hold the name, and it turns a transient failure of the
+    /// probe into the wrong answer rather than into an error.
+    ///
+    /// It reuses the comparison `ensure_veth_pin_hook` writes with, so the
+    /// reader and the writer cannot drift apart.
+    pub fn has_veth_pin_hook(&self, target_veth: &str) -> Result<bool, String> {
+        let script_path = format!("{}/{}/mxc-veth-pin.sh", self.lxc_path, self.name);
         let value = veth_pin_hook_command(&script_path, target_veth);
         let existing = interpret_config_values(
             "lxc.hook.start-host",
             &self.query_config_item("lxc.hook.start-host")?,
         );
-        if existing.iter().any(|present| present == &value) {
-            return Ok(());
-        }
-        self.set_config_item("lxc.hook.start-host", &value)
+        Ok(existing.iter().any(|present| present == &value))
     }
 
     /// Ask liblxc for one config key, with any `lxc.include` already resolved.

@@ -321,7 +321,7 @@ renumber_sole_interface() {
     # an ordinary index-0 container, every assertion below still passes, and the
     # test reports success for a topology it never built.
     if lxc-info -n "$name" -c lxc.net.0.type 2>/dev/null | grep -q .; then
-        fail_now "$label: renumber did not take -- liblxc still reports an interface at lxc.net.0, so this case would not exercise index discovery."
+        fail_now "$label: renumber did not take -- liblxc still reports an interface at lxc.net.0, so this case would not exercise index independence."
     fi
     if ! lxc-info -n "$name" -c "lxc.net.$index.type" 2>/dev/null | grep -q "veth"; then
         fail_now "$label: renumber did not take -- liblxc reports no veth at lxc.net.$index."
