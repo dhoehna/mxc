@@ -379,10 +379,10 @@ fn apply_network_policy(
     // name that does not exist yet, so hooking the not-yet-created veth by its
     // pinned name closes that window entirely.
     if uses_firewall_mode(&policy) {
-        // Only lxc.net.0 gets a pinned veth, and apply_firewall_rules hooks
-        // exactly one interface. A container this run created has exactly that
-        // one interface, but provision also adopts containers it did not create,
-        // and an adopted one can carry lxc.net.1 and beyond. Those would keep
+        // Exactly one interface gets a pinned veth, and apply_firewall_rules
+        // hooks exactly one interface. A container this run created has exactly
+        // that one interface, but provision also adopts containers it did not
+        // create, and an adopted one can carry several. Those would keep
         // routing while start reported that a deny policy had been applied —
         // the policy would be a claim rather than a control. Refuse instead:
         // failing closed on a config MXC cannot fully enforce is the only

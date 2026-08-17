@@ -324,6 +324,36 @@ fn interpret_config_query(stdout: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Decide what a completed index scan means, given the interface summary read
+/// before it and the one read after.
+///
+/// The count and the index come from separate `lxc-info` runs, so a config
+/// rewritten between them would be pinned against a set of interfaces that no
+/// longer exists -- a container could be counted with one interface, gain a
+/// second, and start with only the first one hooked.  Bracketing the scan turns
+/// that into a refusal: a summary that did not survive the scan is not evidence
+/// of anything, and a firewall pinned from it would be a claim rather than a
+/// control.
+///
+/// Split out as a pure function so the decision is testable without `lxc-info`
+/// on the box.
+fn resolve_scanned_interface(
+    before: &str,
+    after: &str,
+    located: Option<SoleNetInterface>,
+) -> Result<Option<SoleNetInterface>, String> {
+    if before.trim() != after.trim() {
+        return Err(format!(
+            "network config changed while it was being read: lxc.net was {:?} before \
+             the interface index was located and {:?} after, so the index cannot be \
+             trusted to cover the container's traffic",
+            before.trim(),
+            after.trim()
+        ));
+    }
+    Ok(located)
+}
+
 /// Read an `lxc-info` run as "does this container exist?".
 ///
 /// Split out as a pure function so the three-way answer is testable without
@@ -1115,11 +1145,14 @@ impl LxcContainer {
     /// A probe that cannot run is an error rather than an empty answer: no
     /// evidence of an interface is not evidence of no interface.
     pub fn configured_net_interfaces(&self) -> Result<NetInterfaceConfig, String> {
-        let count = interpret_net_summary(&self.query_config_item("lxc.net")?);
+        let summary = self.query_config_item("lxc.net")?;
+        let count = interpret_net_summary(&summary);
         // Where it sits only matters when there is exactly one; every other
         // count is refused upstream without reference to the index.
         let sole = if count == 1 {
-            self.locate_sole_net_interface()?
+            let located = self.locate_sole_net_interface()?;
+            let recheck = self.query_config_item("lxc.net")?;
+            resolve_scanned_interface(&summary, &recheck, located)?
         } else {
             None
         };
@@ -1653,6 +1686,76 @@ mod tests {
         // Counting them would report a second interface that does not exist and
         // refuse a container MXC can fully filter.
         assert_eq!(interpret_net_summary("lxc.net = veth\n\n\n\n"), 1);
+    }
+
+    #[test]
+    fn a_config_that_held_still_during_the_scan_keeps_the_located_index() {
+        let found = SoleNetInterface {
+            index: 3,
+            kind: "veth".to_string(),
+        };
+        assert_eq!(
+            resolve_scanned_interface("lxc.net = veth\n", "lxc.net = veth\n", Some(found.clone())),
+            Ok(Some(found))
+        );
+    }
+
+    #[test]
+    fn a_config_that_held_still_with_nothing_found_reports_nothing_found() {
+        // An interface numbered past the search bound is absent as far as the
+        // scan is concerned, and a stable config must not turn that into a
+        // different answer than the scan produced.
+        assert_eq!(
+            resolve_scanned_interface("lxc.net = veth\n", "lxc.net = veth\n", None),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn an_interface_appearing_during_the_scan_refuses_the_located_index() {
+        // The dangerous case: counted with one interface, scanned, then a second
+        // interface arrives.  Pinning the first would leave the second routing.
+        assert!(resolve_scanned_interface(
+            "lxc.net = veth\n",
+            "lxc.net = veth\nveth\n",
+            Some(SoleNetInterface {
+                index: 0,
+                kind: "veth".to_string(),
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_interface_changing_type_during_the_scan_refuses_the_located_index() {
+        assert!(resolve_scanned_interface(
+            "lxc.net = veth\n",
+            "lxc.net = macvlan\n",
+            Some(SoleNetInterface {
+                index: 0,
+                kind: "veth".to_string(),
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_refusal_names_both_summaries_it_saw() {
+        let refusal = resolve_scanned_interface("lxc.net = veth\n", "lxc.net = macvlan\n", None)
+            .expect_err("a changed summary is refused");
+        assert!(refusal.contains("veth"), "{refusal}");
+        assert!(refusal.contains("macvlan"), "{refusal}");
+    }
+
+    #[test]
+    fn a_trailing_newline_difference_is_not_a_config_change() {
+        // Both summaries are captured from a subprocess, so trailing whitespace
+        // is capture noise rather than evidence.  Refusing on it would fail
+        // every start on a config that never moved.
+        assert_eq!(
+            resolve_scanned_interface("lxc.net = veth\n", "lxc.net = veth\n\n", None),
+            Ok(None)
+        );
     }
 
     #[test]

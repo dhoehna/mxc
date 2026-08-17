@@ -297,7 +297,7 @@ renumber_sole_interface() {
     local index="$1"
     local label="$2"
     local name="${SANDBOX_ID#lxc:}"
-    local cfg="/var/lib/lxc/$name/config"
+    local cfg="${LXC_PATH:-/var/lib/lxc}/$name/config"
 
     # A provisioned container is handed its interface by an include, always at
     # lxc.net.0, so this is the only way to build the one topology that tells
