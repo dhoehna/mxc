@@ -273,6 +273,64 @@ finish_current_sandbox() {
     fi
 }
 
+container_host_veth() {
+    local name="$1"
+    local peer
+
+    # Ask the container which host ifindex its own link is paired with, then
+    # resolve that index on the host.  Nothing here trusts a name MXC chose, so
+    # a hook aimed at the wrong interface still fails.
+    #
+    # `lxc-info` reports a Link: line instead, but it walks lxc.net.N from 0 and
+    # stops at the first gap, so it reports nothing at all for a container whose
+    # interface is numbered above a hole -- which is exactly the topology case 10
+    # builds.  Reading it from the container's own kernel view works whatever the
+    # index.
+    peer="$(lxc-attach -n "$name" -- ip -o link 2>/dev/null \
+        | sed -n 's/.*@if\([0-9][0-9]*\):.*/\1/p' | head -1)"
+    [ -n "$peer" ] || return 0
+    ip -o link 2>/dev/null \
+        | awk -v want="$peer" '{ idx = $1; sub(/:$/, "", idx); if (idx == want) { n = $2; sub(/[@:].*/, "", n); print n; exit } }'
+}
+
+renumber_sole_interface() {
+    local index="$1"
+    local label="$2"
+    local name="${SANDBOX_ID#lxc:}"
+    local cfg="/var/lib/lxc/$name/config"
+
+    # A provisioned container is handed its interface by an include, always at
+    # lxc.net.0, so this is the only way to build the one topology that tells
+    # "MXC found the interface" apart from "MXC assumed index 0".  Assigning an
+    # empty lxc.net clears what the include supplied; the numbered keys then
+    # declare the same interface somewhere else.
+    [ -f "$cfg" ] || fail_now "$label: no container config at $cfg to renumber."
+    {
+        echo "lxc.net ="
+        echo "lxc.net.$index.type = veth"
+        echo "lxc.net.$index.link = lxcbr0"
+        echo "lxc.net.$index.flags = up"
+    } >> "$cfg"
+
+    echo "=== $label: renumbered sole interface to lxc.net.$index ==="
+    echo "    lxc.net      -> $(lxc-info -n "$name" -c lxc.net 2>&1 | tr '\n' ' ')"
+    echo "    index 0 type -> $(lxc-info -n "$name" -c lxc.net.0.type 2>&1 | tr '\n' ' ')"
+    echo "    index $index type -> $(lxc-info -n "$name" -c "lxc.net.$index.type" 2>&1 | tr '\n' ' ')"
+
+    # Without these the case is vacuous: a renumber that silently failed leaves
+    # an ordinary index-0 container, every assertion below still passes, and the
+    # test reports success for a topology it never built.
+    if lxc-info -n "$name" -c lxc.net.0.type 2>/dev/null | grep -q .; then
+        fail_now "$label: renumber did not take -- liblxc still reports an interface at lxc.net.0, so this case would not exercise index discovery."
+    fi
+    if ! lxc-info -n "$name" -c "lxc.net.$index.type" 2>/dev/null | grep -q "veth"; then
+        fail_now "$label: renumber did not take -- liblxc reports no veth at lxc.net.$index."
+    fi
+    if [ "$(lxc-info -n "$name" -c lxc.net 2>/dev/null | grep -c 'veth')" != "1" ]; then
+        fail_now "$label: renumber left the container with something other than exactly one interface."
+    fi
+}
+
 run_start_case() {
     local case_no="$1"
     local config="$2"
@@ -283,10 +341,14 @@ run_start_case() {
     local clause="$7"
     local assert_default_deny="${8:-}"
     local quarantine="${9:-}"
+    local renumber_to="${10:-}"
     local req="$WORK_DIR/case_${case_no}.json"
     local out rc actual status sentinel
 
     start_fresh_sandbox "case $case_no"
+    if [ -n "$renumber_to" ]; then
+        renumber_sole_interface "$renumber_to" "case $case_no"
+    fi
     make_request_from_config "$config" "$req"
     QUARANTINE_ACTIVE="$quarantine"
 
@@ -336,7 +398,7 @@ run_start_case() {
             # bridge, and on a bridged veth the plain `-i` rule installs cleanly
             # and never matches, so asserting only that form would accept a
             # container whose traffic walks past the chain untouched.
-            veth="$(lxc-info -n "${SANDBOX_ID#lxc:}" 2>/dev/null | awk '/^Link:/ { print $2; exit }')"
+            veth="$(container_host_veth "${SANDBOX_ID#lxc:}")"
             chain=""
             direct=""
             if [ -n "$veth" ]; then
@@ -496,6 +558,19 @@ run_start_case "6" "$CONFIG_NONEMPTY_ALLOWED" \
     'start fails with policy_validation' \
     "0" "0" \
     'a policy carrying a non-empty allowedHosts must set enforcementMode'
+
+# Clause: roadmap item 13 (N1) asks that default-deny outbound be enforced.  It
+# says nothing about how the container numbers its interfaces, and an interface
+# at lxc.net.3 is exactly as filterable as one at lxc.net.0 -- the veth pin just
+# has to be written where the interface actually is.  This is the only case that
+# separates "MXC located the interface" from "MXC assumed index 0", so it is the
+# one that fails if the index-0 assumption is ever reintroduced.
+run_start_case "10" "$CONFIG_BLOCK_FIREWALL" \
+    'defaultPolicy=block with enforcementMode=firewall on a container whose only interface is at lxc.net.3' \
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    "1" "1" \
+    '(N1) default-deny outbound does not depend on the interface index' \
+    "1" "" "3"
 
 # Clause: the LXC matrix marks network as rejected at provision.
 run_provision_rejection_case "7" "$CONFIG_PROVISION_NETWORK" \

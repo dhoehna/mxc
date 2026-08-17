@@ -1723,13 +1723,16 @@ raw-JSON caller that sends it is not rejected.
 > `"capabilities"` (the default when the field is omitted) start fails rather than
 > silently leaving the container unfiltered. In a firewall mode the veth is not
 > discovered after start: the name is derived from the container name and pinned to
-> `lxc.net.0.veth.pair` before start, so the chain is scoped before the interface
+> `lxc.net.<N>.veth.pair` before start, so the chain is scoped before the interface
 > exists. The interface set comes from liblxc rather than from the container's
 > own config file, so an `lxc.include` that declares interfaces elsewhere is
-> resolved rather than guessed at. Start fails instead when that pin cannot be
+> resolved rather than guessed at, and `<N>` is whichever index liblxc reports the
+> interface at — a container numbering its only interface `lxc.net.3` is enforced
+> exactly as one using `lxc.net.0`. Start fails instead when that pin cannot be
 > trusted to cover the container's traffic — when the container declares
-> anything other than exactly one interface, puts that sole interface at an
-> index other than `lxc.net.0`, or does not declare `lxc.net.0.type = veth`. An
+> anything other than exactly one interface, does not declare that interface's
+> type as `veth`, or numbers it beyond `lxc.net.31`, past which MXC stops
+> searching for it. An
 > undeclared type is refused alongside a wrong one, because absence is not
 > evidence of a veth, and a `macvlan` or `phys` interface would take a hook
 > pinned to a veth name that never appears while its traffic ran unfiltered.

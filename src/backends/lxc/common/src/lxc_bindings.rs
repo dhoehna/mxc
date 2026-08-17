@@ -270,16 +270,33 @@ fn build_attach_args_with_env_control(
 pub struct NetInterfaceConfig {
     /// How many interfaces liblxc will bring up.
     pub count: usize,
-    /// The declared type at `lxc.net.0`, absent when there is no such index.
+    /// Where the container's only interface sits, and what type it declares.
     ///
-    /// Only index 0 is reported because it is the only one enforcement can act
-    /// on: the veth pin and the `FORWARD` hook are both written against
-    /// `lxc.net.0`, so an interface at any other index is unenforceable whatever
-    /// its type. Absent is not the same as `none` -- it means liblxc holds no
-    /// interface at that index, which for a single-interface container is
-    /// evidence the interface sits somewhere else.
-    pub type_at_zero: Option<String>,
+    /// Enforcement pins the veth pair against whichever index this reports, so
+    /// a container that numbers its interface `lxc.net.3` is as enforceable as
+    /// one that uses `lxc.net.0`. Absent when there is no single interface to
+    /// locate, or when it is numbered beyond the search bound.
+    pub sole: Option<SoleNetInterface>,
 }
+
+/// The index and declared type of a container's only network interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoleNetInterface {
+    /// The `N` in `lxc.net.N`.
+    pub index: usize,
+    /// The type declared at `lxc.net.N.type`.
+    pub kind: String,
+}
+
+/// How far to look for a container's only interface.
+///
+/// liblxc reports how many interfaces it will bring up but never says where
+/// they are numbered: `-c lxc.net` prints values rather than indices, `-c
+/// lxc.net.N` is rejected as invalid, and there is no way to list the keys it
+/// holds. The index therefore has to be found by asking for it. Nearly every
+/// container answers on the first probe, so this bound only decides how oddly
+/// numbered a config MXC will still enforce rather than refuse.
+pub const NET_INDEX_SEARCH_LIMIT: usize = 32;
 
 /// Count the interfaces in `lxc-info -c lxc.net` output.
 ///
@@ -1098,10 +1115,30 @@ impl LxcContainer {
     /// A probe that cannot run is an error rather than an empty answer: no
     /// evidence of an interface is not evidence of no interface.
     pub fn configured_net_interfaces(&self) -> Result<NetInterfaceConfig, String> {
-        Ok(NetInterfaceConfig {
-            count: interpret_net_summary(&self.query_config_item("lxc.net")?),
-            type_at_zero: interpret_config_query(&self.query_config_item("lxc.net.0.type")?),
-        })
+        let count = interpret_net_summary(&self.query_config_item("lxc.net")?);
+        // Where it sits only matters when there is exactly one; every other
+        // count is refused upstream without reference to the index.
+        let sole = if count == 1 {
+            self.locate_sole_net_interface()?
+        } else {
+            None
+        };
+        Ok(NetInterfaceConfig { count, sole })
+    }
+
+    /// Find which `lxc.net.N` the container's only interface uses.
+    ///
+    /// The scan stops at the first index liblxc holds a type for, so the usual
+    /// `lxc.net.0` container costs exactly one probe -- the same as asking for
+    /// index 0 directly.
+    fn locate_sole_net_interface(&self) -> Result<Option<SoleNetInterface>, String> {
+        for index in 0..NET_INDEX_SEARCH_LIMIT {
+            let probe = self.query_config_item(&format!("lxc.net.{index}.type"))?;
+            if let Some(kind) = interpret_config_query(&probe) {
+                return Ok(Some(SoleNetInterface { index, kind }));
+            }
+        }
+        Ok(None)
     }
 
     /// Ask liblxc for one config key, with any `lxc.include` already resolved.

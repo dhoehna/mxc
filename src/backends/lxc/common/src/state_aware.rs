@@ -24,7 +24,7 @@ use wxc_common::state_aware_backend::{
 };
 
 use crate::filesystem_mounts;
-use crate::lxc_bindings::{mint_exec_marker, LxcContainer};
+use crate::lxc_bindings::{mint_exec_marker, LxcContainer, NET_INDEX_SEARCH_LIMIT};
 use crate::network_ingress::IngressManager;
 use crate::network_iptables::{CreatedResources, NetworkIptablesManager};
 use crate::signal_cleanup;
@@ -401,10 +401,10 @@ fn apply_network_policy(
             )));
         }
         // Zero is refused for the mirror-image reason. There is no interface to
-        // pin or hook, so pinning lxc.net.0.veth.pair would write a property for
-        // an interface that does not exist and the run would either fail later
-        // or install a chain nothing routes through. Either way the caller asked
-        // for enforced networking on a container that has no network to enforce.
+        // pin or hook, so the veth pin would write a property for an interface
+        // that does not exist and the run would either fail later or install a
+        // chain nothing routes through. Either way the caller asked for enforced
+        // networking on a container that has no network to enforce.
         if net.count == 0 {
             return Err(MxcError::policy_validation(format!(
                 "Container {:?} has no configured network interface, \
@@ -414,45 +414,49 @@ fn apply_network_policy(
         }
 
         // Exactly one interface is necessary but not sufficient -- it also has
-        // to be the one everything downstream assumes, and it has to be a veth.
-        // The pin below, the veth name, and the FORWARD hook are all written
-        // against `lxc.net.0` and all name the host end of a veth pair, so a
-        // single interface sitting at another index, or a macvlan or phys one at
-        // index 0, would get a chain built against an interface that will never
-        // exist while its traffic ran unfiltered and MXC reported the policy as
-        // enforced.
-        match net.type_at_zero.as_deref() {
-            Some("veth") => {}
-            Some(other) => {
-                return Err(MxcError::policy_validation(format!(
-                    "Container {:?} configures lxc.net.0.type = {:?}; a firewall-enforced \
-                     network policy can only be applied to a veth interface, because \
-                     enforcement pins the host end of the veth pair and hooks that name in \
-                     FORWARD. Use a veth interface, or run without firewall enforcement",
-                    container.name(),
-                    other,
-                )));
-            }
+        // to be a veth. Enforcement works by naming the host end of a veth pair
+        // and hooking that name in FORWARD, so a macvlan or phys interface would
+        // get a chain built against a name that never exists while its traffic
+        // ran unfiltered and MXC reported the policy as enforced. The index it
+        // sits at carries no such risk: the pin below is written against
+        // whichever index liblxc reports, so a container numbering its only
+        // interface lxc.net.3 is enforced exactly as one using lxc.net.0.
+        let sole = match net.sole {
+            Some(ref sole) => sole,
             None => {
                 return Err(MxcError::policy_validation(format!(
-                    "Container {:?} has no interface at lxc.net.0; a firewall-enforced \
-                     network policy is pinned to lxc.net.0 and would not cover an interface \
-                     configured at another index. Renumber the interface to lxc.net.0, or run \
-                     without firewall enforcement",
-                    container.name()
+                    "Container {:?} declares one network interface, but MXC could not find \
+                     which lxc.net.N index it uses within lxc.net.0 through lxc.net.{}; \
+                     a firewall-enforced network policy has to pin the host end of that \
+                     interface's veth pair before the container starts. Renumber the \
+                     interface into that range, or run without firewall enforcement",
+                    container.name(),
+                    NET_INDEX_SEARCH_LIMIT - 1,
                 )));
             }
+        };
+        if sole.kind != "veth" {
+            return Err(MxcError::policy_validation(format!(
+                "Container {:?} configures lxc.net.{}.type = {:?}; a firewall-enforced \
+                 network policy can only be applied to a veth interface, because \
+                 enforcement pins the host end of the veth pair and hooks that name in \
+                 FORWARD. Use a veth interface, or run without firewall enforcement",
+                container.name(),
+                sole.index,
+                sole.kind,
+            )));
         }
 
         let veth = NetworkIptablesManager::deterministic_veth_name(container.name());
+        let pin_key = format!("lxc.net.{}.veth.pair", sole.index);
 
         // The name is re-derived on every start, so drop any pin from a prior
         // run before setting it to avoid accumulating duplicate net entries.
         container
-            .clear_config_item("lxc.net.0.veth.pair")
+            .clear_config_item(&pin_key)
             .map_err(|e| MxcError::backend_error(format!("Failed to clear veth pair name: {e}")))?;
         container
-            .set_config_item("lxc.net.0.veth.pair", &veth)
+            .set_config_item(&pin_key, &veth)
             .map_err(|e| MxcError::backend_error(format!("Failed to pin veth pair name: {e}")))?;
         fw_manager.set_veth_interface(&veth);
     }
