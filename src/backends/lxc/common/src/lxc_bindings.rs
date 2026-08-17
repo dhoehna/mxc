@@ -270,111 +270,68 @@ fn build_attach_args_with_env_control(
 pub struct NetInterfaceConfig {
     /// How many interfaces liblxc will bring up.
     pub count: usize,
-    /// Where the container's only interface sits, and what type it declares.
+    /// The declared type of the container's only interface, present only when
+    /// `count == 1`.
     ///
-    /// Enforcement pins the veth pair against whichever index this reports, so
-    /// a container that numbers its interface `lxc.net.3` is as enforceable as
-    /// one that uses `lxc.net.0`. Absent when there is no single interface to
-    /// locate, or when it is numbered beyond the search bound.
-    pub sole: Option<SoleNetInterface>,
+    /// Enforcement refuses anything that is not a `veth`, so the type is read
+    /// to decide that. It comes from the same `lxc.net` read as the count, so
+    /// no separate indexed probe is needed and there is no window between
+    /// reading the count and reading the type.
+    pub sole_kind: Option<String>,
 }
 
-/// The index and declared type of a container's only network interface.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SoleNetInterface {
-    /// The `N` in `lxc.net.N`.
-    pub index: usize,
-    /// The type declared at `lxc.net.N.type`.
-    pub kind: String,
-}
-
-/// How far to look for a container's only interface.
+/// Interpret an `lxc-info -c <key>` answer as the values liblxc holds for that
+/// key.
 ///
-/// liblxc reports how many interfaces it will bring up but never says where
-/// they are numbered: `-c lxc.net` prints values rather than indices, `-c
-/// lxc.net.N` is rejected as invalid, and there is no way to list the keys it
-/// holds. The index therefore has to be found by asking for it. Nearly every
-/// container answers on the first probe, so this bound only decides how oddly
-/// numbered a config MXC will still enforce rather than refuse.
-pub const NET_INDEX_SEARCH_LIMIT: usize = 32;
-
-/// Count the interfaces in `lxc-info -c lxc.net` output.
+/// liblxc prints the first value on a `key = value` line and any further values
+/// bare on lines of their own. Each line is trimmed; a line beginning with
+/// `key` followed by optional whitespace and `=` yields what follows, and any
+/// other line is taken whole. Results are trimmed and empties dropped, so an
+/// absent or empty key yields no values.
 ///
-/// liblxc prints the first value on the `key = value` line and any further
-/// values bare on lines of their own, so one non-empty value is one interface.
-/// A container with no network at all prints the key with an empty value.
-fn interpret_net_summary(stdout: &str) -> usize {
+/// The prefix is keyed on `key` rather than split on the first `=` anywhere in
+/// the line: a continuation value can itself contain `=` (a hook command does),
+/// and splitting on `=` would truncate it.
+fn interpret_config_values(key: &str, stdout: &str) -> Vec<String> {
     stdout
         .lines()
-        .map(|line| line.split_once('=').map_or(line, |(_, rhs)| rhs).trim())
+        .map(|line| line.trim())
+        .map(|line| {
+            line.strip_prefix(key)
+                .map(|rest| rest.trim_start())
+                .and_then(|rest| rest.strip_prefix('='))
+                .map_or(line, |value| value)
+                .trim()
+        })
         .filter(|value| !value.is_empty())
-        .count()
+        .map(|value| value.to_string())
+        .collect()
 }
 
-/// Read a single `lxc-info -c <key>` answer.
+/// Build the `lxc.hook.start-host` value that runs the veth-pin script.
 ///
-/// A key liblxc does not hold is reported on stderr and still exits zero, so an
-/// empty stdout is the absence signal; the caller separates a genuine failure
-/// from an absent key by the exit status instead.
-fn interpret_config_query(stdout: &str) -> Option<String> {
-    stdout
-        .lines()
-        .find_map(|line| line.split_once('='))
-        .map(|(_, value)| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+/// The script takes the desired host veth name as its sole argument, so the
+/// value is the script path and the target name separated by a space.
+fn veth_pin_hook_command(script_path: &str, target_veth: &str) -> String {
+    format!("{} {}", script_path, target_veth)
 }
 
-/// Decide what a completed index scan means, given the interface summary read
-/// before it, the summary read after, and the type still standing at the index
-/// that was located.
+/// Shell body of the `lxc.hook.start-host` hook that renames the container's
+/// host-side veth to the name passed as `$1`.
 ///
-/// The count and the index come from separate `lxc-info` runs, so a config
-/// rewritten between them would be pinned against a set of interfaces that no
-/// longer exists.  Two rewrites matter and neither is visible to the other
-/// check: a second interface arriving changes the summary but leaves the
-/// located index intact, while the sole interface moving to another index
-/// leaves the summary identical -- `lxc.net` prints values, not indices -- and
-/// silently invalidates it.  Both are refused.
-///
-/// This narrows the window; it does not close it.  liblxc offers no lock and no
-/// atomic config read, so a writer that restores the config before the recheck
-/// passes.  That writer needs write access to a root-owned config file and
-/// could flush the firewall directly, so it is not the case being defended
-/// against.  The case being defended against is a config that moved and stayed
-/// moved, which would otherwise be pinned wrong in silence.
-///
-/// Split out as a pure function so the decision is testable without `lxc-info`
-/// on the box.
-fn resolve_scanned_interface(
-    summary_before: &str,
-    summary_after: &str,
-    kind_after: &str,
-    located: Option<SoleNetInterface>,
-) -> Result<Option<SoleNetInterface>, String> {
-    if summary_before.trim() != summary_after.trim() {
-        return Err(format!(
-            "network config changed while it was being read: lxc.net was {:?} before \
-             the interface index was located and {:?} after, so the index cannot be \
-             trusted to cover the container's traffic",
-            summary_before.trim(),
-            summary_after.trim()
-        ));
-    }
-    if let Some(sole) = &located {
-        let standing = interpret_config_query(kind_after);
-        if standing.as_deref() != Some(sole.kind.as_str()) {
-            return Err(format!(
-                "network config changed while it was being read: lxc.net.{}.type was {:?} \
-                 when the interface was located and {:?} on recheck, so the index cannot \
-                 be trusted to cover the container's traffic",
-                sole.index,
-                sole.kind,
-                standing.unwrap_or_default()
-            ));
-        }
-    }
-    Ok(located)
-}
+/// It finds the container's sole peered interface (a veth in the netns prints
+/// `eth0@if<N>`; `lo` has no `@if`, so it is naturally excluded), resolves that
+/// host ifindex to its current name, and renames it. It is idempotent and fails
+/// closed.
+const VETH_PIN_SCRIPT: &str = r#"#!/bin/sh
+set -e
+target="$1"
+i=$(nsenter -t "$LXC_PID" -n ip -o link | sed -n 's/^[0-9]*: [^:@]*@if\([0-9]*\):.*/\1/p' | head -n1)
+[ -n "$i" ] || { echo "mxc: no peered interface in container netns" >&2; exit 1; }
+c=$(ip -o link | sed -n "s/^$i: \([^:@]*\)[@:].*/\1/p" | head -n1)
+[ -n "$c" ] || { echo "mxc: host ifindex $i not resolvable" >&2; exit 1; }
+[ "$c" = "$target" ] || ip link set "$c" name "$target"
+"#;
 
 /// Read an `lxc-info` run as "does this container exist?".
 ///
@@ -1164,40 +1121,61 @@ impl LxcContainer {
     /// liblxc answers for a stopped container, so the answer is available while
     /// there is still time to act on it before start.
     ///
+    /// The count and the sole interface's type both come from a single
+    /// `lxc.net` read, so there is no longer a window between reading the count
+    /// and reading the interface. This is not atomic with respect to the start
+    /// itself -- the config could still change before liblxc reads it -- only
+    /// with respect to this pair of observations.
+    ///
     /// A probe that cannot run is an error rather than an empty answer: no
     /// evidence of an interface is not evidence of no interface.
     pub fn configured_net_interfaces(&self) -> Result<NetInterfaceConfig, String> {
-        let summary = self.query_config_item("lxc.net")?;
-        let count = interpret_net_summary(&summary);
-        // Where it sits only matters when there is exactly one; every other
-        // count is refused upstream without reference to the index.
-        let sole = if count == 1 {
-            let located = self.locate_sole_net_interface()?;
-            let kind_after = match &located {
-                Some(sole) => self.query_config_item(&format!("lxc.net.{}.type", sole.index))?,
-                None => String::new(),
-            };
-            let summary_after = self.query_config_item("lxc.net")?;
-            resolve_scanned_interface(&summary, &summary_after, &kind_after, located)?
+        let values = interpret_config_values("lxc.net", &self.query_config_item("lxc.net")?);
+        let count = values.len();
+        // The type only matters when there is exactly one interface; every
+        // other count is refused upstream without reference to it.
+        let sole_kind = if count == 1 {
+            values.into_iter().next()
         } else {
             None
         };
-        Ok(NetInterfaceConfig { count, sole })
+        Ok(NetInterfaceConfig { count, sole_kind })
     }
 
-    /// Find which `lxc.net.N` the container's only interface uses.
+    /// Install the `lxc.hook.start-host` hook that pins the container's
+    /// host-side veth to `target_veth`.
     ///
-    /// The scan stops at the first index liblxc holds a type for, so the usual
-    /// `lxc.net.0` container costs exactly one probe -- the same as asking for
-    /// index 0 directly.
-    fn locate_sole_net_interface(&self) -> Result<Option<SoleNetInterface>, String> {
-        for index in 0..NET_INDEX_SEARCH_LIMIT {
-            let probe = self.query_config_item(&format!("lxc.net.{index}.type"))?;
-            if let Some(kind) = interpret_config_query(&probe) {
-                return Ok(Some(SoleNetInterface { index, kind }));
-            }
+    /// The hook runs after liblxc has created the veth pair and attached it to
+    /// the bridge but before the container's init execs, so the deterministic
+    /// name is in place before anything in the container can transmit. The hook
+    /// key is container-global -- it carries no `lxc.net.<N>` index -- so
+    /// enforcement no longer depends on which index the interface uses.
+    ///
+    /// The script is written fresh every time so it cannot go stale, and made
+    /// executable. The hook entry is appended only when an identical one is not
+    /// already present; the key is never cleared, because a container's own
+    /// config may declare start-host hooks that clearing would destroy.
+    pub fn ensure_veth_pin_hook(&self, target_veth: &str) -> Result<(), String> {
+        let script_path = format!("{}/{}/mxc-veth-pin.sh", self.lxc_path, self.name);
+
+        std::fs::write(&script_path, VETH_PIN_SCRIPT)
+            .map_err(|e| format!("Failed to write veth pin hook script {script_path}: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("Failed to chmod veth pin hook script {script_path}: {e}"))?;
         }
-        Ok(None)
+
+        let value = veth_pin_hook_command(&script_path, target_veth);
+        let existing = interpret_config_values(
+            "lxc.hook.start-host",
+            &self.query_config_item("lxc.hook.start-host")?,
+        );
+        if existing.iter().any(|present| present == &value) {
+            return Ok(());
+        }
+        self.set_config_item("lxc.hook.start-host", &value)
     }
 
     /// Ask liblxc for one config key, with any `lxc.include` already resolved.
@@ -1473,7 +1451,10 @@ mod tests {
 
     #[test]
     fn one_interface_reports_one() {
-        assert_eq!(interpret_net_summary("lxc.net = veth\n\n"), 1);
+        assert_eq!(
+            interpret_config_values("lxc.net", "lxc.net = veth\n\n").len(),
+            1
+        );
     }
 
     #[test]
@@ -1688,12 +1669,15 @@ mod tests {
         // what decides whether one FORWARD hook covers the container, so a
         // second interface has to survive the parse -- including one that only
         // an lxc.include declared, which is why the question goes to liblxc.
-        assert_eq!(interpret_net_summary("lxc.net = veth\nveth\n\n"), 2);
+        assert_eq!(
+            interpret_config_values("lxc.net", "lxc.net = veth\nveth\n\n").len(),
+            2
+        );
     }
 
     #[test]
     fn a_container_with_no_network_reports_no_interfaces() {
-        assert_eq!(interpret_net_summary("lxc.net =\n"), 0);
+        assert_eq!(interpret_config_values("lxc.net", "lxc.net =\n").len(), 0);
     }
 
     #[test]
@@ -1704,187 +1688,84 @@ mod tests {
         // an empty value, so reading the word as absence would report no
         // interface for a container that has one and refuse it for the wrong
         // reason.
-        assert_eq!(interpret_net_summary("lxc.net = empty\n"), 1);
+        assert_eq!(
+            interpret_config_values("lxc.net", "lxc.net = empty\n").len(),
+            1
+        );
     }
 
     #[test]
     fn trailing_blank_lines_are_not_counted_as_interfaces() {
         // Counting them would report a second interface that does not exist and
         // refuse a container MXC can fully filter.
-        assert_eq!(interpret_net_summary("lxc.net = veth\n\n\n\n"), 1);
+        assert_eq!(
+            interpret_config_values("lxc.net", "lxc.net = veth\n\n\n\n").len(),
+            1
+        );
     }
 
     #[test]
-    fn a_config_that_held_still_during_the_scan_keeps_the_located_index() {
-        let found = SoleNetInterface {
-            index: 3,
-            kind: "veth".to_string(),
-        };
+    fn a_single_value_is_returned_intact() {
         assert_eq!(
-            resolve_scanned_interface(
-                "lxc.net = veth\n",
-                "lxc.net = veth\n",
-                "lxc.net.3.type = veth\n",
-                Some(found.clone())
+            interpret_config_values("lxc.net", "lxc.net = veth\n"),
+            vec!["veth".to_string()]
+        );
+    }
+
+    #[test]
+    fn multiple_values_span_the_inline_and_continuation_lines() {
+        // liblxc prints the first value on the key line and the rest bare, so
+        // every value has to be recovered regardless of which line carries it.
+        assert_eq!(
+            interpret_config_values(
+                "lxc.hook.start-host",
+                "lxc.hook.start-host = /a/one.sh\n/a/two.sh\n"
             ),
-            Ok(Some(found))
+            vec!["/a/one.sh".to_string(), "/a/two.sh".to_string()]
         );
     }
 
     #[test]
-    fn a_scan_that_found_nothing_is_not_reported_as_a_read_failure() {
-        // An interface numbered past the search bound is absent as far as the
-        // scan is concerned.  That has to reach the caller as "not found" so it
-        // can refuse while naming the range it searched, rather than as a read
-        // error that says nothing about why.
+    fn an_empty_value_yields_no_values() {
+        assert!(interpret_config_values("lxc.net", "lxc.net =\n").is_empty());
+    }
+
+    #[test]
+    fn a_value_containing_an_equals_sign_is_returned_intact() {
+        // A hook command can carry `=` in an argument. Splitting on the first
+        // `=` anywhere in the line would truncate it; keying the strip on the
+        // config key preserves the whole value -- both on the inline line and
+        // on a bare continuation line.
         assert_eq!(
-            resolve_scanned_interface("lxc.net = veth\n", "lxc.net = veth\n", "", None),
-            Ok(None)
-        );
-    }
-
-    #[test]
-    fn an_interface_appearing_during_the_scan_refuses_the_located_index() {
-        // Counted with one interface, scanned, then a second interface arrives.
-        // Pinning the first would leave the second routing unfiltered.
-        assert!(resolve_scanned_interface(
-            "lxc.net = veth\n",
-            "lxc.net = veth\nveth\n",
-            "lxc.net.0.type = veth\n",
-            Some(SoleNetInterface {
-                index: 0,
-                kind: "veth".to_string(),
-            })
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn an_interface_moving_index_during_the_scan_refuses_the_located_index() {
-        // lxc.net prints values, not indices, so an interface that moves from 0
-        // to 3 leaves the summary identical.  Only the type standing at the
-        // located index shows it left.
-        assert!(resolve_scanned_interface(
-            "lxc.net = veth\n",
-            "lxc.net = veth\n",
-            "",
-            Some(SoleNetInterface {
-                index: 0,
-                kind: "veth".to_string(),
-            })
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn a_type_restored_after_the_scan_refuses_the_located_index() {
-        // A macvlan briefly reading as veth while the scan ran would otherwise
-        // take a veth pin it can never answer to, and route unfiltered.
-        assert!(resolve_scanned_interface(
-            "lxc.net = macvlan\n",
-            "lxc.net = macvlan\n",
-            "lxc.net.0.type = macvlan\n",
-            Some(SoleNetInterface {
-                index: 0,
-                kind: "veth".to_string(),
-            })
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn an_interface_changing_type_during_the_scan_refuses_the_located_index() {
-        assert!(resolve_scanned_interface(
-            "lxc.net = veth\n",
-            "lxc.net = macvlan\n",
-            "lxc.net.0.type = macvlan\n",
-            Some(SoleNetInterface {
-                index: 0,
-                kind: "veth".to_string(),
-            })
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn the_refusal_names_both_summaries_it_saw() {
-        let refusal = resolve_scanned_interface(
-            "lxc.net = veth\n",
-            "lxc.net = macvlan\n",
-            "lxc.net.0.type = macvlan\n",
-            None,
-        )
-        .expect_err("a changed summary is refused");
-        assert!(refusal.contains("veth"), "{refusal}");
-        assert!(refusal.contains("macvlan"), "{refusal}");
-    }
-
-    #[test]
-    fn the_refusal_names_the_index_whose_type_moved() {
-        let refusal = resolve_scanned_interface(
-            "lxc.net = veth\n",
-            "lxc.net = veth\n",
-            "lxc.net.3.type = macvlan\n",
-            Some(SoleNetInterface {
-                index: 3,
-                kind: "veth".to_string(),
-            }),
-        )
-        .expect_err("a type that moved under the located index is refused");
-        assert!(refusal.contains("lxc.net.3.type"), "{refusal}");
-        assert!(refusal.contains("macvlan"), "{refusal}");
-    }
-
-    #[test]
-    fn a_trailing_newline_difference_is_not_a_config_change() {
-        // Both readings are captured from a subprocess, so trailing whitespace
-        // is capture noise rather than evidence.  Refusing on it would fail
-        // every start on a config that never moved.
-        let found = SoleNetInterface {
-            index: 0,
-            kind: "veth".to_string(),
-        };
-        assert_eq!(
-            resolve_scanned_interface(
-                "lxc.net = veth\n",
-                "lxc.net = veth\n\n",
-                "lxc.net.0.type = veth\n\n",
-                Some(found.clone())
+            interpret_config_values(
+                "lxc.hook.start-host",
+                "lxc.hook.start-host = /a/pin.sh --name=veth0\n/a/other.sh k=v\n"
             ),
-            Ok(Some(found))
+            vec![
+                "/a/pin.sh --name=veth0".to_string(),
+                "/a/other.sh k=v".to_string()
+            ]
         );
     }
 
     #[test]
-    fn a_declared_interface_type_is_read_back() {
+    fn leading_and_trailing_blank_lines_are_ignored() {
         assert_eq!(
-            interpret_config_query("lxc.net.0.type = veth\n"),
-            Some("veth".to_string())
+            interpret_config_values("lxc.net", "\n\nlxc.net = veth\n\n"),
+            vec!["veth".to_string()]
         );
     }
 
     #[test]
-    fn a_key_liblxc_does_not_hold_reports_no_value() {
-        // liblxc names the absent key on stderr and exits zero, so stdout is
-        // empty. Reporting a value here would let an interface that is not a
-        // veth, or is not at index 0, pass the gate.
-        assert_eq!(interpret_config_query(""), None);
-    }
-
-    #[test]
-    fn a_key_with_an_empty_value_reports_no_value() {
-        assert_eq!(interpret_config_query("lxc.net.0.type =\n"), None);
-    }
-
-    #[test]
-    fn a_type_of_empty_is_read_back_as_a_declared_type() {
-        // Distinguishing this from an absent key is what sends a loopback-only
-        // container to the refusal that names its type rather than to the one
-        // that claims it has no interface at lxc.net.0.
-        assert_eq!(
-            interpret_config_query("lxc.net.0.type = empty\n"),
-            Some("empty".to_string())
-        );
+    fn the_pin_hook_command_passes_the_target_as_a_separate_argument() {
+        // The script reads the target from $1, so the value has to be the
+        // script path and the target separated by whitespace, not concatenated.
+        let cmd = veth_pin_hook_command("/var/lib/lxc/box/mxc-veth-pin.sh", "mxcveth-box");
+        assert!(cmd.contains("/var/lib/lxc/box/mxc-veth-pin.sh"), "{cmd}");
+        assert!(cmd.contains("mxcveth-box"), "{cmd}");
+        let mut parts = cmd.split_whitespace();
+        assert_eq!(parts.next(), Some("/var/lib/lxc/box/mxc-veth-pin.sh"));
+        assert_eq!(parts.next(), Some("mxcveth-box"));
     }
 
     #[test]

@@ -1425,11 +1425,13 @@ impl NetworkIptablesManager {
     ///
     /// The firewall must be installed *before* the container starts, but the
     /// veth pair liblxc creates by default has a random name that is only known
-    /// once the container is running. Pinning `lxc.net.<N>.veth.pair` to this
-    /// name — `<N>` being wherever the container's sole interface is numbered —
-    /// lets the FORWARD hook reference the interface by name ahead of time —
-    /// iptables accepts a not-yet-existing interface — so there is no window in
-    /// which a started container has unfiltered network.
+    /// once the container is running. A `lxc.hook.start-host` hook renames the
+    /// host end to this name after liblxc creates it but before the container's
+    /// init runs, which lets the FORWARD hook reference the interface by name
+    /// ahead of time — iptables accepts a not-yet-existing interface — so there
+    /// is no window in which a started container has unfiltered network. That
+    /// hook key carries no interface index, so enforcement does not depend on
+    /// which `lxc.net.<N>` the container numbers its interface.
     ///
     /// The name must fit the kernel `IFNAMSIZ` limit of 15 characters and be
     /// unique per container, so a `mxcv` prefix (4) is followed by an
@@ -1531,26 +1533,82 @@ impl NetworkIptablesManager {
     /// ownership that schedules a pointless retry in `Drop`. Probing reports
     /// exactly what is present, so an already-clean container issues no
     /// commands at all and a half-installed one removes only its own half.
-    fn observe_existing(chain_name: &str) -> Result<CreatedResources, String> {
-        let hooked = |tool: &str| Self::hook_present(&Self::probe_forward_chain(tool), chain_name);
-        // A live FORWARD dump shows that *some* rule jumps to the chain, not
-        // which form installed it, and teardown does not need to know -- it
-        // enumerates and removes every form. Recording the plain hook is enough
-        // to make `hooks_remain` true, while claiming a physdev hook that may
-        // never have existed would only schedule a retry for a rule nothing
-        // installed. The return rules live inside the chain, so the flush
-        // reclaims them without an ownership bit of their own.
+    /// Classify the FORWARD rules this backend installs, from a live dump.
+    ///
+    /// Every delete in [`teardown_family_forward`](Self::teardown_family_forward)
+    /// is gated on the matching ownership bit, so a bit left false on the
+    /// authoritative path leaves a rule installed that nothing will ever
+    /// remove. Rules are recognized by the matches they carry rather than by
+    /// their text, because `iptables -S` does not echo back what was submitted:
+    /// a rule built as `--state ESTABLISHED,RELATED` prints as
+    /// `RELATED,ESTABLISHED`, so comparing against a rebuilt spec would miss
+    /// every return rule.
+    ///
+    /// The two hook forms are told apart by `--physdev-in` alone, so they are
+    /// still recognized when the interface is unknown. The return rules jump to
+    /// ACCEPT rather than to the chain, so the interface is the only thing that
+    /// identifies them as ours; without it they stay unclaimed.
+    fn observe_forward_rules(dump: &str, chain: &str, iface: Option<&str>) -> FamilyResources {
+        let mut found = FamilyResources::default();
+        for line in dump.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.first() != Some(&"-A") || tokens.get(1) != Some(&"FORWARD") {
+                continue;
+            }
+            let targets = |name: &str| tokens.windows(2).any(|w| w[0] == "-j" && w[1] == name);
+            let matches_iface =
+                |opt: &str, val: &str| tokens.windows(2).any(|w| w[0] == opt && w[1] == val);
+
+            if targets(chain) {
+                if tokens.contains(&"--physdev-in") {
+                    found.physdev_hook = true;
+                } else {
+                    found.hook = true;
+                }
+            }
+            if let Some(i) = iface {
+                if targets("ACCEPT") {
+                    if matches_iface("--physdev-out", i) {
+                        found.physdev_return = true;
+                    } else if matches_iface("-o", i) {
+                        found.return_rule = true;
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    fn observe_existing(
+        chain_name: &str,
+        veth_interface: Option<&str>,
+    ) -> Result<CreatedResources, String> {
+        let family = |tool: &str| -> Result<FamilyResources, String> {
+            let mut observed = match Self::probe_forward_chain(tool) {
+                ForwardProbe::Dump(dump) => {
+                    Self::observe_forward_rules(&dump, chain_name, veth_interface)
+                }
+                // A tool that is not installed holds no rules, so it holds no
+                // hook. See `hook_present` for why that is an answer and not a
+                // guess.
+                ForwardProbe::ToolAbsent => FamilyResources::default(),
+                // Fail closed on an unreadable FORWARD, for the reason
+                // `hook_present` gives: claiming no hook would let the chain be
+                // flushed while a jump into it still stands, which unfilters a
+                // live container. Only the plain hook is claimed, because a
+                // delete for a rule that never existed would report a residual
+                // that no later pass can clear.
+                ForwardProbe::Unreadable => FamilyResources {
+                    hook: true,
+                    ..FamilyResources::default()
+                },
+            };
+            observed.chain = Self::chain_exists(tool, chain_name)?;
+            Ok(observed)
+        };
         Ok(CreatedResources {
-            v4: FamilyResources {
-                chain: Self::chain_exists("iptables", chain_name)?,
-                hook: hooked("iptables"),
-                ..FamilyResources::default()
-            },
-            v6: FamilyResources {
-                chain: Self::chain_exists("ip6tables", chain_name)?,
-                hook: hooked("ip6tables"),
-                ..FamilyResources::default()
-            },
+            v4: family("iptables")?,
+            v6: family("ip6tables")?,
         })
     }
 
@@ -2528,13 +2586,14 @@ impl NetworkIptablesManager {
         // veth. Enumerating the live FORWARD chain for jumps to this chain
         // needs no interface and clears both hook forms at once.
         //
-        // It cannot reach the return rules, and nothing else will either: they
-        // are marked residual, but `observe_existing` reconstructs ownership
-        // from the chain and the jumps into it, so a return rule left standing
-        // once its chain is gone is no longer discoverable. Enumerating is
-        // still the better of the two, because it reclaims the chain and both
-        // hooks rather than leaking all four, but the two return rules are a
-        // known strand on this path and not a deferred retry.
+        // It cannot reach the return rules. They are marked residual, and
+        // whether a later pass can reclaim them depends on the interface being
+        // known by then: `observe_existing` claims a return rule only when it
+        // can match the interface the rule names, because nothing else marks
+        // that rule as ours. This path is the one that has no interface, so on
+        // it the two return rules are a known strand rather than a deferred
+        // retry. Enumerating is still the better of the two, because it
+        // reclaims the chain and both hooks rather than leaking all four.
         match veth_interface {
             Some(iface) => {
                 Self::teardown_family_forward(
@@ -2773,7 +2832,7 @@ impl NetworkIptablesManager {
         let mut mgr = Self::new(container_name);
         // Ask the host what is installed instead of asserting it, so a
         // container with nothing left issues no commands and logs no failures.
-        let observed = Self::observe_existing(&mgr.chain_name)?;
+        let observed = Self::observe_existing(&mgr.chain_name, veth_interface)?;
         if observed.is_empty() {
             return Ok(());
         }
@@ -2792,7 +2851,7 @@ impl NetworkIptablesManager {
         // false alarm every time the retry succeeded.
         let chain_name = mgr.chain_name.clone();
         drop(mgr);
-        match Self::observe_existing(&chain_name) {
+        match Self::observe_existing(&chain_name, veth_interface) {
             Ok(o) if o.is_empty() => Ok(()),
             Ok(_) => Err(attempt.err().unwrap_or_else(|| {
                 format!("iptables state for chain {chain_name} survived authoritative cleanup")
@@ -3302,6 +3361,117 @@ mod tests {
             fake.issued().is_empty(),
             "...and must not issue a single command, got: {:?}",
             fake.issued()
+        );
+    }
+
+    /// A verbatim `iptables -S FORWARD` dump taken from a host running a
+    /// default-block sandbox. Written down rather than rebuilt from the
+    /// builders because the point of the exercise is that the kernel does not
+    /// echo back what was submitted -- note `RELATED,ESTABLISHED` here against
+    /// the `ESTABLISHED,RELATED` the rules were installed with.
+    const LIVE_FORWARD_DUMP: &str = "\
+-P FORWARD ACCEPT
+-A FORWARD -m physdev --physdev-out mxcvjdmbp6vwk6m -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -o mxcvjdmbp6vwk6m -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -m physdev --physdev-in mxcvjdmbp6vwk6m -j MXC-mxc-d0e-oozdlgpmvay3kobe
+-A FORWARD -i mxcvjdmbp6vwk6m -j MXC-mxc-d0e-oozdlgpmvay3kobe";
+
+    #[test]
+    fn every_installed_forward_rule_is_claimed() {
+        // Teardown deletes only what ownership claims, so a rule this misses is
+        // a rule that survives stop, deprovision, and every later retry.
+        let observed = NetworkIptablesManager::observe_forward_rules(
+            LIVE_FORWARD_DUMP,
+            "MXC-mxc-d0e-oozdlgpmvay3kobe",
+            Some("mxcvjdmbp6vwk6m"),
+        );
+
+        assert!(observed.hook, "the -i hook must be claimed");
+        assert!(
+            observed.physdev_hook,
+            "the --physdev-in hook must be claimed"
+        );
+        assert!(observed.return_rule, "the -o return rule must be claimed");
+        assert!(
+            observed.physdev_return,
+            "the --physdev-out return rule must be claimed"
+        );
+    }
+
+    #[test]
+    fn a_rule_belonging_to_another_container_is_not_claimed() {
+        // Claiming a neighbour's rule would delete another sandbox's filtering.
+        let observed = NetworkIptablesManager::observe_forward_rules(
+            LIVE_FORWARD_DUMP,
+            "MXC-someone-else",
+            Some("mxcvsomeoneelse"),
+        );
+
+        assert!(
+            observed.is_empty(),
+            "no rule naming another chain or interface may be claimed, got: {observed:?}"
+        );
+    }
+
+    #[test]
+    fn return_rules_are_left_unclaimed_when_the_interface_is_unknown() {
+        // Nothing but the interface name marks a return rule as ours -- it
+        // jumps to ACCEPT, not to our chain. Claiming one on a guess would
+        // issue a delete for a rule this backend never installed.
+        let observed = NetworkIptablesManager::observe_forward_rules(
+            LIVE_FORWARD_DUMP,
+            "MXC-mxc-d0e-oozdlgpmvay3kobe",
+            None,
+        );
+
+        assert!(
+            observed.hook && observed.physdev_hook,
+            "both hook forms are identifiable without the interface"
+        );
+        assert!(
+            !observed.return_rule && !observed.physdev_return,
+            "a return rule must not be claimed without the interface that names it"
+        );
+    }
+
+    #[test]
+    fn a_hook_in_another_table_is_not_read_as_a_forward_hook() {
+        // Only FORWARD is being torn down here; an identical jump installed in
+        // INPUT or OUTPUT belongs to the ingress path and is not ours to delete.
+        let dump = "\
+-A INPUT -i mxcvjdmbp6vwk6m -j MXC-mxc-d0e-oozdlgpmvay3kobe
+-A OUTPUT -o mxcvjdmbp6vwk6m -m state --state RELATED,ESTABLISHED -j ACCEPT";
+
+        let observed = NetworkIptablesManager::observe_forward_rules(
+            dump,
+            "MXC-mxc-d0e-oozdlgpmvay3kobe",
+            Some("mxcvjdmbp6vwk6m"),
+        );
+
+        assert!(
+            observed.is_empty(),
+            "only FORWARD rules may be claimed, got: {observed:?}"
+        );
+    }
+
+    #[test]
+    fn the_two_hook_forms_are_claimed_independently() {
+        // The physdev hook is installed only on a bridged topology. Claiming it
+        // where it was never installed makes teardown issue a delete that
+        // fails, and a failed delete is reported as a residual that no later
+        // pass can ever clear.
+        let dump = "-A FORWARD -i mxcvjdmbp6vwk6m -j MXC-solo";
+
+        let observed = NetworkIptablesManager::observe_forward_rules(
+            dump,
+            "MXC-solo",
+            Some("mxcvjdmbp6vwk6m"),
+        );
+
+        assert!(observed.hook, "the hook that is present must be claimed");
+        assert!(
+            !observed.physdev_hook,
+            "a hook form that is absent must not be claimed"
         );
     }
 

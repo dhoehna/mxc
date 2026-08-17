@@ -24,7 +24,7 @@ use wxc_common::state_aware_backend::{
 };
 
 use crate::filesystem_mounts;
-use crate::lxc_bindings::{mint_exec_marker, LxcContainer, NET_INDEX_SEARCH_LIMIT};
+use crate::lxc_bindings::{mint_exec_marker, LxcContainer};
 use crate::network_ingress::IngressManager;
 use crate::network_iptables::{CreatedResources, NetworkIptablesManager};
 use crate::signal_cleanup;
@@ -371,13 +371,18 @@ fn apply_network_policy(
 
     let mut fw_manager = NetworkIptablesManager::new(container.name());
 
-    // Under a firewall-enforced policy, pin a deterministic host-side veth name
-    // in the container config so the chain and its FORWARD hook can be built
-    // *before* the container runs. The prior flow discovered the veth only after
+    // Under a firewall-enforced policy, MXC installs a `lxc.hook.start-host`
+    // hook that renames the container's host-side veth to a deterministic name.
+    // The hook runs after liblxc creates the veth pair and attaches it to the
+    // bridge, but before the container's init runs, so the chain and its
+    // FORWARD hook can be built against that name *before* anything in the
+    // container can transmit. The prior flow discovered the veth only after
     // start and applied rules afterward, leaving a window in which a container
-    // with a deny policy had unrestricted network. iptables accepts an interface
-    // name that does not exist yet, so hooking the not-yet-created veth by its
-    // pinned name closes that window entirely.
+    // with a deny policy had unrestricted network. iptables accepts an
+    // interface name that does not exist yet, so hooking the not-yet-created
+    // veth by its deterministic name closes that window entirely. The hook key
+    // is container-global, so enforcement no longer depends on which
+    // `lxc.net.<N>` index the interface uses.
     if uses_firewall_mode(&policy) {
         // Exactly one interface gets a pinned veth, and apply_firewall_rules
         // hooks exactly one interface. A container this run created has exactly
@@ -417,47 +422,24 @@ fn apply_network_policy(
         // to be a veth. Enforcement works by naming the host end of a veth pair
         // and hooking that name in FORWARD, so a macvlan or phys interface would
         // get a chain built against a name that never exists while its traffic
-        // ran unfiltered and MXC reported the policy as enforced. The index it
-        // sits at carries no such risk: the pin below is written against
-        // whichever index liblxc reports, so a container numbering its only
-        // interface lxc.net.3 is enforced exactly as one using lxc.net.0.
-        let sole = match net.sole {
-            Some(ref sole) => sole,
-            None => {
-                return Err(MxcError::policy_validation(format!(
-                    "Container {:?} declares one network interface, but MXC could not find \
-                     which lxc.net.N index it uses within lxc.net.0 through lxc.net.{}; \
-                     a firewall-enforced network policy has to pin the host end of that \
-                     interface's veth pair before the container starts. Renumber the \
-                     interface into that range, or run without firewall enforcement",
-                    container.name(),
-                    NET_INDEX_SEARCH_LIMIT - 1,
-                )));
-            }
-        };
-        if sole.kind != "veth" {
+        // ran unfiltered and MXC reported the policy as enforced.
+        let sole_kind = net.sole_kind.as_deref().unwrap_or_default();
+        if sole_kind != "veth" {
             return Err(MxcError::policy_validation(format!(
-                "Container {:?} configures lxc.net.{}.type = {:?}; a firewall-enforced \
-                 network policy can only be applied to a veth interface, because \
-                 enforcement pins the host end of the veth pair and hooks that name in \
-                 FORWARD. Use a veth interface, or run without firewall enforcement",
+                "Container {:?} configures a network interface of type {:?}; a \
+                 firewall-enforced network policy can only be applied to a veth \
+                 interface, because enforcement pins the host end of the veth pair and \
+                 hooks that name in FORWARD. Use a veth interface, or run without \
+                 firewall enforcement",
                 container.name(),
-                sole.index,
-                sole.kind,
+                sole_kind,
             )));
         }
 
         let veth = NetworkIptablesManager::deterministic_veth_name(container.name());
-        let pin_key = format!("lxc.net.{}.veth.pair", sole.index);
-
-        // The name is re-derived on every start, so drop any pin from a prior
-        // run before setting it to avoid accumulating duplicate net entries.
-        container
-            .clear_config_item(&pin_key)
-            .map_err(|e| MxcError::backend_error(format!("Failed to clear veth pair name: {e}")))?;
-        container
-            .set_config_item(&pin_key, &veth)
-            .map_err(|e| MxcError::backend_error(format!("Failed to pin veth pair name: {e}")))?;
+        container.ensure_veth_pin_hook(&veth).map_err(|e| {
+            MxcError::backend_error(format!("Failed to install veth pin hook: {e}"))
+        })?;
         fw_manager.set_veth_interface(&veth);
     }
 
@@ -620,6 +602,20 @@ fn cleanup_network_owned(
 /// deprovision answer success over a chain that survived them, which is the
 /// one outcome the caller has to know about: the stranded chain blocks every
 /// later start of that container name.
+/// The host-side veth name MXC guarantees for a container it enforces.
+///
+/// Teardown deletes FORWARD rules by their full specification, so it needs the
+/// name those rules actually carry. Asking liblxc for it is wrong: the pin hook
+/// renames the interface *after* liblxc creates it, so `lxc-info` keeps
+/// reporting the random name it generated, and deletes replayed against that
+/// name match nothing — the hooks survive and the chain is stranded. The name
+/// is derived rather than discovered because enforcement is what put it there.
+fn enforced_veth_name(container_name: &str) -> Option<String> {
+    Some(NetworkIptablesManager::deterministic_veth_name(
+        container_name,
+    ))
+}
+
 fn cleanup_network_authoritative(
     container_name: &str,
     veth: Option<&str>,
@@ -971,7 +967,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
                     // rollback below gives: a graceful stop waits up to 60 s,
                     // and every second of it is a container whose start already
                     // failed sitting there with a half-applied policy.
-                    let veth = NetworkIptablesManager::discover_veth_interface(container_name);
+                    let veth = enforced_veth_name(container_name);
                     if let Err(stop_err) = container.kill() {
                         // The egress chain is the only part of the policy still
                         // in force, so removing it now would turn a filtered
@@ -1013,7 +1009,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
                 // Kill, not stop: a graceful `lxc-stop` waits up to 60 s and can
                 // fail outright under systemd-in-userns, and every second of
                 // that wait is a running container with no inbound filtering.
-                let veth = NetworkIptablesManager::discover_veth_interface(container_name);
+                let veth = enforced_veth_name(container_name);
                 let stopped = container.kill();
                 signal_cleanup::clear_active();
                 if let Err(stop_err) = stopped {
@@ -1148,7 +1144,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         // process runs without egress filtering during the shutdown drain. If
         // the stop fails, propagate the error and leave the rules in place
         // rather than exposing a still-running container.
-        let veth = NetworkIptablesManager::discover_veth_interface(container_name);
+        let veth = enforced_veth_name(container_name);
         if container
             .is_running()
             .map_err(|e| probe_failed("is running", container_name, e))?
@@ -1177,14 +1173,12 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         // while a start is between installing the firewall and running the
         // container.
         let _lifecycle_lock = LifecycleLock::acquire(&container, container_name)?;
-        // Discover the veth before teardown while the container may still be
-        // running; it disappears once destroyed, but iptables can still delete
-        // a FORWARD rule that names it.
-        let veth = NetworkIptablesManager::discover_veth_interface(container_name); // A probe that could not answer must not be read as "already gone".
-                                                                                    // Skipping the destroy and then running the authoritative network
-                                                                                    // teardown below would strip filtering from a container that is still
-                                                                                    // running, which is the fail-open this ordering exists to prevent. The
-                                                                                    // `?` leaves the rules in place and lets the caller retry.
+        let veth = enforced_veth_name(container_name);
+        // A probe that could not answer must not be read as "already gone".
+        // Skipping the destroy and then running the authoritative network
+        // teardown below would strip filtering from a container that is still
+        // running, which is the fail-open this ordering exists to prevent. The
+        // `?` leaves the rules in place and lets the caller retry.
         if container
             .is_defined()
             .map_err(|e| probe_failed("exists", container_name, e))?
