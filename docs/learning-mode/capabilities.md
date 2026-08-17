@@ -127,34 +127,35 @@ Windows-only `captureDenials` config switch drives collecting those events and
 surfacing the resulting denials to the caller. Its `mode` selects how each
 ungranted access is handled while it is recorded:
 
-> **Host requirement.** `captureDenials` requires a feature-enabled Windows
+> **Host selection.** MXC prefers native capture on a feature-enabled Windows
 > build exposing the complete official V2 API set:
 > `StartLearningModeTrace`, `StopLearningModeTrace`,
 > `CloseLearningModeTrace`, `CreateProcessSecurityEnvironment`,
 > `QueryProcessSecurityEnvironmentSupport`, and
-> `CloseProcessSecurityEnvironment`. It is not supported by the AppContainer
-> fallback tiers; unsupported hosts return `backend_unavailable`.
+> `CloseProcessSecurityEnvironment`. When that set is unavailable or cannot
+> fully honor the requested policy, MXC retains the highest compatible legacy
+> containment tier (SBOX, AppContainer+BFS, or AppContainer+DACL) and pairs it
+> with the guarded WPR capture provider. Unsupported hosts return
+> `backend_unavailable` only when neither path can preserve the full policy.
 >
 > Internal validation confirmed that build `26657.1002` exposes only the
 > incompatible earlier contract and is rejected, while build `26663.1000`
 > exposes the complete V2 contract. These are validation points, not a public
 > Windows release-floor commitment; callers should rely on the runtime probe.
 >
-> `captureDenials` cannot be combined with `processContainer.leastPrivilege`;
-> the Windows process security-environment API used for capture does not expose
-> an LPAC token option, so MXC rejects that combination rather than silently
-> weakening the requested policy.
+> Native PSEC capture cannot represent `processContainer.leastPrivilege`
+> because the process security-environment API does not expose an LPAC token
+> option. MXC therefore retains a compatible legacy containment tier and uses
+> guarded WPR instead of weakening or rejecting the requested policy.
 >
-> `captureDenials` also cannot currently be combined with `network.proxy`.
-> The V2 process security-environment proxy contract requires a separate proxy
-> AppContainer peer identity; MXC rejects the combination until that peer is
-> provisioned by the capture launch path.
+> Native PSEC capture also cannot currently represent `network.proxy` without a
+> separate proxy AppContainer peer identity. Compatible requests use guarded
+> WPR with the legacy tier that can enforce the proxy contract.
 >
-> `filesystem.deniedPaths` requires
-> `QueryProcessSecurityEnvironmentSupport` to advertise
-> `PSE_SUPPORT_FS_DENY`. When the bit is absent, capture fails as
-> `backend_unavailable`; it cannot fall back to AppContainer or host-DACL
-> enforcement.
+> Native capture uses `filesystem.deniedPaths` only when
+> `QueryProcessSecurityEnvironmentSupport` advertises `PSE_SUPPORT_FS_DENY`.
+> Otherwise MXC selects a compatible legacy SBOX, AppContainer+BFS, or
+> AppContainer+DACL tier and uses guarded WPR.
 
 - `mode: "block"` (default) maps onto `learningModeLogging`
   (deny-and-record) — the app / user-configurable flow.
@@ -234,7 +235,9 @@ C# SDK exposes it through `RunResult.OutputMetadata` and
 By default, the intermediate ETW `.etl` trace is an internal, runner-managed
 file in a protected per-run temporary directory that MXC deletes after
 analysis. Set `captureDenials.retainEtl` to `true` to preserve the sealed trace
-for diagnostics after a terminal wait. Retention-enabled captures begin under
+for diagnostics after a terminal wait when native PSEC/V2 capture is selected.
+Guarded-WPR fallback rejects `retainEtl: true` with `backend_unavailable`
+rather than returning its raw host-wide trace. Retention-enabled captures begin under
 `%LOCALAPPDATA%\Microsoft\MXC\capture-denials\working` and move to a protected
 per-run directory under `capture-denials\retained` only after sealing succeeds.
 Abandoning or disposing a process without a terminal wait deletes the internal
