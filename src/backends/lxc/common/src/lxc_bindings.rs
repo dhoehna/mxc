@@ -325,31 +325,53 @@ fn interpret_config_query(stdout: &str) -> Option<String> {
 }
 
 /// Decide what a completed index scan means, given the interface summary read
-/// before it and the one read after.
+/// before it, the summary read after, and the type still standing at the index
+/// that was located.
 ///
 /// The count and the index come from separate `lxc-info` runs, so a config
 /// rewritten between them would be pinned against a set of interfaces that no
-/// longer exists -- a container could be counted with one interface, gain a
-/// second, and start with only the first one hooked.  Bracketing the scan turns
-/// that into a refusal: a summary that did not survive the scan is not evidence
-/// of anything, and a firewall pinned from it would be a claim rather than a
-/// control.
+/// longer exists.  Two rewrites matter and neither is visible to the other
+/// check: a second interface arriving changes the summary but leaves the
+/// located index intact, while the sole interface moving to another index
+/// leaves the summary identical -- `lxc.net` prints values, not indices -- and
+/// silently invalidates it.  Both are refused.
+///
+/// This narrows the window; it does not close it.  liblxc offers no lock and no
+/// atomic config read, so a writer that restores the config before the recheck
+/// passes.  That writer needs write access to a root-owned config file and
+/// could flush the firewall directly, so it is not the case being defended
+/// against.  The case being defended against is a config that moved and stayed
+/// moved, which would otherwise be pinned wrong in silence.
 ///
 /// Split out as a pure function so the decision is testable without `lxc-info`
 /// on the box.
 fn resolve_scanned_interface(
-    before: &str,
-    after: &str,
+    summary_before: &str,
+    summary_after: &str,
+    kind_after: &str,
     located: Option<SoleNetInterface>,
 ) -> Result<Option<SoleNetInterface>, String> {
-    if before.trim() != after.trim() {
+    if summary_before.trim() != summary_after.trim() {
         return Err(format!(
             "network config changed while it was being read: lxc.net was {:?} before \
              the interface index was located and {:?} after, so the index cannot be \
              trusted to cover the container's traffic",
-            before.trim(),
-            after.trim()
+            summary_before.trim(),
+            summary_after.trim()
         ));
+    }
+    if let Some(sole) = &located {
+        let standing = interpret_config_query(kind_after);
+        if standing.as_deref() != Some(sole.kind.as_str()) {
+            return Err(format!(
+                "network config changed while it was being read: lxc.net.{}.type was {:?} \
+                 when the interface was located and {:?} on recheck, so the index cannot \
+                 be trusted to cover the container's traffic",
+                sole.index,
+                sole.kind,
+                standing.unwrap_or_default()
+            ));
+        }
     }
     Ok(located)
 }
@@ -1151,8 +1173,12 @@ impl LxcContainer {
         // count is refused upstream without reference to the index.
         let sole = if count == 1 {
             let located = self.locate_sole_net_interface()?;
-            let recheck = self.query_config_item("lxc.net")?;
-            resolve_scanned_interface(&summary, &recheck, located)?
+            let kind_after = match &located {
+                Some(sole) => self.query_config_item(&format!("lxc.net.{}.type", sole.index))?,
+                None => String::new(),
+            };
+            let summary_after = self.query_config_item("lxc.net")?;
+            resolve_scanned_interface(&summary, &summary_after, &kind_after, located)?
         } else {
             None
         };
@@ -1695,29 +1721,69 @@ mod tests {
             kind: "veth".to_string(),
         };
         assert_eq!(
-            resolve_scanned_interface("lxc.net = veth\n", "lxc.net = veth\n", Some(found.clone())),
+            resolve_scanned_interface(
+                "lxc.net = veth\n",
+                "lxc.net = veth\n",
+                "lxc.net.3.type = veth\n",
+                Some(found.clone())
+            ),
             Ok(Some(found))
         );
     }
 
     #[test]
-    fn a_config_that_held_still_with_nothing_found_reports_nothing_found() {
+    fn a_scan_that_found_nothing_is_not_reported_as_a_read_failure() {
         // An interface numbered past the search bound is absent as far as the
-        // scan is concerned, and a stable config must not turn that into a
-        // different answer than the scan produced.
+        // scan is concerned.  That has to reach the caller as "not found" so it
+        // can refuse while naming the range it searched, rather than as a read
+        // error that says nothing about why.
         assert_eq!(
-            resolve_scanned_interface("lxc.net = veth\n", "lxc.net = veth\n", None),
+            resolve_scanned_interface("lxc.net = veth\n", "lxc.net = veth\n", "", None),
             Ok(None)
         );
     }
 
     #[test]
     fn an_interface_appearing_during_the_scan_refuses_the_located_index() {
-        // The dangerous case: counted with one interface, scanned, then a second
-        // interface arrives.  Pinning the first would leave the second routing.
+        // Counted with one interface, scanned, then a second interface arrives.
+        // Pinning the first would leave the second routing unfiltered.
         assert!(resolve_scanned_interface(
             "lxc.net = veth\n",
             "lxc.net = veth\nveth\n",
+            "lxc.net.0.type = veth\n",
+            Some(SoleNetInterface {
+                index: 0,
+                kind: "veth".to_string(),
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_interface_moving_index_during_the_scan_refuses_the_located_index() {
+        // lxc.net prints values, not indices, so an interface that moves from 0
+        // to 3 leaves the summary identical.  Only the type standing at the
+        // located index shows it left.
+        assert!(resolve_scanned_interface(
+            "lxc.net = veth\n",
+            "lxc.net = veth\n",
+            "",
+            Some(SoleNetInterface {
+                index: 0,
+                kind: "veth".to_string(),
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_type_restored_after_the_scan_refuses_the_located_index() {
+        // A macvlan briefly reading as veth while the scan ran would otherwise
+        // take a veth pin it can never answer to, and route unfiltered.
+        assert!(resolve_scanned_interface(
+            "lxc.net = macvlan\n",
+            "lxc.net = macvlan\n",
+            "lxc.net.0.type = macvlan\n",
             Some(SoleNetInterface {
                 index: 0,
                 kind: "veth".to_string(),
@@ -1731,6 +1797,7 @@ mod tests {
         assert!(resolve_scanned_interface(
             "lxc.net = veth\n",
             "lxc.net = macvlan\n",
+            "lxc.net.0.type = macvlan\n",
             Some(SoleNetInterface {
                 index: 0,
                 kind: "veth".to_string(),
@@ -1741,20 +1808,50 @@ mod tests {
 
     #[test]
     fn the_refusal_names_both_summaries_it_saw() {
-        let refusal = resolve_scanned_interface("lxc.net = veth\n", "lxc.net = macvlan\n", None)
-            .expect_err("a changed summary is refused");
+        let refusal = resolve_scanned_interface(
+            "lxc.net = veth\n",
+            "lxc.net = macvlan\n",
+            "lxc.net.0.type = macvlan\n",
+            None,
+        )
+        .expect_err("a changed summary is refused");
         assert!(refusal.contains("veth"), "{refusal}");
         assert!(refusal.contains("macvlan"), "{refusal}");
     }
 
     #[test]
+    fn the_refusal_names_the_index_whose_type_moved() {
+        let refusal = resolve_scanned_interface(
+            "lxc.net = veth\n",
+            "lxc.net = veth\n",
+            "lxc.net.3.type = macvlan\n",
+            Some(SoleNetInterface {
+                index: 3,
+                kind: "veth".to_string(),
+            }),
+        )
+        .expect_err("a type that moved under the located index is refused");
+        assert!(refusal.contains("lxc.net.3.type"), "{refusal}");
+        assert!(refusal.contains("macvlan"), "{refusal}");
+    }
+
+    #[test]
     fn a_trailing_newline_difference_is_not_a_config_change() {
-        // Both summaries are captured from a subprocess, so trailing whitespace
+        // Both readings are captured from a subprocess, so trailing whitespace
         // is capture noise rather than evidence.  Refusing on it would fail
         // every start on a config that never moved.
+        let found = SoleNetInterface {
+            index: 0,
+            kind: "veth".to_string(),
+        };
         assert_eq!(
-            resolve_scanned_interface("lxc.net = veth\n", "lxc.net = veth\n\n", None),
-            Ok(None)
+            resolve_scanned_interface(
+                "lxc.net = veth\n",
+                "lxc.net = veth\n\n",
+                "lxc.net.0.type = veth\n\n",
+                Some(found.clone())
+            ),
+            Ok(Some(found))
         );
     }
 

@@ -1425,7 +1425,8 @@ impl NetworkIptablesManager {
     ///
     /// The firewall must be installed *before* the container starts, but the
     /// veth pair liblxc creates by default has a random name that is only known
-    /// once the container is running. Pinning `lxc.net.0.veth.pair` to this name
+    /// once the container is running. Pinning `lxc.net.<N>.veth.pair` to this
+    /// name — `<N>` being wherever the container's sole interface is numbered —
     /// lets the FORWARD hook reference the interface by name ahead of time —
     /// iptables accepts a not-yet-existing interface — so there is no window in
     /// which a started container has unfiltered network.
