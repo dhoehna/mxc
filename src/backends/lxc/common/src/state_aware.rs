@@ -391,32 +391,13 @@ fn apply_network_policy(
             .configured_net_interfaces()
             .map_err(|e| MxcError::backend_error(format!("Failed to read network config: {e}")))?;
 
-        // An include can declare interfaces this config never mentions, so the
-        // count above is a lower bound rather than an answer. Refusing is not
-        // pedantry: accepting would mean enforcing on one interface and
-        // reporting success for a container that may route around it.
-        if net.has_include {
+        if net.count > 1 {
             return Err(MxcError::policy_validation(format!(
-                "Container {:?} uses lxc.include, so its full set of network interfaces \
-                 cannot be determined from its own config; a firewall-enforced network \
-                 policy cannot be guaranteed to cover every interface and is refused. \
-                 Inline the included network configuration, or run without firewall \
-                 enforcement",
-                container.name()
-            )));
-        }
-        if net.indices.len() > 1 {
-            return Err(MxcError::policy_validation(format!(
-                "Container {:?} has {} configured network interfaces (lxc.net.{}); \
+                "Container {:?} has {} configured network interfaces; \
                  a firewall-enforced network policy can only be applied to a container \
                  with a single interface, because traffic on the others would bypass it",
                 container.name(),
-                net.indices.len(),
-                net.indices
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", lxc.net."),
+                net.count,
             )));
         }
         // Zero is refused for the mirror-image reason. There is no interface to
@@ -424,40 +405,23 @@ fn apply_network_policy(
         // an interface that does not exist and the run would either fail later
         // or install a chain nothing routes through. Either way the caller asked
         // for enforced networking on a container that has no network to enforce.
-        if net.indices.is_empty() {
+        if net.count == 0 {
             return Err(MxcError::policy_validation(format!(
-                "Container {:?} has no configured network interface (no lxc.net.N entries), \
+                "Container {:?} has no configured network interface, \
                  so a firewall-enforced network policy has nothing to attach to",
                 container.name()
             )));
         }
 
         // Exactly one interface is necessary but not sufficient -- it also has
-        // to be the one everything downstream assumes. The pin below, the veth
-        // name, and the FORWARD hook are all written against `lxc.net.0`, so a
-        // container whose single interface sits at another index would get a
-        // chain built against an interface it never uses, while MXC reported the
-        // policy as enforced.
-        let index = net.indices[0];
-        if index != 0 {
-            return Err(MxcError::policy_validation(format!(
-                "Container {:?} configures its only network interface at lxc.net.{} rather \
-                 than lxc.net.0; a firewall-enforced network policy is pinned to lxc.net.0 \
-                 and would not cover it. Renumber the interface to lxc.net.0, or run without \
-                 firewall enforcement",
-                container.name(),
-                index,
-            )));
-        }
-
-        // Same assumption, the other half. Enforcement works by naming the host
-        // end of a veth pair and hooking that name in FORWARD, so the interface
-        // has to actually be a veth. A macvlan or phys interface at index 0
-        // satisfies every check above and then gets a hook pinned to a veth name
-        // that will never exist, while its traffic uses the real interface
-        // unfiltered. An undeclared type is refused for the same reason: it is
-        // not evidence of a veth.
-        match net.types.get(&index).map(String::as_str) {
+        // to be the one everything downstream assumes, and it has to be a veth.
+        // The pin below, the veth name, and the FORWARD hook are all written
+        // against `lxc.net.0` and all name the host end of a veth pair, so a
+        // single interface sitting at another index, or a macvlan or phys one at
+        // index 0, would get a chain built against an interface that will never
+        // exist while its traffic ran unfiltered and MXC reported the policy as
+        // enforced.
+        match net.type_at_zero.as_deref() {
             Some("veth") => {}
             Some(other) => {
                 return Err(MxcError::policy_validation(format!(
@@ -471,11 +435,10 @@ fn apply_network_policy(
             }
             None => {
                 return Err(MxcError::policy_validation(format!(
-                    "Container {:?} does not declare lxc.net.0.type; a firewall-enforced \
-                     network policy can only be applied to a declared veth interface, because \
-                     enforcement pins the host end of the veth pair and hooks that name in \
-                     FORWARD. Declare lxc.net.0.type = veth, or run without firewall \
-                     enforcement",
+                    "Container {:?} has no interface at lxc.net.0; a firewall-enforced \
+                     network policy is pinned to lxc.net.0 and would not cover an interface \
+                     configured at another index. Renumber the interface to lxc.net.0, or run \
+                     without firewall enforcement",
                     container.name()
                 )));
             }

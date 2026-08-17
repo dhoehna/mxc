@@ -258,80 +258,53 @@ fn build_attach_args_with_env_control(
     args
 }
 
-/// What an LXC config file says about the container's network interfaces.
+/// What liblxc says the container's network interfaces are.
 ///
-/// Carries the `lxc.include` answer alongside the indices because a caller that
-/// filters egress cannot act on the indices without it: an include can add
-/// interfaces this file never mentions, so a count taken from this file alone
-/// would understate the container and let a policy claim to be enforced when it
-/// is not.
+/// Read through `lxc-info -c` rather than by parsing the container's config
+/// file, because `lxc.include` can declare interfaces that file never mentions.
+/// liblxc has already resolved those includes, so its answer is the set that
+/// will actually be brought up; a count taken from the file alone would
+/// understate the container and let a policy claim to be enforced when it is
+/// not.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct NetInterfaceConfig {
-    /// The `N` of every `lxc.net.N.*` key in this file, sorted and deduplicated.
-    pub indices: Vec<u32>,
-    /// Whether this file pulls in another config with `lxc.include`.
-    pub has_include: bool,
-    /// The declared `lxc.net.N.type` for each index that states one.
+    /// How many interfaces liblxc will bring up.
+    pub count: usize,
+    /// The declared type at `lxc.net.0`, absent when there is no such index.
     ///
-    /// A missing entry means the config never declared a type for that index,
-    /// which is not the same as declaring it `none`. The only distinction that
-    /// matters to the firewall is whether an interface is a `veth`, because the
-    /// pin and the `FORWARD` hook are both veth concepts, so a caller that
-    /// needs certainty treats anything other than an explicit `veth` -- absent
-    /// included -- as unenforceable.
-    pub types: std::collections::BTreeMap<u32, String>,
+    /// Only index 0 is reported because it is the only one enforcement can act
+    /// on: the veth pin and the `FORWARD` hook are both written against
+    /// `lxc.net.0`, so an interface at any other index is unenforceable whatever
+    /// its type. Absent is not the same as `none` -- it means liblxc holds no
+    /// interface at that index, which for a single-interface container is
+    /// evidence the interface sits somewhere else.
+    pub type_at_zero: Option<String>,
 }
 
-/// Extract the network-interface picture from an LXC config file.
+/// Count the interfaces in `lxc-info -c lxc.net` output.
 ///
-/// Split out of [`LxcContainer::configured_net_indices`] so the parse is
-/// testable without a container on disk. A key matches only when the segment
-/// after `lxc.net.` parses as an integer and is followed by a `.`, so
-/// `lxc.network.0.type` (the pre-2.1 spelling) and a bare `lxc.net.0` with no
-/// sub-key are both ignored — neither declares an interface liblxc will bring
-/// up under the modern schema. Comment lines are skipped, since `#` prefixes a
-/// comment in this format and a commented-out interface is not configured.
+/// liblxc prints the first value on the `key = value` line and any further
+/// values bare on lines of their own, so one non-empty value is one interface.
+/// A container with no network at all prints the key with an empty value.
+fn interpret_net_summary(stdout: &str) -> usize {
+    stdout
+        .lines()
+        .map(|line| line.split_once('=').map_or(line, |(_, rhs)| rhs).trim())
+        .filter(|value| !value.is_empty())
+        .count()
+}
+
+/// Read a single `lxc-info -c <key>` answer.
 ///
-/// `lxc.include` is reported rather than followed. Following it correctly means
-/// resolving relative paths and directory globs the way liblxc does, and
-/// getting that subtly wrong would produce exactly the false confidence this
-/// function exists to prevent. A caller that needs certainty refuses instead.
-fn parse_net_interface_config(config_contents: &str) -> NetInterfaceConfig {
-    let mut indices: Vec<u32> = Vec::new();
-    let mut has_include = false;
-    let mut types: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
-
-    for line in config_contents.lines() {
-        let Some((lhs, rhs)) = line.split_once('=') else {
-            continue;
-        };
-        let key = lhs.trim();
-        if key.starts_with('#') {
-            continue;
-        }
-        if key == "lxc.include" {
-            has_include = true;
-            continue;
-        }
-        if let Some(rest) = key.strip_prefix("lxc.net.") {
-            if let Some((index, sub_key)) = rest.split_once('.') {
-                if let Ok(n) = index.parse::<u32>() {
-                    indices.push(n);
-                    if sub_key == "type" {
-                        types.insert(n, rhs.trim().to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    indices.sort_unstable();
-    indices.dedup();
-    NetInterfaceConfig {
-        indices,
-        has_include,
-        types,
-    }
+/// A key liblxc does not hold is reported on stderr and still exits zero, so an
+/// empty stdout is the absence signal; the caller separates a genuine failure
+/// from an absent key by the exit status instead.
+fn interpret_config_query(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find_map(|line| line.split_once('='))
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Read an `lxc-info` run as "does this container exist?".
@@ -1108,30 +1081,49 @@ impl LxcContainer {
         format!("{}/{}/config", self.lxc_path, self.name)
     }
 
-    /// What this container's config says about its network interfaces.
+    /// What liblxc says this container's network interfaces are.
     ///
     /// Provision adopts an existing container as readily as it creates one, and
     /// an adopted container can carry more network interfaces than the single
     /// `lxc.net.0` MXC configures for itself. A caller that filters egress needs
-    /// to know that before it claims to have filtered anything. A missing config
-    /// file reports nothing configured, consistent with
-    /// [`clear_config_item`](Self::clear_config_item) treating it as
-    /// already-clear.
+    /// to know that before it claims to have filtered anything.
+    ///
+    /// The question goes to liblxc rather than to the config file because
+    /// `lxc.include` can add interfaces the file never mentions, and resolving
+    /// includes here -- relative paths and directory globs both -- would mean
+    /// reimplementing liblxc's own resolution and getting it subtly wrong.
+    /// liblxc answers for a stopped container, so the answer is available while
+    /// there is still time to act on it before start.
+    ///
+    /// A probe that cannot run is an error rather than an empty answer: no
+    /// evidence of an interface is not evidence of no interface.
     pub fn configured_net_interfaces(&self) -> Result<NetInterfaceConfig, String> {
-        let config_path = self.config_file_path();
-        let contents = match std::fs::read_to_string(&config_path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(NetInterfaceConfig::default())
-            }
-            Err(e) => {
-                return Err(format!(
-                    "Failed to read config to enumerate network interfaces: {} (config file: {})",
-                    e, config_path
-                ))
-            }
-        };
-        Ok(parse_net_interface_config(&contents))
+        Ok(NetInterfaceConfig {
+            count: interpret_net_summary(&self.query_config_item("lxc.net")?),
+            type_at_zero: interpret_config_query(&self.query_config_item("lxc.net.0.type")?),
+        })
+    }
+
+    /// Ask liblxc for one config key, with any `lxc.include` already resolved.
+    ///
+    /// A key liblxc does not hold is not a failure -- it reports that on stderr
+    /// and exits zero, leaving stdout empty -- so only a nonzero exit is treated
+    /// as one.
+    fn query_config_item(&self, key: &str) -> Result<String, String> {
+        let output = self
+            .lxc_command("lxc-info")
+            .arg("-c")
+            .arg(key)
+            .output()
+            .map_err(|e| format!("failed to run lxc-info -c {key}: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "lxc-info -c {} failed: {}",
+                key,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     /// Get the current system architecture string for LXC templates.
@@ -1384,14 +1376,8 @@ mod tests {
     }
 
     #[test]
-    fn a_single_interface_config_reports_one_network_index() {
-        let config = "lxc.uts.name = box\n\
-                      lxc.net.0.type = veth\n\
-                      lxc.net.0.link = lxcbr0\n\
-                      lxc.net.0.flags = up\n";
-        let net = parse_net_interface_config(config);
-        assert_eq!(net.indices, vec![0]);
-        assert!(!net.has_include);
+    fn one_interface_reports_one() {
+        assert_eq!(interpret_net_summary("lxc.net = veth\n\n"), 1);
     }
 
     #[test]
@@ -1601,97 +1587,54 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_interface_type_is_captured_for_each_index() {
-        // The index alone cannot tell the firewall whether it can enforce.
-        // Enforcement names the host end of a veth pair, so the caller has to
-        // see the declared type to refuse a macvlan or phys interface instead
-        // of hooking a veth name that will never exist.
-        let config = "lxc.net.0.type = veth\n\
-                      lxc.net.0.link = lxcbr0\n\
-                      lxc.net.1.type = macvlan\n";
-        let net = parse_net_interface_config(config);
-        assert_eq!(net.indices, vec![0, 1]);
-        assert_eq!(net.types.get(&0).map(String::as_str), Some("veth"));
-        assert_eq!(net.types.get(&1).map(String::as_str), Some("macvlan"));
+    fn every_interface_is_counted_so_a_caller_can_refuse_to_half_filter() {
+        // liblxc prints the first value inline and the rest bare. The count is
+        // what decides whether one FORWARD hook covers the container, so a
+        // second interface has to survive the parse -- including one that only
+        // an lxc.include declared, which is why the question goes to liblxc.
+        assert_eq!(interpret_net_summary("lxc.net = veth\nveth\n\n"), 2);
     }
 
     #[test]
-    fn an_interface_that_declares_no_type_reports_no_type() {
-        // The negative control for the test above. An undeclared type must stay
-        // distinguishable from `veth`, because the firewall gate treats only a
-        // positive `veth` as enforceable -- reporting a default here would let
-        // an unenforceable container through.
-        let config = "lxc.net.0.link = lxcbr0\n\
-                      lxc.net.0.flags = up\n";
-        let net = parse_net_interface_config(config);
-        assert_eq!(net.indices, vec![0]);
-        assert!(!net.types.contains_key(&0));
+    fn a_container_with_no_network_reports_no_interfaces() {
+        assert_eq!(interpret_net_summary("lxc.net =\n"), 0);
     }
 
     #[test]
-    fn every_configured_interface_is_reported_so_a_caller_can_refuse_to_half_filter() {
-        let config = "lxc.net.0.type = veth\n\
-                      lxc.net.1.type = veth\n\
-                      lxc.net.1.link = br1\n\
-                      lxc.net.4.type = macvlan\n";
-        assert_eq!(parse_net_interface_config(config).indices, vec![0, 1, 4]);
+    fn trailing_blank_lines_are_not_counted_as_interfaces() {
+        // Counting them would report a second interface that does not exist and
+        // refuse a container MXC can fully filter.
+        assert_eq!(interpret_net_summary("lxc.net = veth\n\n\n\n"), 1);
     }
 
     #[test]
-    fn an_include_is_reported_because_it_can_declare_interfaces_this_file_never_names() {
-        // The visible count here is 1, which would otherwise look enforceable.
-        // The include can add an interface that routes around the single hook,
-        // so the caller has to know the count is only a lower bound.
-        let config = "lxc.net.0.type = veth\nlxc.include = /usr/share/lxc/config/common.conf\n";
-        let net = parse_net_interface_config(config);
-        assert_eq!(net.indices, vec![0]);
-        assert!(net.has_include);
-    }
-
-    #[test]
-    fn a_commented_out_include_does_not_count_as_an_include() {
-        let config = "lxc.net.0.type = veth\n# lxc.include = /some/file.conf\n";
-        assert!(!parse_net_interface_config(config).has_include);
-    }
-
-    #[test]
-    fn a_config_with_no_network_keys_reports_no_interfaces() {
-        let config = "lxc.uts.name = box\nlxc.rootfs.path = /var/lib/lxc/box/rootfs\n";
-        assert!(parse_net_interface_config(config).indices.is_empty());
-    }
-
-    #[test]
-    fn a_commented_out_interface_is_not_counted_as_configured() {
-        // liblxc ignores the line, so counting it would make MXC refuse a
-        // container it can in fact fully filter.
-        let config = "lxc.net.0.type = veth\n# lxc.net.1.type = veth\n";
-        assert_eq!(parse_net_interface_config(config).indices, vec![0]);
-    }
-
-    #[test]
-    fn the_legacy_lxc_network_spelling_is_not_mistaken_for_a_modern_interface() {
-        let config = "lxc.net.0.type = veth\nlxc.network.1.type = veth\n";
-        assert_eq!(parse_net_interface_config(config).indices, vec![0]);
-    }
-
-    #[test]
-    fn repeated_keys_for_one_interface_still_count_as_one_interface() {
-        // set_config_item appends, so a restart can leave several lines for the
-        // same index. Counting lines instead of indices would refuse a
-        // single-interface container.
-        let config = "lxc.net.0.type = veth\n\
-                      lxc.net.0.veth.pair = mxcv-aaaa\n\
-                      lxc.net.0.veth.pair = mxcv-bbbb\n";
-        assert_eq!(parse_net_interface_config(config).indices, vec![0]);
-    }
-
-    #[test]
-    fn a_missing_config_file_reports_nothing_configured_rather_than_an_error() {
-        let c = LxcContainer::new("definitely-not-provisioned", Some("/nonexistent-lxcpath"));
+    fn a_declared_interface_type_is_read_back() {
         assert_eq!(
-            c.configured_net_interfaces(),
-            Ok(NetInterfaceConfig::default())
+            interpret_config_query("lxc.net.0.type = veth\n"),
+            Some("veth".to_string())
         );
+    }
+
+    #[test]
+    fn a_key_liblxc_does_not_hold_reports_no_value() {
+        // liblxc names the absent key on stderr and exits zero, so stdout is
+        // empty. Reporting a value here would let an interface that is not a
+        // veth, or is not at index 0, pass the gate.
+        assert_eq!(interpret_config_query(""), None);
+    }
+
+    #[test]
+    fn a_key_with_an_empty_value_reports_no_value() {
+        assert_eq!(interpret_config_query("lxc.net.0.type =\n"), None);
+    }
+
+    #[test]
+    fn an_unreadable_container_is_an_error_rather_than_an_empty_answer() {
+        // No evidence of an interface is not evidence of no interface. Answering
+        // "none" would send the caller down the zero-interface path and report a
+        // refusal reason that was never established.
+        let c = LxcContainer::new("definitely-not-provisioned", Some("/nonexistent-lxcpath"));
+        assert!(c.configured_net_interfaces().is_err());
     }
 
     #[test]

@@ -15,7 +15,7 @@
 # filesystem block leaves every path list empty, so only the recorded presence
 # of the block distinguishes it from a request that carried no block at all.
 #
-# Case 3 is quarantined, not weakened; see the comment at its call site.
+# Case 3 proves the default-deny hook reaches a stock provisioned container.
 #
 # The start fixtures keep a __SANDBOX_ID__ placeholder because the live LXC
 # sandboxId is the container name returned by this test's own provision call.
@@ -414,21 +414,18 @@ run_start_case "2" "$CONFIG_BLOCK_CAPS" \
 
 # Clause: "To start a default-deny container, set enforcementMode to firewall or both."
 #
-# QUARANTINED, not weakened. The assertion below is exactly what the contract
-# requires and it still runs. It currently fails because the doc's own
-# remediation is unreachable: lxc-create's distro template emits
-# `lxc.include = /usr/share/lxc/config/common.conf` into every provisioned
-# container (verified by reading a generated config), and the contract at
-# mxc-state-aware-sandbox-api.md:1728 refuses a firewall-mode start whose config
-# uses `lxc.include`. So :1750's instruction to set enforcementMode=firewall
-# cannot be satisfied through the documented provision surface. Both clauses
-# predate this change, which touches neither container creation nor the veth pin.
+# This is the direct observable proof of roadmap item 13's "ensure hook is
+# always applied": a stock provisioned container carries
+# `lxc.include = /usr/share/lxc/config/common.conf`, and the default-deny hook
+# has to reach it anyway. The assertion was previously quarantined because
+# enumeration read the container's own config file, where an include hides
+# whatever it pulls in; it is live now that enumeration asks liblxc, which has
+# already resolved the include.
 run_start_case "3" "$CONFIG_BLOCK_FIREWALL" \
     'defaultPolicy=block with enforcementMode=firewall at start' \
     'start succeeds and exec proves the container runs' \
     "1" "1" \
-    'To start a default-deny container, set enforcementMode to firewall or both' \
-    'contract :1750 says enforcementMode=firewall starts a default-deny container, but :1728 refuses any config using lxc.include, which lxc-create emits into every provisioned container -- the documented escape hatch is unreachable'
+    'To start a default-deny container, set enforcementMode to firewall or both'
 
 # Clause: "A permissive default needs no iptables rule to be honest."
 run_start_case "4" "$CONFIG_ALLOW_CAPS" \
