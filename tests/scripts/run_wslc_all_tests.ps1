@@ -216,33 +216,37 @@ $null = $results.Add((Run-WslcTest "wslc_large_output.json"))
 
 Write-Host "`n--- Filesystem Tests ---" -ForegroundColor Cyan
 
-# wslc_filesystem.json also asserts cpuCount + memoryMb enforcement via nproc and /proc/meminfo.
-$null = $results.Add((Run-WslcTest "wslc_filesystem.json" `
-    -OutputMatches "(?s)PASS: filesystem mount visible.*PASS: cpuCount enforced.*PASS: memoryMb enforced"))
-
-# Fixed paths must match tests\configs\wslc_readonly_mount.json.
+# Fixed paths must match tests\configs\wslc_filesystem.json and
+# tests\configs\wslc_readonly_mount.json.
+$fsFixtureDir = "C:\wslcfs"
 $readonlyFixtureDir = "C:\wslcro"
 $readonlyFixture = Join-Path $readonlyFixtureDir "test.txt"
 
-function Remove-ReadonlyFixture {
+function Remove-FilesystemFixtures {
+    Remove-Item -Recurse -Force $fsFixtureDir -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $readonlyFixtureDir -ErrorAction SilentlyContinue
 }
 
-# Seed the readonly fixture the same way the LXC and bubblewrap suites do
-# (run_lxc_filesystem_test.sh:21, run_bwrap_filesystem_test.sh:25).  Without
-# this, wslc_readonly_mount.json cats a file that was never created and fails
-# for a missing fixture rather than for a mount defect.  The root is test-only
-# and removed in the finally, so a developer's C:\workspace -- which the
-# prerequisites above tell them to fill with alpine.tar -- is never written to,
-# and a mount that is wrongly writable does not leave its probe file behind.
-Remove-ReadonlyFixture
+# Both filesystem configs mount a host directory the suite owns outright, so a
+# run needs nothing hand-made and never touches C:\workspace, where the
+# prerequisites above tell the developer to keep alpine.tar.  wslc_filesystem
+# only needs its mount target to exist; wslc_readonly_mount also reads
+# test.txt, seeded the way the LXC and bubblewrap suites seed theirs
+# (run_lxc_filesystem_test.sh:21, run_bwrap_filesystem_test.sh:25).  The
+# finally removes both roots, including the probe file a wrongly-writable
+# mount would leave behind.
+Remove-FilesystemFixtures
 try {
+    $null = New-Item -ItemType Directory -Path $fsFixtureDir -Force
     $null = New-Item -ItemType Directory -Path $readonlyFixtureDir -Force
     Set-Content -Path $readonlyFixture -Value "test content" -Encoding ascii
 
+    # wslc_filesystem.json also asserts cpuCount + memoryMb enforcement via nproc and /proc/meminfo.
+    $null = $results.Add((Run-WslcTest "wslc_filesystem.json" `
+        -OutputMatches "(?s)PASS: filesystem mount visible.*PASS: cpuCount enforced.*PASS: memoryMb enforced"))
     $null = $results.Add((Run-WslcTest "wslc_readonly_mount.json" -OutputContains "Read succeeded"))
 } finally {
-    Remove-ReadonlyFixture
+    Remove-FilesystemFixtures
 }
 
 Write-Host "`n--- Object Validation Tests ---" -ForegroundColor Cyan
