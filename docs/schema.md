@@ -91,10 +91,13 @@ production configs and the dev schema when working on experimental features:
                                            // path in output metadata. Defaults to false.
                                            // Retention requires a terminal wait; abandoning the
                                            // process handle deletes the internal trace.
+                                           // Requires native PSEC/V2 capture; guarded-WPR fallback
+                                           // rejects retention rather than exposing a host-wide ETL.
         }
                                            // Omit outputPath for a managed JSON output file.
-                                           // captureDenials cannot be combined with leastPrivilege.
-                                           // captureDenials cannot currently be combined with network.proxy.
+                                           // Native PSEC/V2 capture cannot combine with leastPrivilege
+                                           // or network.proxy. Hosts without that complete native set
+                                           // retain an eligible legacy containment tier and use guarded WPR.
     },
 
     "lxc": {                               // LXC-specific
