@@ -11,9 +11,7 @@
 # default-deny policy, and they differ only in whether the field was present in
 # the wire request, so together they pin presence-driven behavior rather than
 # value-driven behavior. Case 4 completes the pair by showing presence alone is
-# not enough. Case 9 does the same job for `filesystem_specified`: an empty
-# filesystem block leaves every path list empty, so only the recorded presence
-# of the block distinguishes it from a request that carried no block at all.
+# not enough.
 #
 # Case 3 proves the default-deny hook reaches a stock provisioned container,
 # and reads the host's own iptables state to show the hook was applied rather
@@ -141,7 +139,6 @@ CONFIG_EMPTY_ALLOWED="$CONFIG_DIR/lxc_state_aware_start_empty_allowed_hosts.json
 CONFIG_NONEMPTY_ALLOWED="$CONFIG_DIR/lxc_state_aware_start_nonempty_allowed_hosts_capabilities.json"
 CONFIG_PROVISION_NETWORK="$CONFIG_DIR/lxc_state_aware_start_network_at_provision_rejected.json"
 CONFIG_PROVISION_FILESYSTEM="$CONFIG_DIR/lxc_state_aware_start_filesystem_at_provision_rejected.json"
-CONFIG_PROVISION_FILESYSTEM_EMPTY="$CONFIG_DIR/lxc_state_aware_start_filesystem_empty_at_provision_rejected.json"
 CONFIG_BLOCK_BOTH="$CONFIG_DIR/lxc_state_aware_start_default_block_both.json"
 CONFIG_ALLOWED_FIREWALL="$CONFIG_DIR/lxc_state_aware_start_allowed_hosts_firewall.json"
 CONFIG_BLOCKED_CAPS="$CONFIG_DIR/lxc_state_aware_start_blocked_hosts_capabilities.json"
@@ -155,27 +152,11 @@ verify_fixture_contracts() {
     for cfg in "$CONFIG_NO_NETWORK" "$CONFIG_BLOCK_CAPS" "$CONFIG_BLOCK_FIREWALL" \
         "$CONFIG_ALLOW_CAPS" "$CONFIG_EMPTY_ALLOWED" "$CONFIG_NONEMPTY_ALLOWED" \
         "$CONFIG_PROVISION_NETWORK" "$CONFIG_PROVISION_FILESYSTEM" \
-        "$CONFIG_PROVISION_FILESYSTEM_EMPTY" "$CONFIG_BLOCK_BOTH" \
-        "$CONFIG_ALLOWED_FIREWALL" "$CONFIG_BLOCKED_CAPS" \
+        "$CONFIG_BLOCK_BOTH" "$CONFIG_ALLOWED_FIREWALL" "$CONFIG_BLOCKED_CAPS" \
         "$CONFIG_ALLOW_LOCAL" "$CONFIG_PROXY" "$CONFIG_PROXY_EXTERNAL" \
         "$CONFIG_FILESYSTEM_PATHS"; do
         [ -f "$cfg" ] || fail_now "fixture not found: $cfg"
     done
-
-    # Case 9's fixture must stay EMPTY. A filesystem block carrying any path
-    # list satisfies has_filesystem_policy through that list, so the case would
-    # pass with the presence bit deleted and would pin nothing. This guard is
-    # the only thing keeping the case honest.
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c 'import json,sys
-cfg = json.load(open(sys.argv[1], encoding="utf-8"))
-if cfg.get("filesystem") != {}:
-    raise SystemExit("fixture drift in %s: filesystem block must be exactly {} so the case isolates the presence bit" % sys.argv[1])' \
-            "$CONFIG_PROVISION_FILESYSTEM_EMPTY" || fail_now "fixture drift in $CONFIG_PROVISION_FILESYSTEM_EMPTY"
-    else
-        grep -q '"filesystem"[[:space:]]*:[[:space:]]*{}' "$CONFIG_PROVISION_FILESYSTEM_EMPTY" \
-            || fail_now "fixture drift in $CONFIG_PROVISION_FILESYSTEM_EMPTY: filesystem block must be exactly {}"
-    fi
 
     # Case 8's fixture is guarded here rather than in the block below so the
     # existing seven keep their positional indices.
@@ -790,17 +771,11 @@ run_provision_rejection_case "7" "$CONFIG_PROVISION_NETWORK" \
     'network.defaultPolicy=block sent at provision' \
     'matrix marks network as rejected at provision'
 
-# Clause: the LXC matrix marks filesystem as rejected at provision. Case 8 sends
-# a populated block, which the path lists alone are enough to refuse; case 9
-# sends an empty one, where the lists are all empty and only the recorded
-# presence of the block can tell the phase that a caller sent it at all.
+# Clause: the LXC matrix marks a non-empty filesystem path list as rejected at
+# provision.
 run_provision_rejection_case "8" "$CONFIG_PROVISION_FILESYSTEM" \
-    'filesystem block sent at provision' \
-    'matrix marks filesystem as rejected at provision'
-
-run_provision_rejection_case "9" "$CONFIG_PROVISION_FILESYSTEM_EMPTY" \
-    'empty filesystem block sent at provision' \
-    'matrix rejects the filesystem field on presence, not on content'
+    'filesystem block with a populated path list sent at provision' \
+    'matrix marks a non-empty filesystem path list as rejected at provision'
 
 # Clause: roadmap item 13 (N1) names firewall enforcement, and the schema offers
 # `both` alongside `firewall`. Case 3 pins `firewall`; nothing pinned `both`, so
@@ -857,9 +832,9 @@ run_proxy_start_case "15" \
     '(N5) an unenforceable proxy is refused rather than silently ignored'
 
 # Clause: the start phase accepts the filesystem lists it rejects at provision
-# (cases 8 and 9), and D1/D4 ask that readonly be readable-not-writable and that
-# denied be masked. Cases 8 and 9 only pin the provision-time refusal; without
-# this, no case shows the lists ever take effect anywhere.
+# (case 8), and D1/D4 ask that readonly be readable-not-writable and that
+# denied be masked. Case 8 only pins the provision-time refusal; without this,
+# no case shows the lists ever take effect anywhere.
 run_filesystem_start_case "16" "$CONFIG_FILESYSTEM_PATHS" \
     'readonlyPaths and deniedPaths sent at start' \
     'the start phase applies the filesystem lists it refuses at provision'

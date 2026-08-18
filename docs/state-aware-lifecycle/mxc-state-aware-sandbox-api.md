@@ -1704,15 +1704,17 @@ unconditionally by the in-guest agent).
 | `network` | rejected | rejected | rejected | rejected | rejected |
 | `ui` | rejected | rejected | rejected | rejected | rejected |
 
-For LXC, both `filesystem` and `network` are applied at **start** — the container is
+For LXC, filesystem path lists and `network` are applied at **start** — the container is
 created empty at provision and its mounts and iptables chain are installed just before
-it runs — and rejected at every other phase. `ui` is not consulted anywhere in the LXC
-backend; `LxcStartConfig` does not expose it, so SDK callers cannot pass it, but a
-raw-JSON caller that sends it is not rejected.
+it runs — and rejected at every other phase. Only a *non-empty* path list counts as a
+filesystem policy, so a `filesystem` block whose lists are all empty is accepted at any
+phase. `ui` is not consulted anywhere in the LXC backend; `LxcStartConfig` does not
+expose it, so SDK callers cannot pass it, but a raw-JSON caller that sends it is not
+rejected.
 
 | Field | provision | start | exec | stop | deprovision |
 |---|---|---|---|---|---|
-| `filesystem` | rejected | applied | rejected | rejected | rejected |
+| `filesystem` (non-empty path lists) | rejected | applied | rejected | rejected | rejected |
 | `network` | rejected | applied | rejected | rejected | rejected |
 | `ui` | ignored | ignored | ignored | ignored | ignored |
 

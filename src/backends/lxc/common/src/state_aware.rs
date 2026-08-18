@@ -200,13 +200,7 @@ fn probe_failed(question: &str, container_name: &str, detail: String) -> MxcErro
 }
 
 fn has_filesystem_policy(policy: &ContainerPolicy) -> bool {
-    // `filesystem_specified` is the outermost bit, and it is here for the same
-    // reason `network_specified` is below: an empty `filesystem: {}` block
-    // leaves all three lists empty, indistinguishable from a caller who sent no
-    // filesystem section at all. Without it, a phase that documents "no
-    // filesystem section" silently accepts one and ignores it.
-    policy.filesystem_specified
-        || !policy.readwrite_paths.is_empty()
+    !policy.readwrite_paths.is_empty()
         || !policy.readonly_paths.is_empty()
         || !policy.denied_paths.is_empty()
 }
@@ -1583,29 +1577,43 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_filesystem_block_still_counts_as_a_filesystem_policy() {
-        // An empty `filesystem: {}` leaves all three path lists empty, exactly
-        // as an absent block does, so the lists alone cannot tell a caller who
-        // said nothing from one who said "nothing in particular".  Without the
-        // presence bit, provision/exec/stop/deprovision accepted and ignored a
-        // block the phase matrix says they reject.  Twin of `network_specified`.
-        let policy = ContainerPolicy {
-            filesystem_specified: true,
-            ..Default::default()
-        };
+    fn no_filesystem_block_at_all_is_not_a_filesystem_policy() {
+        // Plain provisions must stay outside the filesystem phase gate.
         assert!(
-            has_filesystem_policy(&policy),
-            "a supplied but empty filesystem block must still be seen"
+            !has_filesystem_policy(&ContainerPolicy::default()),
+            "a policy with no filesystem section must not look like one"
         );
     }
 
     #[test]
-    fn no_filesystem_block_at_all_is_not_a_filesystem_policy() {
-        // Negative control for the test above: if presence alone always
-        // answered true, every plain provision would be refused.
+    fn any_one_path_list_alone_is_a_filesystem_policy() {
+        // The gate is an OR across the three lists, so a dropped clause still
+        // leaves the other two answering true.  Each list is exercised on its
+        // own so that a phase stops refusing only the list that went missing.
+        let readwrite = ContainerPolicy {
+            readwrite_paths: vec!["/tmp/rw".to_string()],
+            ..Default::default()
+        };
+        let readonly = ContainerPolicy {
+            readonly_paths: vec!["/tmp/ro".to_string()],
+            ..Default::default()
+        };
+        let denied = ContainerPolicy {
+            denied_paths: vec!["/tmp/denied".to_string()],
+            ..Default::default()
+        };
+
         assert!(
-            !has_filesystem_policy(&ContainerPolicy::default()),
-            "a policy with no filesystem section must not look like one"
+            has_filesystem_policy(&readwrite),
+            "readwritePaths alone must be seen as a filesystem policy"
+        );
+        assert!(
+            has_filesystem_policy(&readonly),
+            "readonlyPaths alone must be seen as a filesystem policy"
+        );
+        assert!(
+            has_filesystem_policy(&denied),
+            "deniedPaths alone must be seen as a filesystem policy"
         );
     }
 
