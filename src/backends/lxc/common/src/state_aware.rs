@@ -14,9 +14,7 @@ use serde::Serialize;
 
 use wxc_common::id::mint_random_token;
 use wxc_common::logger::{Logger, Mode};
-use wxc_common::models::{
-    ContainerPolicy, ExecutionRequest, LxcConfig, NetworkEnforcementMode, NetworkPolicy,
-};
+use wxc_common::models::{ContainerPolicy, ExecutionRequest, LxcConfig};
 use wxc_common::mxc_error::MxcError;
 use wxc_common::state_aware_backend::{
     null_pipe_handle, DeprovisionResult, ExecConsumer, ExecHandle, ExecOutcome, ProvisionResult,
@@ -212,46 +210,10 @@ fn has_network_policy(policy: &ContainerPolicy) -> bool {
     // both produce a policy indistinguishable from the struct default -- so a
     // phase that documents "no network section" would otherwise accept one.
     policy.network_specified
-        || matches!(
-            policy.network_enforcement_mode,
-            NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-        )
         || !policy.allowed_hosts.is_empty()
         || !policy.blocked_hosts.is_empty()
         || policy.allow_local_network
         || policy.network_proxy.is_enabled()
-        || policy.default_network_policy_present
-}
-
-/// Whether `policy` expresses a network restriction that LXC can only deliver
-/// through iptables.
-///
-/// LXC has no capability-based network enforcement, so under
-/// `NetworkEnforcementMode::Capabilities` — the default when `enforcementMode`
-/// is omitted — `apply_firewall_rules` returns a successful no-op. Any
-/// restriction expressed here would therefore be silently unenforced, so the
-/// caller rejects the start rather than run fail-open.
-///
-/// An explicit `defaultPolicy: "block"` counts as a restriction. The wire
-/// carries the distinction as `Option<NetworkPolicy>`; the parser records it in
-/// `default_network_policy_present`, so a requested default-deny is
-/// distinguishable from the struct default a policy-free start produces. A
-/// requested default of `Allow`, and the absent case (`default_network_policy`
-/// left at its `Block` default without the presence bit), do not require
-/// enforcement — the latter is exactly the plain start in
-/// `run_lxc_state_aware_test.sh`, which must not be rejected.
-fn requires_firewall_enforcement(policy: &ContainerPolicy) -> bool {
-    !policy.allowed_hosts.is_empty()
-        || !policy.blocked_hosts.is_empty()
-        || (policy.default_network_policy_present
-            && policy.default_network_policy == NetworkPolicy::Block)
-}
-
-fn uses_firewall_mode(policy: &ContainerPolicy) -> bool {
-    matches!(
-        policy.network_enforcement_mode,
-        NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-    )
 }
 
 fn reject_start_policy_on_other_phase(
@@ -307,12 +269,8 @@ fn reject_unenforceable_network_policy(policy: &ContainerPolicy) -> Result<(), M
         ));
     }
 
-    // `IngressManager` refuses this, but only once it is invoked, and it is
-    // invoked only in a firewall mode. With `enforcementMode` omitted both
-    // managers take their no-op paths, so without this the start reports
-    // success and the container gets unrestricted inbound traffic -- broader
-    // than the local-network access that was asked for. Rejecting before mode
-    // dispatch also means a dry run gives the same verdict as a real start.
+    // A dry run stops before the ingress apply, so without this it would report
+    // success for a start that `IngressManager` refuses.
     if policy.allow_local_network {
         return Err(MxcError::policy_validation(
             "LXC state-aware start does not support network.allowLocalNetwork: the container's \
@@ -321,20 +279,6 @@ fn reject_unenforceable_network_policy(policy: &ContainerPolicy) -> Result<(), M
         ));
     }
 
-    // Reject a policy this backend cannot enforce, rather than reporting a
-    // successful start that silently leaves the container unfiltered. LXC
-    // enforces network policy only through iptables, and `apply_firewall_rules`
-    // treats any non-firewall mode as a successful no-op.
-    if requires_firewall_enforcement(policy) && !uses_firewall_mode(policy) {
-        return Err(MxcError::policy_validation(format!(
-            "LXC state-aware start cannot enforce this network policy under \
-             enforcementMode {:?}: LXC has no capability-based network enforcement, \
-             so allowedHosts/blockedHosts would be silently unenforced and an explicit \
-             defaultPolicy 'block' would not be applied. \
-             Use enforcementMode 'firewall' or 'both'.",
-            policy.network_enforcement_mode
-        )));
-    }
     Ok(())
 }
 
@@ -365,19 +309,24 @@ fn apply_network_policy(
 
     let mut fw_manager = NetworkIptablesManager::new(container.name());
 
-    // Under a firewall-enforced policy, MXC installs a `lxc.hook.start-host`
-    // hook that renames the container's host-side veth to a deterministic name.
-    // The hook runs after liblxc creates the veth pair and attaches it to the
-    // bridge, but before the container's init runs, so the chain and its
-    // FORWARD hook can be built against that name *before* anything in the
-    // container can transmit. The prior flow discovered the veth only after
-    // start and applied rules afterward, leaving a window in which a container
-    // with a deny policy had unrestricted network. iptables accepts an
+    // When the policy requires the egress firewall, MXC installs a
+    // `lxc.hook.start-host` hook that renames the container's host-side veth to
+    // a deterministic name. The hook runs after liblxc creates the veth pair and
+    // attaches it to the bridge, but before the container's init runs, so the
+    // chain and its FORWARD hook can be built against that name *before* anything
+    // in the container can transmit. The prior flow discovered the veth only
+    // after start and applied rules afterward, leaving a window in which a
+    // container with a deny policy had unrestricted network. iptables accepts an
     // interface name that does not exist yet, so hooking the not-yet-created
     // veth by its deterministic name closes that window entirely. The hook key
     // is container-global, so enforcement no longer depends on which
     // `lxc.net.<N>` index the interface uses.
-    if uses_firewall_mode(&policy) {
+    //
+    // This gate is the same predicate `apply_firewall_rules` uses to decide
+    // whether to install rules, so the pin hook and the multi-interface guard
+    // run exactly when a chain will be scoped to the veth, and never when the
+    // apply is a no-op.
+    if policy.requires_firewall() {
         // Exactly one interface gets a pinned veth, and apply_firewall_rules
         // hooks exactly one interface. A container this run created has exactly
         // that one interface, but provision also adopts containers it did not
@@ -543,16 +492,14 @@ fn apply_ingress_policy(
     let policy = normalized_policy(request, logger)?;
 
     let Some(pid) = container.init_pid() else {
-        if uses_firewall_mode(&policy) {
-            // Enforcing inbound means entering the container's netns, and the
-            // init PID is the only handle on it. Continuing would silently drop
-            // the requested deny, so refuse the start instead.
-            return Err(MxcError::backend_error(
-                "Failed to discover the container init PID; cannot enter the container \
-                 network namespace to enforce the inbound network policy",
-            ));
-        }
-        return Ok(());
+        // Ingress installs unconditionally, so a missing netns is always fatal.
+        // Enforcing inbound means entering the container's netns, and the init
+        // PID is the only handle on it. Continuing would silently drop the
+        // inbound deny, so refuse the start instead.
+        return Err(MxcError::backend_error(
+            "Failed to discover the container init PID; cannot enter the container \
+             network namespace to enforce the inbound network policy",
+        ));
     };
 
     let mut manager = IngressManager::new(container_name, pid);
@@ -912,7 +859,13 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             .is_running()
             .map_err(|e| probe_failed("is running", container_name, e))?
         {
-            if has_filesystem_policy(&request.policy) || has_network_policy(&request.policy) {
+            // A running container cannot receive this start's chain, and an
+            // absent network section now owes one, so refusing is the only
+            // answer that does not report enforcement that never happened.
+            if has_filesystem_policy(&request.policy)
+                || has_network_policy(&request.policy)
+                || request.policy.requires_firewall()
+            {
                 return Err(MxcError::already_started(
                     "LXC container is already running; start policy cannot be reapplied",
                 ));
@@ -1250,6 +1203,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
 mod tests {
     use super::*;
     use wxc_common::models::LifecycleConfig;
+    use wxc_common::models::NetworkEnforcementMode;
     use wxc_common::models::NetworkPolicy;
     use wxc_common::models::ProxyConfig;
     use wxc_common::mxc_error::MxcErrorCode;
@@ -1269,115 +1223,53 @@ mod tests {
     }
 
     #[test]
-    fn restrictions_require_firewall_enforcement() {
-        // Explicit host lists are only ever enforced through iptables on this
-        // backend.
-        assert!(requires_firewall_enforcement(&restrictive_policy()));
-        assert!(requires_firewall_enforcement(&ContainerPolicy {
+    fn a_host_restriction_without_an_enforcement_mode_is_accepted_not_rejected() {
+        // The core change, seen through the start-only rejection: enforcement is
+        // policy-driven, so a host restriction no longer needs
+        // `enforcementMode: firewall` to be honored. Under the default
+        // (capabilities) mode the real start now installs iptables rules, so
+        // this must accept the policy rather than refuse it as unenforceable.
+        assert!(reject_unenforceable_network_policy(&restrictive_policy()).is_ok());
+        assert!(reject_unenforceable_network_policy(&ContainerPolicy {
             allowed_hosts: vec!["example.com".to_string()],
             ..Default::default()
-        }));
+        })
+        .is_ok());
     }
 
     #[test]
-    fn explicit_default_block_requires_firewall_but_absent_or_allow_does_not() {
-        // Premise change for item 6: recovering the wire's presence bit
-        // (`default_network_policy_present`) makes an explicitly-requested
-        // `defaultPolicy: "block"` distinguishable from the struct default a
-        // policy-free start produces, so it now drives enforcement where it
-        // previously could not.
-
-        // Absent network block: default-constructed, so `present` is false even
-        // though `default_network_policy` reads `Block`. This is exactly what a
-        // start with no `network` block produces, and it must not be treated as
-        // a restriction — otherwise every plain start, including the basic
-        // lifecycle in run_lxc_state_aware_test.sh, would be rejected.
-        let no_network_block = ContainerPolicy::default();
-        assert_eq!(
-            no_network_block.default_network_policy,
-            NetworkPolicy::Block
-        );
-        assert!(!no_network_block.default_network_policy_present);
-        assert!(!requires_firewall_enforcement(&no_network_block));
-
-        // Explicitly-requested `defaultPolicy: "block"`: the parser sets the
-        // presence bit, so it is now an enforceable restriction. Under a
-        // capabilities (non-firewall) mode the caller rejects the start rather
-        // than run the default-deny fail-open.
-        assert!(requires_firewall_enforcement(&ContainerPolicy {
+    fn an_explicit_default_block_without_an_enforcement_mode_is_accepted() {
+        // `defaultPolicy: "block"` with no `enforcementMode` is now enforced
+        // rather than silently dropped, so the start-only rejection no longer
+        // fires for it.
+        assert!(reject_unenforceable_network_policy(&ContainerPolicy {
             default_network_policy: NetworkPolicy::Block,
-            default_network_policy_present: true,
             ..Default::default()
-        }));
-
-        // Explicitly-requested `defaultPolicy: "allow"` is permissive, so it
-        // needs no iptables enforcement even though the presence bit is set.
-        assert!(!requires_firewall_enforcement(&ContainerPolicy {
-            default_network_policy: NetworkPolicy::Allow,
-            default_network_policy_present: true,
-            ..Default::default()
-        }));
+        })
+        .is_ok());
     }
 
     #[test]
-    fn unrestricted_policy_does_not_require_firewall_enforcement() {
-        let policy = ContainerPolicy {
-            default_network_policy: NetworkPolicy::Allow,
-            ..Default::default()
-        };
-        assert!(!requires_firewall_enforcement(&policy));
-    }
-
-    #[test]
-    fn capabilities_mode_cannot_carry_lxc_network_restrictions() {
-        // `Capabilities` is the default when `enforcementMode` is omitted, and
-        // LXC has no capability-based network enforcement. A restrictive policy
-        // under that mode must be rejected rather than reported as a successful
-        // start that leaves the container unfiltered.
+    fn an_explicit_capabilities_mode_is_ignored_not_rejected() {
+        // A caller may set `enforcementMode: "capabilities"` explicitly. LXC
+        // ignores the value now, so a restriction carried alongside it is
+        // accepted and enforced -- the caller gets more enforcement than asked
+        // for, never a rejection.
         let policy = ContainerPolicy {
             network_enforcement_mode: NetworkEnforcementMode::Capabilities,
             ..restrictive_policy()
         };
-        assert!(requires_firewall_enforcement(&policy));
-        assert!(!uses_firewall_mode(&policy));
-
-        // Assert the refusal itself, not only the two predicates behind it.
-        // The SDK once restated this rule as a TypeScript union, which could
-        // not hold: the predicate turns on whether a host list is empty, and a
-        // list assembled at run time has no compile-time length.  This gate is
-        // the only control, so every restriction source is checked here.
-        for restriction in [
-            restrictive_policy(),
-            ContainerPolicy {
-                allowed_hosts: vec!["example.com".to_string()],
-                ..Default::default()
-            },
-            ContainerPolicy {
-                default_network_policy: NetworkPolicy::Block,
-                default_network_policy_present: true,
-                ..Default::default()
-            },
-        ] {
-            let policy = ContainerPolicy {
-                network_enforcement_mode: NetworkEnforcementMode::Capabilities,
-                ..restriction
-            };
-            let err = reject_unenforceable_network_policy(&policy)
-                .expect_err("a restriction under Capabilities has no enforceable implementation");
-            assert!(
-                format!("{err}").contains("enforcementMode"),
-                "the refusal has to name the field the caller must set, got {err}"
-            );
-        }
+        assert!(reject_unenforceable_network_policy(&policy).is_ok());
     }
 
     #[test]
     fn allow_local_network_is_rejected_whatever_the_enforcement_mode() {
-        // `IngressManager` refuses this, but it only gets the chance in a
-        // firewall mode. With `enforcementMode` omitted both managers take
-        // their no-op paths, so without a check here the start reports success
-        // and the container gets every inbound source -- broader than the
-        // local-network access that was asked for.
+        // `IngressManager` refuses this once invoked, and ingress now installs
+        // unconditionally, so it is always invoked. A dry run stops before the
+        // ingress apply, so this request-only rejection is what gives the dry
+        // run the same verdict as the real start. Mode no longer changes the
+        // outcome; looping the modes only shows the verdict does not depend on
+        // it.
         for mode in [
             NetworkEnforcementMode::Capabilities,
             NetworkEnforcementMode::Firewall,
@@ -1402,33 +1294,6 @@ mod tests {
         // The negative control: the gate above must not swallow ordinary
         // starts.
         assert!(reject_unenforceable_network_policy(&ContainerPolicy::default()).is_ok());
-    }
-
-    #[test]
-    fn firewall_modes_are_accepted_for_restrictive_policies() {
-        for mode in [
-            NetworkEnforcementMode::Firewall,
-            NetworkEnforcementMode::Both,
-        ] {
-            let policy = ContainerPolicy {
-                network_enforcement_mode: mode,
-                ..restrictive_policy()
-            };
-            assert!(uses_firewall_mode(&policy));
-        }
-    }
-
-    #[test]
-    fn plain_start_with_no_network_block_is_not_rejected() {
-        // The exact policy a start with no `network` block produces. This is
-        // the basic lifecycle run_lxc_state_aware_test.sh exercises, so it must
-        // pass the enforceability gate in `apply_network_policy`.
-        let policy = ContainerPolicy::default();
-        assert!(!requires_firewall_enforcement(&policy) || uses_firewall_mode(&policy));
-        // And it must stay off the firewall path entirely: veth pinning and the
-        // pre-start iptables install are scoped to the firewall modes, so a
-        // default policy neither touches the container config nor installs rules.
-        assert!(!uses_firewall_mode(&policy));
     }
 
     #[test]
@@ -1948,36 +1813,38 @@ mod tests {
             err.message
         );
 
-        // A host restriction under a non-firewall enforcement mode: LXC has no
-        // capability-based network enforcement, so this would start unfiltered.
-        let unenforceable = ExecutionRequest {
-            policy: restrictive_policy(),
+        // allowLocalNetwork: the inbound chain can only open every source, which
+        // is broader than the local-network access requested, so IngressManager
+        // refuses it and the real start aborts. This is the other rejection that
+        // needs only the request, so the dry run must give the same verdict.
+        let permissive_inbound = ExecutionRequest {
+            policy: ContainerPolicy {
+                allow_local_network: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
-        assert!(!uses_firewall_mode(&unenforceable.policy));
         let err = runner
-            .validate_start("lxc:mxc-abcd1234", &unenforceable, None)
+            .validate_start("lxc:mxc-abcd1234", &permissive_inbound, None)
             .unwrap_err();
         assert_eq!(err.code, MxcErrorCode::PolicyValidation);
         assert!(
-            err.message.contains("enforcementMode"),
-            "expected the enforcement-mode rejection, got: {}",
+            err.message.contains("allowLocalNetwork"),
+            "expected the allowLocalNetwork rejection, got: {}",
             err.message
         );
     }
 
     #[test]
-    fn validate_start_still_accepts_an_enforceable_restriction() {
-        // The negative control for the test above: the same host restriction
-        // under `firewall` mode is exactly what this backend can enforce, so
-        // validation must not reject it. Without this, "reject everything"
-        // would pass.
+    fn validate_start_accepts_a_restriction_without_an_enforcement_mode() {
+        // The negative control for the test above, and the core behavior change
+        // seen through the caller: the same host restriction with no
+        // `enforcementMode` is now enforceable through iptables, so validation
+        // accepts it instead of refusing it as unenforceable. Without this,
+        // "reject everything" would pass.
         let runner = LxcStateAwareRunner::new();
         let req = ExecutionRequest {
-            policy: ContainerPolicy {
-                network_enforcement_mode: NetworkEnforcementMode::Firewall,
-                ..restrictive_policy()
-            },
+            policy: restrictive_policy(),
             ..Default::default()
         };
         runner

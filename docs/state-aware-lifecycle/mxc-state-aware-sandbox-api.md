@@ -1718,46 +1718,28 @@ rejected.
 | `network` | rejected | applied | rejected | rejected | rejected |
 | `ui` | ignored | ignored | ignored | ignored | ignored |
 
-> **LXC `network` constraints.** `network.proxy` is rejected at start. LXC enforces
-> network policy only through iptables, so a policy carrying a *non-empty*
-> `allowedHosts` or `blockedHosts` must set `enforcementMode` to `"firewall"` or
-> `"both"`; an empty list is not a restriction and needs no mode. Under
-> `"capabilities"` (the default when the field is omitted) start fails rather than
-> silently leaving the container unfiltered. In a firewall mode the veth is not
-> discovered after start: the name is derived from the container name and pinned by
-> a container-global `lxc.hook.start-host` installed before start, so the chain is
-> scoped before the interface exists. The hook resolves the container's peer
-> interface from `$LXC_PID` and renames it to that name; if it cannot find one it
-> exits nonzero, which aborts the start rather than leaving the container
-> unfiltered. The interface set comes from liblxc rather than from the container's
-> own config file, so an `lxc.include` that declares interfaces elsewhere is
+> **LXC `network` constraints.** `network.proxy` and `allowLocalNetwork` are
+> rejected at start.  LXC enforces network policy through iptables whenever
+> `defaultPolicy` is `"block"`, either host list is non-empty, or proxy is
+> enabled.  The value of `enforcementMode` is accepted but ignored by LXC; it
+> does not disable enforcement.  The veth is not discovered after start: the name
+> is derived from the container name and pinned by a container-global
+> `lxc.hook.start-host` installed before start, so the chain is scoped before the
+> interface exists. The hook resolves the container's peer interface from
+> `$LXC_PID` and renames it to that name; if it cannot find one it exits
+> nonzero, which aborts the start rather than leaving the container unfiltered.
+> The interface set comes from liblxc rather than from the container's own
+> config file, so an `lxc.include` that declares interfaces elsewhere is
 > resolved rather than guessed at, and no interface index is read at all — a
 > container numbering its only interface `lxc.net.3` is enforced exactly as one
 > using `lxc.net.0`, as is one at any index liblxc accepts. Start fails instead
-> when that pin cannot be
-> trusted to cover the container's traffic — when the container declares
-> anything other than exactly one interface, or does not declare that interface's
-> type as `veth`. An
-> undeclared type is refused alongside a wrong one, because absence is not
-> evidence of a veth, and a `macvlan` or `phys` interface would take a hook
-> pinned to a veth name that never appears while its traffic ran unfiltered.
-> `allowLocalNetwork`
-> and `removeRulesOnExit` are not part of the LXC surface (see
-> `LxcNetworkConfig`).
->
-> An explicit `defaultPolicy: "block"` now triggers the same rejection as
-> `allowedHosts`/`blockedHosts`: the parser records whether the field was present in
-> the wire request (`default_network_policy_present`), so a requested default-deny is
-> distinguishable from the struct default a policy-free start produces.  Under
-> `"capabilities"` (the default `enforcementMode`), start therefore fails rather than
-> let the container run believing it is default-deny when no iptables rule enforces it
-> (`state_aware.rs: requires_firewall_enforcement`, `validate_start`).  A start that
-> supplies no `network.defaultPolicy` does not set the presence bit.  An explicit
-> `defaultPolicy: "allow"` does set it, because the parser records every value the
-> wire request carried, but a permissive default needs no iptables rule to be honest
-> and so does not require firewall enforcement either way.  To start a default-deny
-> container, set
-> `enforcementMode` to `"firewall"` or `"both"`.
+> when that pin cannot be trusted to cover the container's traffic — when the
+> container declares anything other than exactly one interface, or does not
+> declare that interface's type as `veth`. An undeclared type is refused
+> alongside a wrong one, because absence is not evidence of a veth, and a
+> `macvlan` or `phys` interface would take a hook pinned to a veth name that
+> never appears while its traffic ran unfiltered. `removeRulesOnExit` is not
+> part of the LXC surface (see `LxcNetworkConfig`).
 
 - **Compile-time enforcement at the SDK.** Each per-(backend, phase) Config (§6.1)
   declares only the cross-cutting fields the matrix marks as `applied` for that phase

@@ -1,17 +1,8 @@
 #!/bin/bash
 # LXC state-aware network policy matrix test.
 #
-# Proves the LXC start-phase network contract in docs/state-aware-lifecycle:
-# absent defaultPolicy is not the same as explicit defaultPolicy=block,
-# explicit defaultPolicy=allow is permissive even when present, empty host lists
-# are not restrictions, non-empty host lists require firewall enforcement, and
-# network is rejected at provision.
-#
-# Cases 1 and 2 are the pair that matters most: both produce the same effective
-# default-deny policy, and they differ only in whether the field was present in
-# the wire request, so together they pin presence-driven behavior rather than
-# value-driven behavior. Case 4 completes the pair by showing presence alone is
-# not enough.
+# Proves that LXC start requests enforce policy-driven network rules, including
+# the inherited default-deny policy when the request omits a network block.
 #
 # Case 3 proves the default-deny hook reaches a stock provisioned container,
 # and reads the host's own iptables state to show the hook was applied rather
@@ -702,21 +693,20 @@ command -v lxc-create >/dev/null 2>&1 || skip "LXC state-aware network matrix UN
 
 echo "Running LXC state-aware network policy matrix test..."
 
-# Clause: "A start that supplies no network.defaultPolicy does not set the presence bit."
 run_start_case "1" "$CONFIG_NO_NETWORK" \
     'no network block at start' \
-    'start succeeds' \
-    "1" "0" \
-    'A start that supplies no network.defaultPolicy does not set the presence bit'
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    "1" "1" \
+    'an absent network block inherits deny-by-default and is enforced' \
+    "1"
 
-# Clause: "Under capabilities, start therefore fails."
 run_start_case "2" "$CONFIG_BLOCK_CAPS" \
     'defaultPolicy=block with enforcementMode omitted at start' \
-    'start fails with policy_validation' \
-    "0" "0" \
-    'Under capabilities, start therefore fails'
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    "1" "1" \
+    'defaultPolicy=block is enforced when enforcementMode is omitted' \
+    "1"
 
-# Clause: "To start a default-deny container, set enforcementMode to firewall or both."
 #
 # This is the direct observable proof of roadmap item 13's "ensure hook is
 # always applied": a stock provisioned container carries
@@ -729,29 +719,28 @@ run_start_case "3" "$CONFIG_BLOCK_FIREWALL" \
     'defaultPolicy=block with enforcementMode=firewall at start' \
     'start succeeds, exec proves the container runs, and FORWARD drops by default' \
     "1" "1" \
-    'To start a default-deny container, set enforcementMode to firewall or both' \
+    'an explicit firewall mode remains accepted, but is not required for enforcement' \
     "1"
 
-# Clause: "A permissive default needs no iptables rule to be honest."
 run_start_case "4" "$CONFIG_ALLOW_CAPS" \
     'defaultPolicy=allow with enforcementMode omitted at start' \
     'start succeeds' \
     "1" "0" \
     'a permissive default needs no iptables rule and does not require firewall enforcement'
 
-# Clause: "An empty list is not a restriction and needs no mode."
 run_start_case "5" "$CONFIG_EMPTY_ALLOWED" \
     'allowedHosts empty list with enforcementMode omitted at start' \
-    'start succeeds and exec proves the container runs' \
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
     "1" "1" \
-    'an empty list is not a restriction and needs no mode'
+    'an empty list does not relax the inherited default-deny policy' \
+    "1"
 
-# Clause: "A policy carrying a non-empty allowedHosts must set enforcementMode."
 run_start_case "6" "$CONFIG_NONEMPTY_ALLOWED" \
     'allowedHosts non-empty with enforcementMode omitted at start' \
-    'start fails with policy_validation' \
-    "0" "0" \
-    'a policy carrying a non-empty allowedHosts must set enforcementMode'
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    "1" "1" \
+    'a non-empty allowedHosts policy is enforced when enforcementMode is omitted' \
+    "1"
 
 # Clause: roadmap item 13 (N1) asks that default-deny outbound be enforced.  It
 # says nothing about how the container numbers its interfaces, and an interface
@@ -788,26 +777,20 @@ run_start_case "11" "$CONFIG_BLOCK_BOTH" \
     '(N1) default-deny outbound is enforced under enforcementMode=both' \
     "1"
 
-# Clause: case 6 shows a non-empty allowedHosts is refused when no mode can
-# enforce it. That leaves the accepting half unpinned -- a build that refused the
-# list under every mode would still pass case 6. This is the other half: with
-# firewall enforcement the same list starts and the default-deny hook lands.
+# Case 12 preserves compatibility for callers that explicitly request firewall enforcement.
 run_start_case "12" "$CONFIG_ALLOWED_FIREWALL" \
     'allowedHosts non-empty with enforcementMode=firewall at start' \
     'start succeeds, exec proves the container runs, and FORWARD drops by default' \
     "1" "1" \
-    '(N3) a non-empty allowedHosts is enforceable under firewall mode' \
+    '(N3) a non-empty allowedHosts policy remains enforceable with an explicit firewall mode' \
     "1"
 
-# Clause: roadmap item 16 (N4) treats deny rules as first-class alongside allow
-# rules. blockedHosts is a restriction exactly as allowedHosts is, so it must
-# demand an enforcement mode for the same reason -- otherwise a caller could pass
-# a block list under capabilities and receive no enforcement and no error.
 run_start_case "13" "$CONFIG_BLOCKED_CAPS" \
     'blockedHosts non-empty with enforcementMode omitted at start' \
-    'start fails with policy_validation' \
-    "0" "0" \
-    '(N4) a policy carrying a non-empty blockedHosts must set enforcementMode'
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    "1" "1" \
+    '(N4) a non-empty blockedHosts policy is enforced when enforcementMode is omitted' \
+    "1"
 
 # Clause: roadmap item 14 (N2) is explicit -- "reject `hostLoopback: "allow"`
 # rather than guessing ports or exposing the container IP." The roadmap records

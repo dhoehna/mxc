@@ -1100,11 +1100,6 @@ fn convert_wire_config(
 
         if let Some(p) = net.default_policy {
             policy.default_network_policy = p.into();
-            // Preserve the presence bit the wire `Option<NetworkPolicy>` carried:
-            // once flattened, an explicit `defaultPolicy: "block"` is otherwise
-            // indistinguishable from the struct default a policy-free start
-            // produces.
-            policy.default_network_policy_present = true;
         }
 
         if let Some(m) = net.enforcement_mode {
@@ -1234,30 +1229,6 @@ fn convert_wire_config(
                        HTTP_PROXY. Use a loopback proxy (127.0.0.1/::1/localhost) or \
                        'network.proxy.builtinTestServer: true' for port-scoped reachability \
                        under deny.";
-            logger.log_line(msg);
-            return Err(WxcError::ConfigParse(msg.to_string()));
-        }
-
-        // LXC is the inverse of the two guards above: it *does* have a
-        // privileged packet-filter layer, and that layer is the only thing that
-        // makes the proxy an exception rather than a suggestion. Under the
-        // default `Capabilities` mode `apply_firewall_rules` installs nothing,
-        // so the runner would inject HTTP(S)_PROXY while leaving direct egress
-        // wide open -- a config that reads as deny-all-except-proxy and
-        // enforces neither half. Reject it rather than auto-promoting, so the
-        // user's stated enforcement is never silently rewritten.
-        if containment == ContainmentBackend::Lxc
-            && policy.network_proxy.is_enabled()
-            && !matches!(
-                policy.network_enforcement_mode,
-                NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-            )
-        {
-            let msg = "LXC: network.proxy requires network.enforcementMode='firewall' \
-                       or 'both'. Under the default 'capabilities' mode no iptables \
-                       rules are installed, so the proxy environment variables would be \
-                       injected while direct egress stayed unrestricted -- any client \
-                       that ignores HTTP_PROXY would bypass the proxy entirely.";
             logger.log_line(msg);
             return Err(WxcError::ConfigParse(msg.to_string()));
         }
@@ -3091,56 +3062,6 @@ mod tests {
     }
 
     #[test]
-    fn network_default_policy_absent_leaves_presence_false() {
-        // Absent `defaultPolicy` must not set the presence bit.  The struct
-        // default is Block, so without this bit an explicit "block" would be
-        // indistinguishable from a policy-free start.
-        let json = r#"{"process": {"commandLine": "print('test')"}}"#;
-        let encoded = base64_encode(json.as_bytes());
-        let mut logger = test_logger();
-
-        let req = load_request(&encoded, &mut logger, true).unwrap();
-        assert!(
-            !req.policy.default_network_policy_present,
-            "absent defaultPolicy must not set the presence bit"
-        );
-    }
-
-    #[test]
-    fn network_default_policy_block_sets_presence_true() {
-        // An explicit "block" must set both the policy value and the presence bit.
-        // The presence bit is what lets `requires_firewall_enforcement` distinguish
-        // a caller-requested default-deny from the struct default a policy-free
-        // start produces.
-        let json = r#"{"process": {"commandLine": "print('test')"}, "network": {"defaultPolicy": "block"}}"#;
-        let encoded = base64_encode(json.as_bytes());
-        let mut logger = test_logger();
-
-        let req = load_request(&encoded, &mut logger, true).unwrap();
-        assert_eq!(req.policy.default_network_policy, NetworkPolicy::Block);
-        assert!(
-            req.policy.default_network_policy_present,
-            "explicit defaultPolicy: \"block\" must set the presence bit"
-        );
-    }
-
-    #[test]
-    fn network_default_policy_allow_sets_presence_true() {
-        // An explicit "allow" must set the presence bit even though Allow is not
-        // a firewall restriction.
-        let json = r#"{"process": {"commandLine": "print('test')"}, "network": {"defaultPolicy": "allow"}}"#;
-        let encoded = base64_encode(json.as_bytes());
-        let mut logger = test_logger();
-
-        let req = load_request(&encoded, &mut logger, true).unwrap();
-        assert_eq!(req.policy.default_network_policy, NetworkPolicy::Allow);
-        assert!(
-            req.policy.default_network_policy_present,
-            "explicit defaultPolicy: \"allow\" must set the presence bit"
-        );
-    }
-
-    #[test]
     fn network_default_policy_absent_defaults_to_block_on_any_version() {
         // wxc-exec is the trust boundary -- absent `defaultPolicy`
         // resolves to `Block` regardless of declared schema version.
@@ -3765,10 +3686,10 @@ mod tests {
     #[test]
     fn proxy_accepted_with_lxc() {
         // LXC requires a routable proxy host: localhost/127.0.0.1 is the
-        // container loopback and unreachable, so use network.proxy.url.
-        // A firewall mode is required, because that is what makes the proxy an
-        // exception to deny-all rather than an unenforced suggestion.
-        let json = r#"{"process":{"commandLine":"x"},"containment":"lxc","network":{"proxy":{"url":"http://proxy.example.com:8080"},"enforcementMode":"firewall"}}"#;
+        // container loopback and unreachable, so use network.proxy.url. A proxy
+        // makes the policy require the firewall, so LXC installs the rules that
+        // make it an exception to deny-all; no enforcementMode is needed.
+        let json = r#"{"process":{"commandLine":"x"},"containment":"lxc","network":{"proxy":{"url":"http://proxy.example.com:8080"}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
 
@@ -3780,48 +3701,32 @@ mod tests {
     }
 
     #[test]
-    fn proxy_with_lxc_accepts_both_mode() {
-        // 'both' also installs the iptables rules, so it satisfies the guard.
-        let json = r#"{"process":{"commandLine":"x"},"containment":"lxc","network":{"proxy":{"url":"http://proxy.example.com:8080"},"enforcementMode":"both"}}"#;
-        let encoded = base64_encode(json.as_bytes());
-        let mut logger = test_logger();
+    fn proxy_with_lxc_is_accepted_whatever_the_enforcement_mode() {
+        // The behavior change, seen through the parser: an LXC proxy used to be
+        // rejected unless enforcementMode was firewall/both. It is now accepted
+        // regardless -- omitted, capabilities, firewall, and both all parse to
+        // an enabled proxy, because the proxy alone drives the install.
+        for mode in [
+            r#""enforcementMode":"capabilities","#,
+            r#""enforcementMode":"firewall","#,
+            r#""enforcementMode":"both","#,
+            "",
+        ] {
+            let json = format!(
+                r#"{{"process":{{"commandLine":"x"}},"containment":"lxc","network":{{{}"proxy":{{"url":"http://proxy.example.com:8080"}}}}}}"#,
+                mode
+            );
+            let encoded = base64_encode(json.as_bytes());
+            let mut logger = test_logger();
 
-        let req = load_request(&encoded, &mut logger, true).unwrap();
-        assert!(req.policy.network_proxy.is_enabled());
-    }
-
-    #[test]
-    fn proxy_with_lxc_and_omitted_enforcement_mode_is_rejected() {
-        // enforcementMode defaults to 'capabilities', under which
-        // apply_firewall_rules installs nothing. Accepting this config would
-        // inject HTTP(S)_PROXY while leaving direct egress unrestricted, so
-        // anything ignoring the environment variables bypasses the proxy.
-        let json = r#"{"process":{"commandLine":"x"},"containment":"lxc","network":{"proxy":{"url":"http://proxy.example.com:8080"}}}"#;
-        let encoded = base64_encode(json.as_bytes());
-        let mut logger = test_logger();
-
-        let err = load_request(&encoded, &mut logger, true).unwrap_err();
-        assert!(
-            format!("{}", err).contains("network.proxy requires network.enforcementMode"),
-            "expected the LXC enforcement-mode rejection, got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn proxy_with_lxc_and_explicit_capabilities_mode_is_rejected() {
-        // Stating 'capabilities' explicitly is the same fail-open as omitting
-        // it, so it must be rejected identically rather than read as consent.
-        let json = r#"{"process":{"commandLine":"x"},"containment":"lxc","network":{"proxy":{"url":"http://proxy.example.com:8080"},"enforcementMode":"capabilities"}}"#;
-        let encoded = base64_encode(json.as_bytes());
-        let mut logger = test_logger();
-
-        let err = load_request(&encoded, &mut logger, true).unwrap_err();
-        assert!(
-            format!("{}", err).contains("network.proxy requires network.enforcementMode"),
-            "expected the LXC enforcement-mode rejection, got: {}",
-            err
-        );
+            let req = load_request(&encoded, &mut logger, true).unwrap_or_else(|err| {
+                panic!("an LXC proxy must be accepted (mode fragment {mode:?}), got: {err}")
+            });
+            assert!(
+                req.policy.network_proxy.is_enabled(),
+                "mode fragment {mode:?}: the proxy must be enabled"
+            );
+        }
     }
 
     // The credential guard runs after `convert_wire_proxy`, so a

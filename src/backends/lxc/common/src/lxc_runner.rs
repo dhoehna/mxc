@@ -10,9 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use wxc_common::logger::Logger;
-use wxc_common::models::{
-    ExecutionRequest, LifecycleConfig, LxcConfig, NetworkEnforcementMode, ScriptResponse,
-};
+use wxc_common::models::{ExecutionRequest, LifecycleConfig, LxcConfig, ScriptResponse};
 use wxc_common::script_runner::ScriptRunner;
 
 use crate::filesystem_mounts;
@@ -260,14 +258,7 @@ impl LxcScriptRunner {
             let _ = writeln!(logger, "Container already running.");
         }
 
-        // Wait for network only when the config uses network features (firewall rules
-        // or allowed/blocked hosts), or when the container must reach a proxy.
-        let needs_network = matches!(
-            request.policy.network_enforcement_mode,
-            NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-        ) || !request.policy.allowed_hosts.is_empty()
-            || !request.policy.blocked_hosts.is_empty()
-            || request.policy.network_proxy.is_enabled();
+        let needs_network = request.policy.requires_firewall();
 
         if needs_network {
             Self::wait_for_network(&container_name, Duration::from_secs(10), logger);
@@ -330,20 +321,14 @@ impl LxcScriptRunner {
         // above: it enforces `allowLocalNetwork` (inbound default-deny) via the
         // container's own iptables INPUT chain, reached with `nsenter`.
         //
-        // A firewall enforcement mode means the caller asked for the inbound
-        // deny chain. LXC enforces it inside the container's own netns, so it
-        // is useless without the init PID that lets us enter that netns — and
-        // the ingress manager cannot even be constructed without one.
-        let use_firewall = matches!(
-            request.policy.network_enforcement_mode,
-            NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-        );
+        // Ingress installs unconditionally, so the init PID is mandatory for
+        // every start: LXC enters the container's netns through it, and the
+        // ingress manager cannot even be constructed without one.
 
-        // Kept in scope for post-execution cleanup; `None` when there is no
-        // netns PID and no firewall was requested (nothing to enforce).
-        let mut ingress_manager: Option<IngressManager> = None;
-
-        match container.init_pid() {
+        // Kept in scope for post-execution cleanup. A missing init PID returns
+        // below, so the match always yields the manager for a successful
+        // install on the path that continues.
+        let mut ingress_manager: Option<IngressManager> = match container.init_pid() {
             Some(pid) => {
                 let _ = writeln!(logger, "Container init PID: {}", pid);
                 let mut mgr = IngressManager::new(&container_name, pid);
@@ -368,39 +353,32 @@ impl LxcScriptRunner {
                     }
                 }
                 // Every non-success arm above returns, so the apply call
-                // succeeded. Only now may the policy be marked for
-                // preservation: the flag also suppresses `Drop`, and a partial
-                // chain from a failed install must still be torn down. Success
-                // does not imply a chain exists — a non-firewall enforcement
-                // mode succeeds without installing one — but in that case no
-                // ownership flag is set and `Drop` has nothing to do either way.
+                // succeeded and the inbound chain now exists. Only now may the
+                // policy be marked for preservation: the flag also suppresses
+                // `Drop`, and a partial chain from a failed install must still be
+                // torn down.
                 mgr.set_preserve_policy(!self.cleanup_policy);
-                ingress_manager = Some(mgr);
+                Some(mgr)
             }
-            None if use_firewall => {
-                // The run asked for a firewall but we could not find the
-                // container netns to enforce it in. There is no legitimate
-                // ingress-without-a-netns case: enforcing inbound requires
-                // entering the container's namespace, so running anyway would
-                // silently disable the requested inbound deny (a fail-open).
-                // Abort instead. This guard is specific to the LXC ingress
-                // path, which addresses its namespace by init PID; other
-                // backends reach their firewall handling through their own
-                // runners and never construct an `IngressManager`.
+            None => {
+                // Ingress installs unconditionally now, so a missing netns is
+                // always fatal. Enforcing inbound requires entering the
+                // container's namespace, so running anyway would silently
+                // disable the inbound deny (a fail-open). Abort instead. This
+                // guard is specific to the LXC ingress path, which addresses its
+                // namespace by init PID; other backends reach their firewall
+                // handling through their own runners and never construct an
+                // `IngressManager`.
                 if self.destroy_on_exit || container_created {
                     let _ = container.destroy();
                 }
                 return ScriptResponse::error(
                     "Failed to discover the container init PID; cannot enter the container \
-                     network namespace to enforce the requested inbound firewall. Aborting \
-                     rather than running with inbound enforcement silently disabled.",
+                     network namespace to enforce the inbound firewall. Aborting rather than \
+                     running with inbound enforcement silently disabled.",
                 );
             }
-            None => {
-                // No firewall requested and no netns PID: nothing to enforce
-                // inbound, so no ingress chain is installed.
-            }
-        }
+        };
 
         let mut pinned = false;
 

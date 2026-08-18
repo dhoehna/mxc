@@ -618,17 +618,6 @@ pub struct ContainerPolicy {
     pub denied_paths: Vec<String>,
     pub fallback: FallbackPolicy,
     pub default_network_policy: NetworkPolicy,
-    /// Whether the wire config carried an explicit `network.defaultPolicy`.
-    ///
-    /// The wire type `Network::default_policy` is `Option<NetworkPolicy>`, but
-    /// this flattened field is not, so an explicit `defaultPolicy: "block"` and
-    /// an omitted one both land here as the struct default (`Block`). The parser
-    /// sets this flag when the wire value was present, preserving the presence
-    /// bit the `Option` carried so a backend can distinguish "the user asked for
-    /// a default policy" from "no network block at all" — which
-    /// `default_network_policy` alone cannot express. Defaults to `false`, and
-    /// the struct's `#[serde(default)]` keeps the addition backward-compatible.
-    pub default_network_policy_present: bool,
     pub network_enforcement_mode: NetworkEnforcementMode,
     /// When true, the sandboxed process may bind() + listen() on local IPs
     /// and accept incoming connections. Independent of `default_network_policy`
@@ -705,6 +694,17 @@ impl ContainerPolicy {
             &self.allowed_hosts,
             &self.blocked_hosts,
         )
+    }
+
+    /// True when the policy requires the LXC egress firewall to install rules.
+    ///
+    /// `default_network_policy` defaults to `Block`, so a request carrying no
+    /// `network` section lands here as deny-all.
+    pub fn requires_firewall(&self) -> bool {
+        self.default_network_policy == NetworkPolicy::Block
+            || !self.allowed_hosts.is_empty()
+            || !self.blocked_hosts.is_empty()
+            || self.network_proxy.is_enabled()
     }
 }
 

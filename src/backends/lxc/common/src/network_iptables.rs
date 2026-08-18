@@ -13,9 +13,7 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 use wxc_common::logger::Logger;
-use wxc_common::models::{
-    ContainerPolicy, NetworkEnforcementMode, NetworkPolicy, ProxyAddress, ProxyHostPin,
-};
+use wxc_common::models::{ContainerPolicy, NetworkPolicy, ProxyAddress, ProxyHostPin};
 
 /// One destination the container is allowed to reach when the policy routes
 /// egress through a cooperative proxy: an address the proxy host resolved to,
@@ -2030,16 +2028,6 @@ impl NetworkIptablesManager {
         Ok(())
     }
 
-    /// Whether the given enforcement mode is served by the iptables firewall
-    /// backend. Pure and side-effect-free so the gate can be exercised without
-    /// invoking the host firewall.
-    fn enforcement_mode_uses_firewall(mode: &NetworkEnforcementMode) -> bool {
-        matches!(
-            mode,
-            NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-        )
-    }
-
     /// Apply network firewall rules based on the container policy.
     ///
     /// On any failure after resources are created, the inner call rolls back
@@ -2058,35 +2046,13 @@ impl NetworkIptablesManager {
         policy: &ContainerPolicy,
         logger: &mut Logger,
     ) -> Result<bool, String> {
-        // Skip if network enforcement doesn't use firewall.
-        if !Self::enforcement_mode_uses_firewall(&policy.network_enforcement_mode) {
-            // ...unless the policy also carries a proxy, in which case skipping
-            // is the dangerous outcome rather than the safe one. The runner
-            // injects HTTP(S)_PROXY from the same policy regardless of what
-            // happens here, so returning `Ok(true)` with no rules installed
-            // yields a container that advertises a proxy and restricts nothing:
-            // any client ignoring the environment reaches the network directly.
-            //
-            // The JSON parser rejects this combination, but the parser is not
-            // the only door. `LxcScriptRunner::execute` and `mxc_engine::run`
-            // take an already-built `ExecutionRequest`, and
-            // `NetworkEnforcementMode` derives `Default` as `Capabilities` -- so
-            // a policy constructed in code gets the unenforced mode without
-            // anyone choosing it. Restating the invariant here puts it in the
-            // layer that can actually observe whether rules were installed,
-            // which is the only layer every caller passes through.
-            if policy.network_proxy.is_enabled() {
-                return Err(
-                    "network.proxy requires network.enforcementMode='firewall' or 'both'. \
-                     This policy enables a proxy under 'capabilities', where no iptables \
-                     rules are installed, so the proxy environment would be injected while \
-                     direct egress stayed unrestricted -- any client that ignores HTTP_PROXY \
-                     would bypass the proxy entirely. Refusing to apply rather than reporting \
-                     success for an enforcement that did not happen."
-                        .to_string(),
-                );
-            }
-            logger.log_line("Network enforcement mode does not use firewall, skipping iptables.");
+        // `enforcementMode` is deliberately not consulted here; a caller may get
+        // more enforcement than the mode asked for, never less.
+        if !policy.requires_firewall() {
+            logger.log_line(
+                "Network policy requires no egress firewall (permissive default, no host \
+                 lists, no proxy); skipping iptables.",
+            );
             return Ok(true);
         }
 
@@ -3175,7 +3141,7 @@ mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
     use wxc_common::logger::{Logger, Mode};
-    use wxc_common::models::{ContainerPolicy, NetworkEnforcementMode, ProxyAddress, ProxyConfig};
+    use wxc_common::models::{ContainerPolicy, NetworkEnforcementMode, NetworkPolicy};
 
     /// Build a policy requesting the given enforcement mode, leaving every
     /// other field at its default.
@@ -5064,10 +5030,18 @@ mod tests {
     }
 
     #[test]
-    fn a_non_firewall_policy_is_a_successful_no_op() {
+    fn a_policy_that_requires_no_firewall_is_a_successful_no_op() {
+        // Default-allow, no host lists, no proxy: the one policy shape that asks
+        // for no filtering at all. The gate must report it as a clean no-op and
+        // install nothing -- observed through the fake, which records every
+        // command an apply would have issued.
+        let fake = test_firewall::install();
         let mut manager = NetworkIptablesManager::new("skip-noop");
         manager.set_veth_interface("veth-skip");
-        let policy = policy_with_enforcement_mode(NetworkEnforcementMode::Capabilities);
+        let policy = ContainerPolicy {
+            default_network_policy: NetworkPolicy::Allow,
+            ..Default::default()
+        };
         let mut logger = Logger::new(Mode::Buffer);
 
         let result = manager.apply_firewall_rules(&policy, &mut logger);
@@ -5075,92 +5049,83 @@ mod tests {
         assert_eq!(
             result,
             Ok(true),
-            "a policy that does not use firewall enforcement must be reported as a successful no-op"
+            "a policy that requires no firewall must be reported as a successful no-op"
         );
         assert!(
             !manager.rules_applied(),
             "a no-op firewall skip must leave no rules marked as applied"
         );
+        assert!(
+            fake.issued().is_empty(),
+            "a no-op must not issue a single command, got: {:?}",
+            fake.issued()
+        );
     }
 
     #[test]
-    fn every_enforcement_mode_takes_the_contractual_firewall_gate() {
-        for (mode, uses_firewall) in enforcement_modes_with_firewall_contract() {
-            assert_eq!(
-                NetworkIptablesManager::enforcement_mode_uses_firewall(&mode),
-                uses_firewall,
-                "{mode:?} firewall-gate predicate mismatch"
-            );
-        }
-    }
-
-    // The JSON parser rejects proxy-under-capabilities, but it is not the only
-    // way in: `LxcScriptRunner::execute` and `mxc_engine::run` take an
-    // already-built `ExecutionRequest`. Skipping here would report success for
-    // an enforcement that never happened, while the runner still injects the
-    // proxy environment -- a container that advertises a proxy and restricts
-    // nothing.
-    #[test]
-    fn a_proxy_under_a_non_firewall_mode_is_refused_rather_than_skipped() {
-        // `Capabilities` is the only mode the firewall gate rejects, and it is
-        // also `NetworkEnforcementMode`'s `Default` -- so this is what a policy
-        // built in code gets when nobody sets the field at all.
-        let mut policy = policy_with_enforcement_mode(NetworkEnforcementMode::Capabilities);
-        policy.network_proxy = ProxyConfig {
-            address: Some(ProxyAddress::new("10.0.0.5".to_string(), 3128)),
-            builtin_test_server: false,
-        };
-        let mut manager = NetworkIptablesManager::new("proxy-gate");
+    fn a_default_block_policy_installs_rules_without_an_enforcement_mode() {
+        // The core behavior change, seen through the commands: the struct
+        // default is `block`, and with the mode gone that alone must drive an
+        // install. Before the change this policy took the no-op path and the
+        // container reached the whole internet.
+        let fake = test_firewall::install();
+        let mut manager = NetworkIptablesManager::new("default-block");
+        manager.set_veth_interface("veth-block0");
+        let policy = ContainerPolicy::default();
         let mut logger = Logger::new(Mode::Buffer);
 
         let result = manager.apply_firewall_rules(&policy, &mut logger);
 
-        let error = result.expect_err(
-            "a proxy under an enforcement mode that installs no rules must not report success",
+        assert!(
+            result.is_ok(),
+            "a default-block policy must apply, got: {:?}",
+            result
         );
         assert!(
-            error.contains("enforcementMode"),
-            "the error must name the setting that has to change; got: {error}"
-        );
-        assert!(
-            !manager.rules_applied(),
-            "a refused apply must leave no rules marked as applied"
+            fake.issued().contains(&strings(&[
+                "iptables",
+                "-N",
+                &chain_name_for("default-block")
+            ])),
+            "a default-block policy must create the filtering chain, got: {:?}",
+            fake.issued()
         );
     }
 
-    // `builtin_test_server` enables the proxy without an address, and it takes
-    // the same injection path, so the gate cannot key on the address alone.
     #[test]
-    fn the_builtin_test_server_proxy_is_gated_the_same_way() {
-        let mut policy = policy_with_enforcement_mode(NetworkEnforcementMode::Capabilities);
-        policy.network_proxy = ProxyConfig {
-            address: None,
-            builtin_test_server: true,
+    fn an_explicit_capabilities_mode_installs_the_same_rules_as_omitting_it() {
+        // `enforcementMode` is now parsed and ignored: an explicit
+        // `capabilities` must produce exactly the commands an omitted mode does,
+        // never fewer. A caller may get more enforcement than asked for, never
+        // less.
+        let restriction = ContainerPolicy {
+            blocked_hosts: vec!["203.0.113.9".to_string()],
+            ..Default::default()
         };
-        let mut manager = NetworkIptablesManager::new("builtin-gate");
-        let mut logger = Logger::new(Mode::Buffer);
+        let explicit = ContainerPolicy {
+            network_enforcement_mode: NetworkEnforcementMode::Capabilities,
+            ..restriction.clone()
+        };
 
-        assert!(
-            manager.apply_firewall_rules(&policy, &mut logger).is_err(),
-            "an address-free proxy is still a proxy and must not be silently unenforced"
-        );
-    }
-
-    // The refusal must be narrow: without a proxy there is nothing to leave
-    // unenforced, so `capabilities` remains an ordinary supported mode.
-    #[test]
-    fn a_proxy_free_policy_still_skips_cleanly_under_capabilities() {
-        let policy = policy_with_enforcement_mode(NetworkEnforcementMode::Capabilities);
-        let mut manager = NetworkIptablesManager::new("no-proxy-skip");
-        let mut logger = Logger::new(Mode::Buffer);
+        let issued_for = |policy: &ContainerPolicy| -> Vec<Vec<String>> {
+            let fake = test_firewall::install();
+            let mut manager = NetworkIptablesManager::new("mode-parity");
+            manager.set_veth_interface("veth-parity0");
+            let mut logger = Logger::new(Mode::Buffer);
+            let _ = manager.apply_firewall_rules(policy, &mut logger);
+            fake.issued()
+        };
 
         assert_eq!(
-            manager.apply_firewall_rules(&policy, &mut logger),
-            Ok(true),
-            "capabilities mode without a proxy must stay a successful no-op"
+            issued_for(&explicit),
+            issued_for(&restriction),
+            "an explicit capabilities mode must issue the same commands as omitting it"
         );
     }
 
+    /// Build a policy carrying the given enforcement mode over the struct
+    /// defaults. The default policy is `block`, so every mode this produces
+    /// requires the firewall -- the tests below use it to drive a real install.
     fn policy_with_enforcement_mode(
         network_enforcement_mode: NetworkEnforcementMode,
     ) -> ContainerPolicy {
@@ -5169,16 +5134,6 @@ mod tests {
             ..Default::default()
         }
     }
-
-    /// The expected answers are written out as literals rather than derived from
-    /// a second copy of the predicate. A test that recomputes the contract it is
-    /// checking passes even when both copies are wrong in the same way.
-    fn enforcement_modes_with_firewall_contract() -> [(NetworkEnforcementMode, bool); 3] {
-        use NetworkEnforcementMode::{Both, Capabilities, Firewall};
-
-        [(Capabilities, false), (Firewall, true), (Both, true)]
-    }
-
     // -----------------------------------------------------------------------
     // Spec-derived tests: ip6tables status
     // -----------------------------------------------------------------------

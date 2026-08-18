@@ -117,37 +117,22 @@ export interface LxcProvisionConfig {
  *   `network` object. Rust's `wire::Network` is `deny_unknown_fields`, so
  *   sending it fails the whole request.
  * - `allowLocalNetwork` deserializes, but start rejects
- *   `allowLocalNetwork: true` with a policy-validation error whatever the
- *   enforcement mode (`src/backends/lxc/common/src/state_aware.rs:322`). The
- *   container's inbound chain can only open a source range, and opening every
- *   source is broader than the local-network access requested.
- * - `enforcementMode` is restricted to the firewall modes.  LXC has no
- *   capability-based network enforcement, so `'capabilities'` cannot enforce
- *   anything.
- *
- * Whether a given policy *needs* a firewall mode is deliberately not expressed
- * here.  `requires_firewall_enforcement`
- * (`src/backends/lxc/common/src/state_aware.rs:249`) turns on whether
- * `allowedHosts` and `blockedHosts` are *empty*, which TypeScript cannot see:
- * a `string[]` assembled at run time may hold a restriction or none.  A type
- * that tried to mirror that predicate both rejected configurations the backend
- * accepts and admitted ones it refuses, so the rule lives where it can
- * actually be evaluated.  Omit `enforcementMode` on a policy carrying a
- * restriction and start fails with a policy-validation error naming the fix
- * (`reject_unenforceable_network_policy`, state_aware.rs:309).
+ *   `allowLocalNetwork: true` with a policy-validation error
+ *   (`reject_unenforceable_network_policy`). The container's inbound chain can
+ *   only open a source range, and opening every source is broader than the
+ *   local-network access requested.
+ * - `enforcementMode` is accepted, parsed, and ignored.  LXC enforces from
+ *   `defaultPolicy`, `allowedHosts`, and `blockedHosts` alone, so no
+ *   combination of this field with those is worth rejecting here.
  */
 export interface LxcNetworkConfig {
-  /** LXC enforces network policy only via iptables. */
-  enforcementMode?: 'firewall' | 'both';
-  /**
-   * An explicit `'block'` is a restriction, so start refuses it without a
-   * firewall mode rather than let the container run believing it is
-   * default-deny while no iptables rule enforces that.
-   */
+  /** Accepted, parsed, and ignored by LXC. */
+  enforcementMode?: NetworkConfig['enforcementMode'];
+  /** Enforced by LXC regardless of `enforcementMode`. */
   defaultPolicy?: NetworkConfig['defaultPolicy'];
-  /** A non-empty list is a restriction and requires `enforcementMode`. */
+  /** Enforced by LXC regardless of `enforcementMode`. */
   allowedHosts?: NetworkConfig['allowedHosts'];
-  /** A non-empty list is a restriction and requires `enforcementMode`. */
+  /** Enforced by LXC regardless of `enforcementMode`. */
   blockedHosts?: NetworkConfig['blockedHosts'];
 }
 

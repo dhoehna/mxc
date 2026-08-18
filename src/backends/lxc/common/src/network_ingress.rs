@@ -57,7 +57,7 @@
 use std::process::Command;
 
 use wxc_common::logger::Logger;
-use wxc_common::models::{ContainerPolicy, NetworkEnforcementMode};
+use wxc_common::models::ContainerPolicy;
 
 use crate::network_iptables::{
     ingress_chain_name_for, HostIpv6State, Ip6tablesStatus, NetworkIptablesManager,
@@ -158,7 +158,7 @@ pub struct IngressManager {
     /// `/proc/<pid>/net/if_inet6`, which names the same namespace by PID
     /// without entering it. A caller that cannot supply a PID must not
     /// construct an `IngressManager` at all. See `lxc_runner`, which aborts the
-    /// run when a firewall mode is requested but no init PID can be found.
+    /// run when no init PID can be found.
     netns_pid: u32,
     /// Per-resource ownership. What we actually created or hooked, tracked
     /// separately per family, so teardown attempts only the operations this run
@@ -505,17 +505,8 @@ impl IngressManager {
         policy: &ContainerPolicy,
         logger: &mut Logger,
     ) -> Result<bool, String> {
-        // Skip if network enforcement doesn't use a firewall.
-        let use_firewall = matches!(
-            policy.network_enforcement_mode,
-            NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-        );
-        if !use_firewall {
-            logger.log_line(
-                "Network enforcement mode does not use firewall, skipping ingress chain.",
-            );
-            return Ok(true);
-        }
+        // Gating this on the egress policy would stop installing an inbound
+        // deny for a permissive-egress config that gets one today.
 
         // Permissive host-loopback inbound (`allowLocalNetwork: true`) is not
         // yet implementable safely. Scoping it to host loopback needs a schema
@@ -1838,12 +1829,12 @@ mod tests {
         );
     }
 
-    /// A firewall-mode policy with `allowLocalNetwork: true`.
-    fn permissive_firewall_policy() -> ContainerPolicy {
+    /// A policy with `allowLocalNetwork: true`. Ingress ignores
+    /// `enforcementMode`, so the mode is left at its default.
+    fn permissive_policy() -> ContainerPolicy {
         ContainerPolicy {
             allow_local_network: true,
             default_network_policy: NetworkPolicy::Block,
-            network_enforcement_mode: NetworkEnforcementMode::Firewall,
             ..Default::default()
         }
     }
@@ -1859,7 +1850,7 @@ mod tests {
         // The PID value is irrelevant: the refusal precedes every use of it.
         for pid in [1u32, 42u32, 999_999u32] {
             let mut mgr = IngressManager::new("permissive-container", pid);
-            let result = mgr.apply_firewall_rules(&permissive_firewall_policy(), &mut logger);
+            let result = mgr.apply_firewall_rules(&permissive_policy(), &mut logger);
             assert!(
                 result.is_err(),
                 "allowLocalNetwork: true must be refused (pid={pid})"

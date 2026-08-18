@@ -9,7 +9,6 @@ import {
   ExecConfigFor,
   IsolationSessionProvisionConfig,
   IsolationSessionStartConfig,
-  LxcNetworkConfig,
   ProvisionMetadataFor,
   ProvisionResult,
   SandboxId,
@@ -275,43 +274,23 @@ describe('LxcStartConfig', () => {
     assert.ok(cfg);
   });
 
-  it("rejects enforcementMode 'capabilities', which LXC cannot implement", () => {
+  it("accepts enforcementMode 'capabilities', which LXC now parses and ignores", () => {
     const cfg: StartConfigFor<'lxc'> = {
       network: {
-        // @ts-expect-error — LXC enforces network policy only via iptables.
         enforcementMode: 'capabilities',
       },
     };
-    assert.ok(cfg);
+    assert.strictEqual(cfg.network?.enforcementMode, 'capabilities');
   });
 
-  it('leaves the mode/restriction rule to start, which is where it can be evaluated', () => {
-    // `requires_firewall_enforcement` turns on whether the host lists are empty
-    // (src/backends/lxc/common/src/state_aware.rs:249), and a `string[]`
-    // assembled at run time has no compile-time length.  Every policy below
-    // must therefore type check; a restrictive one without `enforcementMode` is
-    // refused at start by `reject_unenforceable_network_policy`
-    // (state_aware.rs:309), covered by the Rust test
-    // `capabilities_mode_cannot_carry_lxc_network_restrictions`.
-    const restrictive: LxcNetworkConfig[] = [
-      { defaultPolicy: 'block' },
-      { allowedHosts: ['example.com'] },
-      { blockedHosts: ['blocked.example.com'] },
-    ];
-
-    // Not restrictions, so they run without a firewall mode.  The policy-free
-    // start is the one run_lxc_state_aware_test.sh exercises.
-    const permitted: LxcNetworkConfig[] = [
-      { defaultPolicy: 'allow' },
-      {},
-      { allowedHosts: [] },
-      { blockedHosts: [] },
-    ];
-
-    assert.deepStrictEqual(restrictive[0], { defaultPolicy: 'block' });
-    assert.deepStrictEqual(restrictive[1], { allowedHosts: ['example.com'] });
-    assert.deepStrictEqual(permitted[1], {});
-    assert.deepStrictEqual(permitted[2], { allowedHosts: [] });
+  it('accepts a restrictive policy without enforcementMode, which LXC now enforces regardless', () => {
+    // Enforcement no longer depends on enforcementMode (see LxcNetworkConfig's
+    // doc comment) — a restriction type-checks and is honored whether or not
+    // enforcementMode accompanies it.
+    const cfg: StartConfigFor<'lxc'> = {
+      network: { defaultPolicy: 'block', allowedHosts: ['example.com'] },
+    };
+    assert.strictEqual(cfg.network?.defaultPolicy, 'block');
   });
 });
 
