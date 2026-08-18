@@ -28,7 +28,6 @@ import {
   nonExecCall,
   spawnAndCollect,
   tryParseErrorEnvelope,
-  tryParseErrorEnvelopeFromLines,
 } from './state-aware-helper.js';
 
 /**
@@ -190,11 +189,12 @@ export async function execInSandboxAsync<C extends StateAwareContainmentBackend>
     // timeout is a dispatch failure raised *after* the script has streamed
     // output, so that gate would drop the envelope for a killed script and hand
     // the caller an ordinary result for a run that never finished. The
-    // narrowing that keeps a script's own output from being misread lives in
-    // `tryParseErrorEnvelopeFromLines`, which considers only the last non-empty
-    // line.
+    // narrowing that keeps a script's own output from being misread is reading
+    // only the last non-empty line: a genuine dispatch failure ends the stream
+    // with its envelope, because the executor writes its diagnostic buffer,
+    // then the envelope, then exits.
     const errorEnvelope = backendKey === 'lxc'
-      ? tryParseErrorEnvelopeFromLines(stderr)
+      ? tryParseErrorEnvelope(stderr.trimEnd().split('\n').pop() ?? '')
       : tryParseErrorEnvelope(stdout);
     if (errorEnvelope) {
       throw mxcErrorFromEnvelope(errorEnvelope.error);

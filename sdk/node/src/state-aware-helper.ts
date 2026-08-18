@@ -187,44 +187,6 @@ export function tryParseErrorEnvelope(stdout: string): WireErrorEnvelope | null 
   return null;
 }
 
-/**
- * Attempts to find an `{error}` envelope at the end of `stderr`.
- *
- * A streaming exec cannot put its error envelope on stdout, because stdout is
- * carrying the container's raw output by then, so the executor writes it to
- * stderr instead. Whole-string parsing is no use there: stderr also carries the
- * flushed diagnostic buffer, so the envelope is one line among several rather
- * than the entire stream.
- *
- * Only the last non-empty line is considered, and only when it is a well-formed
- * envelope. That narrowness is what keeps an ordinary diagnostic line that
- * happens to be JSON from being read as a dispatch failure. A genuine dispatch
- * failure always ends the stream with its envelope, because the executor emits
- * the diagnostic buffer, then the envelope, then exits.
- *
- * The guest's own output is not a hazard on this channel *for LXC*, which is
- * the only backend whose executor reserves stderr for the envelope: its
- * streaming exec runs the guest on a pty whose primary end is relayed to the
- * executor's *stdout*, so guest stderr is merged into stdout and never reaches
- * this stream. Callers must therefore not additionally require stdout to be
- * empty — a script timeout produces both a full stdout and an envelope here.
- *
- * That reasoning is backend-specific and does not generalize. The Windows
- * Sandbox executor forwards guest `FrameKind::Stderr` frames straight to this
- * stream (`backends/windows_sandbox/lifecycle/src/state_aware.rs:408-414`), so
- * there the last non-empty stderr line can be the script's own. Callers must
- * apply this only to backends that own the channel; see `execInSandboxAsync`.
- */
-export function tryParseErrorEnvelopeFromLines(stderr: string): WireErrorEnvelope | null {
-  const lines = stderr.split('\n');
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const trimmed = lines[i].trim();
-    if (trimmed === '') continue;
-    return tryParseErrorEnvelope(trimmed);
-  }
-  return null;
-}
-
 // --- Spawn injection (test-only) ---
 
 export type SpawnImpl = (cmd: string, args: string[], opts: unknown) => unknown;
