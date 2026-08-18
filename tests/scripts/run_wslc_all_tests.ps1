@@ -216,22 +216,34 @@ $null = $results.Add((Run-WslcTest "wslc_large_output.json"))
 
 Write-Host "`n--- Filesystem Tests ---" -ForegroundColor Cyan
 
-# Seed the readonly fixture the same way the LXC and bubblewrap suites do
-# (run_lxc_filesystem_test.sh:21, run_bwrap_filesystem_test.sh:25).  Without
-# this, wslc_readonly_mount.json cats a file that was never created and fails
-# for a missing fixture rather than for a mount defect.
-$readonlyFixtureDir = "C:\workspace"
-$readonlyFixture = Join-Path $readonlyFixtureDir "test.txt"
-if (-not (Test-Path $readonlyFixtureDir))
-{
-    $null = New-Item -ItemType Directory -Path $readonlyFixtureDir -Force
-}
-Set-Content -Path $readonlyFixture -Value "test content" -Encoding ascii
-
 # wslc_filesystem.json also asserts cpuCount + memoryMb enforcement via nproc and /proc/meminfo.
 $null = $results.Add((Run-WslcTest "wslc_filesystem.json" `
     -OutputMatches "(?s)PASS: filesystem mount visible.*PASS: cpuCount enforced.*PASS: memoryMb enforced"))
-$null = $results.Add((Run-WslcTest "wslc_readonly_mount.json" -OutputContains "Read succeeded"))
+
+# Fixed paths must match tests\configs\wslc_readonly_mount.json.
+$readonlyFixtureDir = "C:\wslcro"
+$readonlyFixture = Join-Path $readonlyFixtureDir "test.txt"
+
+function Remove-ReadonlyFixture {
+    Remove-Item -Recurse -Force $readonlyFixtureDir -ErrorAction SilentlyContinue
+}
+
+# Seed the readonly fixture the same way the LXC and bubblewrap suites do
+# (run_lxc_filesystem_test.sh:21, run_bwrap_filesystem_test.sh:25).  Without
+# this, wslc_readonly_mount.json cats a file that was never created and fails
+# for a missing fixture rather than for a mount defect.  The root is test-only
+# and removed in the finally, so a developer's C:\workspace -- which the
+# prerequisites above tell them to fill with alpine.tar -- is never written to,
+# and a mount that is wrongly writable does not leave its probe file behind.
+Remove-ReadonlyFixture
+try {
+    $null = New-Item -ItemType Directory -Path $readonlyFixtureDir -Force
+    Set-Content -Path $readonlyFixture -Value "test content" -Encoding ascii
+
+    $null = $results.Add((Run-WslcTest "wslc_readonly_mount.json" -OutputContains "Read succeeded"))
+} finally {
+    Remove-ReadonlyFixture
+}
 
 Write-Host "`n--- Object Validation Tests ---" -ForegroundColor Cyan
 # Object-based validation (roadmap D6): a directory under readwritePaths and a
