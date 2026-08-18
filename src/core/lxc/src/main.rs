@@ -12,7 +12,7 @@ use wxc_common::models::{ExecutionRequest, ScriptResponse};
 use wxc_common::mxc_error::{MxcError, ResponseEnvelope};
 use wxc_common::script_runner::handle_dry_run_exit;
 use wxc_common::state_aware_dispatch::DispatchOutcome;
-use wxc_common::state_aware_request::{MxcRequest, ParsedStateAwareRequest, Phase};
+use wxc_common::state_aware_request::{MxcRequest, ParsedStateAwareRequest};
 use wxc_common::telemetry;
 
 use lxc_common::signal_cleanup;
@@ -139,14 +139,6 @@ fn run_state_aware_main(
     parsed.request.testing_features_enabled = testing_features;
     parsed.request.dry_run = dry_run;
 
-    // A non-dry-run exec streams the container's raw output straight to this
-    // process's stdout (the PTY relay in the exec phase), so for that phase
-    // stdout is no longer a clean JSON channel. A dispatch error must not print
-    // its envelope there: a consumer parsing stdout as JSON would find the
-    // envelope glued onto the tail of the streamed output. Capture the decision
-    // here, before `parsed` is moved into the telemetry-wrapped dispatch.
-    let exec_streams_stdout = matches!(parsed.phase, Phase::Exec) && !dry_run;
-
     // Shares the `wxc` executor's telemetry / correlation-vector orchestration
     // rather than calling dispatch directly, so a Linux lifecycle emits the same
     // events, carries the same MS-CV, and installs the same crash hook.
@@ -171,16 +163,7 @@ fn run_state_aware_main(
         }
         Ok(DispatchOutcome::ExecCompleted { exit_code }) => process::exit(exit_code),
         Err(e) => {
-            // For a streaming exec the envelope goes to stderr so it stays
-            // unambiguously separable from the raw output already written to
-            // stdout. Every other phase keeps stdout as its single client-facing
-            // channel, matching the success envelope.
-            let envelope = error_envelope_string(&e);
-            if exec_streams_stdout {
-                eprintln!("{}", envelope);
-            } else {
-                println!("{}", envelope);
-            }
+            println!("{}", error_envelope_string(&e));
             process::exit(1);
         }
     }
@@ -189,10 +172,8 @@ fn run_state_aware_main(
 /// Serialise `error` to its JSON response-envelope string, including the
 /// last-resort fallback for when the envelope itself fails to serialise.
 ///
-/// Which channel it goes to is the caller's decision, and the callers disagree
-/// on purpose: a non-exec phase writes it to stdout, a streaming exec writes it
-/// to stderr because the guest owns stdout by then, and a parse failure writes
-/// it to both because the phase is exactly what could not be determined.
+/// Every caller writes it to stdout, which the cross-backend contract (§7.3)
+/// reserves for the response envelope in every phase.
 fn error_envelope_string(error: &MxcError) -> String {
     let envelope: ResponseEnvelope<()> = ResponseEnvelope::from_error(error);
     serde_json::to_string(&envelope).unwrap_or_else(|_| {
@@ -310,21 +291,8 @@ fn main() {
             process::exit(1);
         }
         Err(ParseError::StateAware(e)) => {
-            // Parsing is what failed, so the phase is not known here -- an exec
-            // request that names an unsupported version never reaches the point
-            // where the phase is read. The two phases read different channels:
-            // non-exec calls parse stdout, and exec calls parse stderr because
-            // an LXC guest owns stdout once it is running. So the envelope goes
-            // to both, and whichever caller this was finds it on the channel it
-            // trusts. Nothing has run in a container yet, so neither copy is
-            // competing with guest output.
-            //
-            // The stderr copy lands last because the exec-side reader considers
-            // only the final non-empty line.
-            let envelope = error_envelope_string(&e);
-            println!("{}", envelope);
+            println!("{}", error_envelope_string(&e));
             eprint!("{}", logger.get_buffer());
-            eprintln!("{}", envelope);
             process::exit(1);
         }
     };

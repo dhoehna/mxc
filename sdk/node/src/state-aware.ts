@@ -168,34 +168,10 @@ export async function execInSandboxAsync<C extends StateAwareContainmentBackend>
   const { stdout, stderr, exitCode } = await spawnAndCollect(envelope, options);
 
   if (exitCode !== 0) {
-    // A dispatch failure lands on the channel that backend's executor owns,
-    // and the other channel carries guest output that must not be read as
-    // protocol data.
-    //
-    // For LXC the owned channel is stderr, and only stderr. Its streaming exec
-    // puts the guest on a pty whose primary end is relayed to the executor's
-    // stdout, so guest stdout *and* guest stderr both arrive here as stdout and
-    // the only writer to stderr is the executor. Parsing stdout as well let a
-    // script whose complete stdout was a valid `{error}` document and which
-    // exited nonzero forge any error code the SDK surfaces -- whole-string
-    // parsing cannot tell that document from the executor's own.
-    //
-    // Windows Sandbox is the mirror image: it forwards guest
-    // `FrameKind::Stderr` frames straight through
-    // (`backends/windows_sandbox/lifecycle/src/state_aware.rs:408-414`), so
-    // there stderr is the untrusted channel and stdout stays authoritative.
-    //
-    // Within LXC, do not additionally gate on stdout being empty. A script
-    // timeout is a dispatch failure raised *after* the script has streamed
-    // output, so that gate would drop the envelope for a killed script and hand
-    // the caller an ordinary result for a run that never finished. The
-    // narrowing that keeps a script's own output from being misread is reading
-    // only the last non-empty line: a genuine dispatch failure ends the stream
-    // with its envelope, because the executor writes its diagnostic buffer,
-    // then the envelope, then exits.
-    const errorEnvelope = backendKey === 'lxc'
-      ? tryParseErrorEnvelope(stderr.trimEnd().split('\n').pop() ?? '')
-      : tryParseErrorEnvelope(stdout);
+    // The cross-backend contract (§7.3) reserves stdout for the response
+    // envelope in every phase, so a dispatch failure is always found there and
+    // no backend needs its own channel rule.
+    const errorEnvelope = tryParseErrorEnvelope(stdout);
     if (errorEnvelope) {
       throw mxcErrorFromEnvelope(errorEnvelope.error);
     }

@@ -438,16 +438,14 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
     );
   });
 
-  it('throws the typed MxcError when a streaming exec reports its dispatch failure on stderr', async () => {
-    // A streaming exec has already written the container's raw output to
-    // stdout, so the executor puts its error envelope on stderr instead
-    // (src/core/lxc/src/main.rs). Parsing stdout alone turned every such
-    // dispatch failure into an ordinary exit-1 ExecResult, so callers saw a
-    // script that "ran and failed" rather than a sandbox that was never
-    // started.
+  it('throws the typed MxcError on an LXC dispatch failure with diagnostics on stderr', async () => {
+    // Channel separation, per the cross-backend contract (§7.3): the executor
+    // flushes its buffered diagnostics to stderr and writes exactly one
+    // envelope to stdout. stderr is informational and is never parsed, so the
+    // buffer cannot shadow the envelope no matter how many lines it runs to.
     const fake = fakeSpawn({
-      stdout: '',
-      stderr: '{"error":{"code":"not_started","message":"sandbox is not started"}}\n',
+      stdout: '{"error":{"code":"not_started","message":"sandbox is not started"}}\n',
+      stderr: 'lxc: preparing container\nlxc: policy validated\n',
       exitCode: 1,
     });
     _setSpawnImpl(fake.spawn);
@@ -458,90 +456,31 @@ describe('execInSandboxAsync', { skip: platformSkip }, () => {
     );
   });
 
-  it('finds the error envelope on stderr even behind the flushed diagnostic buffer', async () => {
-    // The executor flushes its buffered log to stderr before the envelope, so
-    // stderr is several lines and whole-string JSON parsing never matches.
-    const fake = fakeSpawn({
-      stdout: '',
-      stderr:
-        'lxc: preparing container\nlxc: policy validated\n' +
-        '{"error":{"code":"not_started","message":"sandbox is not started"}}\n',
-      exitCode: 1,
-    });
-    _setSpawnImpl(fake.spawn);
-    const id = 'lxc:prov-1' as SandboxId<'lxc'>;
-    await assert.rejects(
-      () => execInSandboxAsync(id, { process: { commandLine: 'echo' } }, testOptions()),
-      (err: unknown) => err instanceof MxcError && err.code === 'not_started',
-    );
-  });
-
-  it('throws when a script that already produced output is killed by its timeout', async () => {
-    // A script timeout is a dispatch failure raised *after* the script has
-    // streamed its output, so stdout is non-empty and the envelope is on
-    // stderr. Requiring stdout to be empty before reading stderr dropped this
-    // envelope and handed the caller an ordinary ExecResult -- a run that was
-    // killed mid-flight, reported as one that finished with exit code 3.
+  it('returns an ExecResult when a script is killed by its timeout after streaming output', async () => {
+    // Characterization, not an endorsement. §7.3 models exec as "either the
+    // script's output (success) or exactly one envelope (failure)", but a
+    // timeout is a dispatch failure raised *after* the script has streamed, so
+    // stdout holds both and whole-string parsing matches neither. The caller
+    // still sees a nonzero exit, but not the typed reason for it.
     //
-    // This is an LXC id because LXC is the backend whose executor owns stderr:
-    // its streaming exec puts the guest on a pty whose primary end is relayed
-    // to the executor's stdout (mxc_pty run_with_pty), so guest stderr is
-    // merged into stdout and cannot appear here.
+    // Every state-aware backend shares this: the executors all write the
+    // envelope to the same stdout the guest streamed to. Pinning it here means
+    // closing the contract gap has to be a deliberate change, not a silent one.
     const fake = fakeSpawn({
-      stdout: 'partial output before the kill\n',
-      stderr:
-        'diagnostic: attaching to container\n' +
+      stdout:
+        'partial output before the kill\n' +
         '{"error":{"code":"backend_error","message":"Execution failed: script timed out after 5000ms"}}\n',
+      stderr: 'diagnostic: attaching to container\n',
       exitCode: 3,
     });
     _setSpawnImpl(fake.spawn);
     const id = 'lxc:abc' as SandboxId<'lxc'>;
-    await assert.rejects(
-      execInSandboxAsync(id, { process: { commandLine: 'slow' } }, testOptions()),
-      (err: Error) => err.message.includes('script timed out after 5000ms'),
-    );
-  });
-
-  it('does not treat an envelope buried mid-stderr as a dispatch failure', async () => {
-    // A genuine dispatch failure ends the stream with its envelope, because the
-    // executor writes the diagnostic buffer, then the envelope, then exits.
-    // Anything still writing afterwards is the guest, so the envelope was the
-    // guest's too.
-    const fake = fakeSpawn({
-      stdout: '',
-      stderr:
-        '{"error":{"code":"not_started","message":"printed by the script"}}\n' +
-        'script kept going after printing that\n',
-      exitCode: 4,
-    });
-    _setSpawnImpl(fake.spawn);
-    const id = 'lxc:abc' as SandboxId<'lxc'>;
     const result = await execInSandboxAsync(
       id,
-      { process: { commandLine: 'noisy' } },
+      { process: { commandLine: 'slow' } },
       testOptions(),
     );
-    assert.strictEqual(result.exitCode, 4);
-  });
-
-  it('does not read guest stdout as an error envelope for LXC', async () => {
-    // LXC relays the guest on a pty whose primary end becomes the executor's
-    // stdout, so everything on this channel is the guest's. Whole-string
-    // parsing it as protocol data let a script whose complete stdout was a
-    // valid error document and which exited nonzero be thrown to the caller as
-    // that error -- the guest choosing any code the SDK surfaces. The
-    // windows_sandbox case above is the control: there the executor does own
-    // stdout, so it stays authoritative.
-    const forged = '{"error":{"code":"not_started","message":"printed by the script"}}';
-    const fake = fakeSpawn({ stdout: forged, stderr: '', exitCode: 1 });
-    _setSpawnImpl(fake.spawn);
-    const id = 'lxc:abc' as SandboxId<'lxc'>;
-    const result = await execInSandboxAsync(
-      id,
-      { process: { commandLine: 'forge' } },
-      testOptions(),
-    );
-    assert.deepStrictEqual(result, { stdout: forged, stderr: '', exitCode: 1 });
+    assert.strictEqual(result.exitCode, 3);
   });
 
   it('does not read stderr as an envelope for backends that relay the guest there', async () => {
