@@ -233,7 +233,6 @@ describe('LxcStartConfig', () => {
       version: '0.6.0-alpha',
       filesystem: { readwritePaths: ['/workspace'] },
       network: {
-        enforcementMode: 'firewall',
         defaultPolicy: 'block',
         allowedHosts: ['example.com'],
         blockedHosts: ['blocked.example.com'],
@@ -274,19 +273,17 @@ describe('LxcStartConfig', () => {
     assert.ok(cfg);
   });
 
-  it("accepts enforcementMode 'capabilities', which LXC now parses and ignores", () => {
+  it('rejects enforcementMode, which LXC never consults', () => {
     const cfg: StartConfigFor<'lxc'> = {
       network: {
+        // @ts-expect-error — enforcement follows the policy, not the mode.
         enforcementMode: 'capabilities',
       },
     };
-    assert.strictEqual(cfg.network?.enforcementMode, 'capabilities');
+    assert.ok(cfg);
   });
 
-  it('accepts a restrictive policy without enforcementMode, which LXC now enforces regardless', () => {
-    // Enforcement no longer depends on enforcementMode (see LxcNetworkConfig's
-    // doc comment) — a restriction type-checks and is honored whether or not
-    // enforcementMode accompanies it.
+  it('enforces a restrictive policy from the policy fields alone', () => {
     const cfg: StartConfigFor<'lxc'> = {
       network: { defaultPolicy: 'block', allowedHosts: ['example.com'] },
     };

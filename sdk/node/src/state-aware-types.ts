@@ -121,18 +121,15 @@ export interface LxcProvisionConfig {
  *   (`reject_unenforceable_network_policy`). The container's inbound chain can
  *   only open a source range, and opening every source is broader than the
  *   local-network access requested.
- * - `enforcementMode` is accepted, parsed, and ignored.  LXC enforces from
- *   `defaultPolicy`, `allowedHosts`, and `blockedHosts` alone, so no
- *   combination of this field with those is worth rejecting here.
+ * - `enforcementMode` is not offered.  LXC enforces from `defaultPolicy`,
+ *   `allowedHosts`, and `blockedHosts` alone (`apply_firewall_rules` never
+ *   consults the mode), so exposing it would advertise a setting with no
+ *   effect.  The wire still accepts the field, so a `network` object shared
+ *   with another backend keeps parsing.
  */
 export interface LxcNetworkConfig {
-  /** Accepted, parsed, and ignored by LXC. */
-  enforcementMode?: NetworkConfig['enforcementMode'];
-  /** Enforced by LXC regardless of `enforcementMode`. */
   defaultPolicy?: NetworkConfig['defaultPolicy'];
-  /** Enforced by LXC regardless of `enforcementMode`. */
   allowedHosts?: NetworkConfig['allowedHosts'];
-  /** Enforced by LXC regardless of `enforcementMode`. */
   blockedHosts?: NetworkConfig['blockedHosts'];
 }
 
