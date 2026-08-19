@@ -112,8 +112,11 @@
 //! `stop`, `deprovision` (and a dry run of any phase) — taking the wire-format
 //! request JSON and returning the response-envelope JSON. [`exec_sandbox`] runs
 //! the `exec` phase as a live streaming [`Sandbox`], the same handle
-//! [`spawn_sandbox`] returns. The only in-tree state-aware backend
-//! (IsolationSession) is Windows-only and needs its OS-side service.
+//! [`spawn_sandbox`] returns. Three backends implement the lifecycle —
+//! IsolationSession, WSLc and Windows Sandbox, all Windows-only — but only
+//! IsolationSession serves a streaming `exec` in-process; see [`exec_sandbox`]
+//! for what the other two return there, and the crate README for how each one
+//! is compiled in.
 //!
 //! ## No pty
 //!
@@ -190,8 +193,19 @@ pub fn run(request: SandboxRequest) -> Result<Output, Error> {
 /// The request JSON is the same wire format the executor accepts (an object with
 /// a `phase` field). Errors (malformed request, unsupported phase, backend
 /// failures) come back as an [`Error`] with the matching [`ErrorCode`].
-pub fn run_state_aware_json(request_json: &str, dry_run: bool) -> Result<String, Error> {
-    mxc_engine::run_state_aware_json(request_json, dry_run)
+///
+/// `experimental` is the in-process equivalent of the executor's
+/// `--experimental` flag. The experimental backends — WindowsSandbox,
+/// IsolationSession and WSLc — are refused with
+/// [`ErrorCode::BackendUnavailable`] unless it is set, before any work is done.
+/// It is an API parameter rather than a field in the request JSON so that a
+/// config cannot grant itself experimental access.
+pub fn run_state_aware_json(
+    request_json: &str,
+    dry_run: bool,
+    experimental: bool,
+) -> Result<String, Error> {
+    mxc_engine::run_state_aware_json(request_json, dry_run, experimental)
 }
 
 /// Run the `exec` phase of a state-aware request (as a JSON string) as a **live
@@ -200,6 +214,15 @@ pub fn run_state_aware_json(request_json: &str, dry_run: bool) -> Result<String,
 ///
 /// The request JSON must be an `exec`-phase state-aware request (with a
 /// `sandboxId` identifying a started sandbox). No pty is allocated.
-pub fn exec_sandbox(request_json: &str) -> Result<Sandbox, Error> {
-    mxc_engine::exec_state_aware_json(request_json).map(Sandbox::new)
+///
+/// `experimental` opts in to the experimental backends, as for
+/// [`run_state_aware_json`]. **IsolationSession is the only backend that serves
+/// a streaming `exec` in-process**: the streaming dispatcher asks for
+/// `ExecConsumer::Library`, which WSLc refuses outright because it relays to the
+/// executor's stdio, and Windows Sandbox has no streaming arm at all
+/// (`unsupported_phase`). IsolationSession's arm additionally needs
+/// `mxc_engine/isolation_session`, which this crate does not forward yet — so
+/// today this entry point cannot return a live handle from a stock build.
+pub fn exec_sandbox(request_json: &str, experimental: bool) -> Result<Sandbox, Error> {
+    mxc_engine::exec_state_aware_json(request_json, experimental).map(Sandbox::new)
 }
