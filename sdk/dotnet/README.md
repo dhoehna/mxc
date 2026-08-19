@@ -36,6 +36,24 @@ catch (MxcException ex)
 }
 ```
 
+When the failure came from an underlying platform API, `MxcException` also
+carries which call failed and why: `Operation` names the call and `NativeCode`
+carries its status (e.g. `0x80070490`), with `Remediation` holding an
+actionable hint whenever the failure has one. `Operation` and `NativeCode` are
+`null` for failures raised before any API call. `ToString()` appends the
+operation and status, so logging the exception alone keeps the diagnosis:
+
+```csharp
+catch (MxcException ex) when (ex.Operation is not null)
+{
+    Console.Error.WriteLine($"{ex.Operation} failed with {ex.NativeCode}: {ex.Message}");
+    if (ex.Remediation is not null)
+    {
+        Console.Error.WriteLine($"  try: {ex.Remediation}");
+    }
+}
+```
+
 `MxcSandbox.RunAsync(policy, command)` offloads the blocking native call to the
 thread pool. `MxcSandbox.NativeVersion` returns the loaded `mxc_ffi` version.
 Optional feature outputs are returned through `RunResult.OutputMetadata`; for
@@ -44,13 +62,60 @@ generated JSON document and carries its summary. When ETL retention is enabled,
 `OutputMetadata.CaptureDenials.EtlPath` identifies the retained trace. If
 capture finalization fails after retaining the trace,
 `OutputMetadata.CaptureDenialsError` carries both the failure and its path.
-After deleting a retained ETL, also remove its now-empty per-run parent
-directory.
+Delete every reported ETL file after use. Do not delete its parent directory
+unless your application independently owns or positively recognizes that
+directory; it may be a shared location such as the system temporary directory
+or the configured output directory.
 
 `RunResult.Warnings` carries security warnings raised during the run — notably
 when `permissiveLearningMode` disabled deny-by-default. MXC never writes these
 to the host's stderr, so inspecting `Warnings` is the only way to learn that
 containment was relaxed.
+
+### Denial capture (Windows)
+
+Set `SandboxPolicy.CaptureDenials` to record Windows ProcessContainer accesses
+that the policy does not grant:
+
+```csharp
+var policy = new SandboxPolicy
+{
+    Version = "0.8.0-alpha",
+    CaptureDenials = new CaptureDenialsPolicy
+    {
+        // Block is the safe default: deny the access and record it.
+        // Allow records what would have been denied but relaxes containment.
+        Mode = CaptureDenialsMode.Block,
+        // Optional absolute destination. MXC inserts a per-run ID into the stem.
+        OutputPath = @"C:\logs\denials.json",
+        // Retained ETLs can contain sensitive paths and identifiers.
+        RetainEtl = false,
+    },
+};
+
+RunResult result = MxcSandbox.Run(policy, "cmd /c type C:\\blocked.txt");
+if (result.OutputMetadata?.CaptureDenials is { } capture)
+{
+    Console.WriteLine($"denials: {capture.OutputPath}");
+    Console.WriteLine($"unique denials: {capture.TotalDenials}");
+}
+
+foreach (string warning in result.Warnings)
+{
+    Console.Error.WriteLine(warning);
+}
+```
+
+`OutputPath`'s parent directory must already exist. When it is omitted, MXC
+uses a run-unique file in the system temporary directory. Delete every reported
+ETL file after use, including an ETL reported through
+`CaptureDenialsError.EtlPath`; do not delete its parent directory unless your
+application independently owns or positively recognizes that directory.
+`CaptureDenialsMode.Allow` intentionally weakens deny-by-default containment;
+always inspect `RunResult.Warnings`. Streaming processes currently do not
+expose warnings, so use `Run` or `RunAsync` when warning inspection is required.
+Linux and macOS accept the policy for cross-platform parity but do not act on
+it.
 
 ### Streaming
 

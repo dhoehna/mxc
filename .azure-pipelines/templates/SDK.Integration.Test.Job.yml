@@ -99,8 +99,8 @@ jobs:
       - ${{ if eq(target.os, 'linux') }}:
         - script: |
             sudo apt-get update -qq
-            sudo apt-get install -y -qq lxc lxc-utils dnsmasq-base iptables bubblewrap
-          displayName: Install LXC and Bubblewrap
+            sudo apt-get install -y -qq lxc lxc-utils dnsmasq-base iptables bubblewrap slirp4netns
+          displayName: Install LXC, Bubblewrap, and slirp4netns
 
         # LXC enforces network policy from the policy itself, and the default is
         # deny-all, so every LXC run installs an egress chain even when the
