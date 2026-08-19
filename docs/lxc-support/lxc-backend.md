@@ -82,6 +82,49 @@ The `distribution` and `release` fields control which LXC template is used to cr
 | `debian` | `bookworm`, `trixie` | Stable, well-tested |
 | `fedora` | `39`, `40` | Modern packages |
 
+### State-aware lifecycle configuration
+
+The table above describes the **one-shot** surface, where the two fields sit in
+a top-level `lxc` section.  The state-aware lifecycle carries the same two
+fields in the backend's own sub-object instead, under
+`experimental.lxc.provision`, alongside the `provision` phase that consumes
+them:
+
+```json
+{
+    "phase": "provision",
+    "containment": "lxc",
+    "experimental": {
+        "lxc": {
+            "provision": {
+                "distribution": "alpine",
+                "release": "3.23"
+            }
+        }
+    }
+}
+```
+
+`provision` is the only phase that takes LXC-specific configuration.  `start`,
+`exec`, `stop`, and `deprovision` carry no `experimental.lxc` payload — they
+route by the `sandboxId` returned from `provision`, and their cross-cutting
+`filesystem` and `network` policy comes from the top-level sections.
+
+| Rule | Enforced by | Diagnostic when violated |
+|------|-------------|--------------------------|
+| Both `distribution` and `release` are required | runtime | `LXC distribution and release are required` |
+| `experimental.lxc.provision` must be present on the provision phase | runtime | `experimental.lxc.provision with distribution and release is required` |
+| Each field must be a string | schema and parser | ``Invalid configuration at `experimental.lxc.provision.distribution`: invalid type: ... expected a string`` |
+| Only one backend section may appear, and it must match `containment` | runtime | `Multiple containment backends configured: ... Only one backend section is allowed; remove the unused section(s)` |
+
+Both fields are optional in the wire model, exactly as they are in the one-shot
+`lxc` section, so the schema accepts a provision section that omits them and the
+backend is what refuses it.  That split is deliberate: the `experimental` block
+is intentionally permissive and the schema "is an editor/CI convenience, never
+the gate" (`docs/schema-codegen.md`), so requirements that a caller must satisfy
+live in the parser and the backend.  See `docs/versioning.md` for the
+single-backend-section rule and its graduation path.
+
 ### Process Environment and Working Directory
 
 The `process.cwd` and `process.env` fields from the standard schema are honored inside the container:
