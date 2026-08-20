@@ -388,17 +388,21 @@ pub fn install() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 /// Whether a stop attempt left the container safe to unfilter.
 ///
 /// `lxc-stop -k` exits non-zero on a container that is not running, so a kill
 /// that reported failure does not on its own mean the container survived. A
 /// state that could not be read stays a failure, keeping the filtering in
 /// place for a container that might still be transmitting.
+///
+/// Only the Linux watchdog calls this, but it stays compiled on every target
+/// so Windows and macOS CI still type-check and test the decision.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn stop_left_container_down(killed: bool, running_after: Option<bool>) -> bool {
     killed || running_after == Some(false)
 }
 
+#[cfg(target_os = "linux")]
 fn run_watchdog(mask: SigSet) -> ! {
     loop {
         // sigwait isn't normally interruptible; on the unlikely failure, retry.
