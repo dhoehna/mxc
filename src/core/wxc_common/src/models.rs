@@ -696,10 +696,6 @@ impl ContainerPolicy {
         )
     }
 
-    /// True when the policy requires the LXC egress firewall to install rules.
-    ///
-    /// `default_network_policy` defaults to `Block`, so a request carrying no
-    /// `network` section lands here as deny-all.
     pub fn requires_firewall(&self) -> bool {
         self.default_network_policy == NetworkPolicy::Block
             || !self.allowed_hosts.is_empty()

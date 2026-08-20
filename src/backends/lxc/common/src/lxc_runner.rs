@@ -97,11 +97,7 @@ impl LxcScriptRunner {
 
     /// Core execution logic.
     fn run_internal(&self, request: &ExecutionRequest, logger: &mut Logger) -> ScriptResponse {
-        // Object-based FS-policy normalization (D6): tighten aliases of the same
-        // host object to the strictest intent (deny > ro > rw) before building
-        // mounts. See `wxc_common::filesystem_object`. Only clone the request
-        // when an aliasing conflict actually needs tightening; an unresolvable
-        // path with deniedPaths present fails closed.
+        // tighten aliases of the same host object to the strictest intent (deny > ro > rw)
         let normalized;
         let request = match wxc_common::filesystem_object::normalize_object_conflicts(
             &request.policy,
@@ -117,10 +113,7 @@ impl LxcScriptRunner {
             Ok(None) => request,
             Err(msg) => return ScriptResponse::error(&msg),
         };
-        // Delegation check (D3): reject any policy path the invoking user cannot
-        // access, so the sandbox never gains access the caller lacks. Runs AFTER
-        // object normalization so it is evaluated against the already-tightened
-        // intents.
+        // reject any policy path the invoking user cannot access
         if let Err(msg) = wxc_common::filesystem_access::check_delegation(&request.policy) {
             return ScriptResponse::error(&msg);
         }
@@ -134,18 +127,7 @@ impl LxcScriptRunner {
         }
 
         let container_name = self.resolve_container_name();
-        // Refuse a credential-bearing proxy URL here as well as at parse time.
-        // The parser guard only covers requests it built; `ExecutionRequest`
-        // and `ProxyAddress::from_url` are public, so a caller can hand this
-        // runner a policy the parser never saw. Below, `apply_proxy_env` sets
-        // HTTP(S)_PROXY to `to_url()`, which returns the original URL verbatim,
-        // and `build_attach_args_with_env_control` turns every environment
-        // entry into a `--set-var=KEY=VALUE` argument of the `lxc-attach`
-        // process this backend spawns (lxc_bindings.rs). A process's argv is
-        // readable through /proc/<pid>/cmdline by any local user for the
-        // lifetime of the command. The check sits ahead of container creation
-        // and firewall programming so a rejected request leaves no state
-        // behind.
+        // Credentials here would be visible to other local users.
         if let Some(url) = request
             .policy
             .network_proxy
@@ -154,24 +136,14 @@ impl LxcScriptRunner {
             .map(|address| address.to_url())
         {
             if wxc_common::proxy_env::proxy_url_has_credentials(&url) {
-                // Built from the redacted form so the rejection cannot become
-                // the leak it is rejecting.
                 return ScriptResponse::error(&format!(
-                    "LXC: network.proxy.url must not carry credentials ('{}'). LXC passes the \
-                     proxy URL to lxc-attach as a --set-var command-line argument, and process \
-                     arguments are world-readable through /proc/<pid>/cmdline, so the password \
-                     would be visible to every local user while the command runs. Use a proxy \
+                    "LXC: network.proxy.url must not carry credentials ('{}'). Use a proxy \
                      that does not require inline credentials, or supply them to the proxy \
                      itself rather than through the URL.",
                     wxc_common::proxy_env::redact_proxy_url(&url)
                 ));
             }
         }
-        // Make the name visible to the signal-cleanup watchdog so a fatal
-        // signal during create/start/attach still tears the container down —
-        // but only when the caller actually wants the container destroyed at
-        // exit. With `destroyOnExit = false` the normal completion path
-        // preserves the container, so the signal path must too.
         if self.destroy_on_exit {
             signal_cleanup::set_active(&container_name);
         }
