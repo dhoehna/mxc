@@ -14,7 +14,7 @@ use wxc_common::models::{ExecutionRequest, LifecycleConfig, LxcConfig, ScriptRes
 use wxc_common::script_runner::ScriptRunner;
 
 use crate::filesystem_mounts;
-use crate::lxc_bindings::LxcContainer;
+use crate::lxc_bindings::{LxcContainer, NetInterfaceConfig};
 use crate::network_ingress::IngressManager;
 use crate::network_iptables::NetworkIptablesManager;
 use crate::signal_cleanup;
@@ -53,6 +53,14 @@ impl LxcScriptRunner {
         } else {
             self.container_id.clone()
         }
+    }
+
+    /// Whether the pin hook can rename this container's interface before start.
+    ///
+    /// A nonzero exit from the hook aborts the start, so a shape it would
+    /// reject keeps the post-start path rather than becoming a new refusal.
+    fn pinnable_before_start(net: &NetInterfaceConfig) -> bool {
+        net.count == 1 && net.sole_kind.as_deref() == Some("veth")
     }
 
     /// Wait for the container's network stack to initialize.
@@ -217,6 +225,55 @@ impl LxcScriptRunner {
                 ));
             }
         };
+        let mut fw_manager = NetworkIptablesManager::new(&container_name);
+
+        // Install egress before the container starts, so nothing inside it
+        // transmits during an interval MXC already reports as deny-all.
+        // iptables accepts a rule naming an interface that does not exist yet,
+        // so the name is pinned here and the interface catches up at start.
+        let mut egress_installed = false;
+        if !running && request.policy.requires_firewall() {
+            let pinnable = match container.configured_net_interfaces() {
+                Ok(net) => Self::pinnable_before_start(&net),
+                Err(e) => {
+                    let _ = writeln!(logger, "Could not read the network config: {}", e);
+                    false
+                }
+            };
+            if pinnable {
+                let veth = NetworkIptablesManager::deterministic_veth_name(&container_name);
+                if let Err(e) = container.ensure_veth_pin_hook(&veth) {
+                    if self.destroy_on_exit || container_created {
+                        let _ = container.destroy();
+                    }
+                    return ScriptResponse::error(&format!(
+                        "Failed to pin the container's network interface: {}",
+                        e
+                    ));
+                }
+                let _ = writeln!(logger, "Pinned veth interface before start: {}", veth);
+                fw_manager.set_veth_interface(&veth);
+                if self.destroy_on_exit {
+                    signal_cleanup::set_active_veth(&veth);
+                }
+                match fw_manager.apply_firewall_rules(&request.policy, logger) {
+                    Ok(true) => egress_installed = true,
+                    Ok(false) => {
+                        if self.destroy_on_exit || container_created {
+                            let _ = container.destroy();
+                        }
+                        return ScriptResponse::error("Failed to apply network firewall rules.");
+                    }
+                    Err(e) => {
+                        if self.destroy_on_exit || container_created {
+                            let _ = container.destroy();
+                        }
+                        return ScriptResponse::error(&format!("Network policy error: {}", e));
+                    }
+                }
+            }
+        }
+
         if !running {
             let _ = writeln!(logger, "Starting LXC container...");
             if let Err(e) = container.start() {
@@ -230,63 +287,65 @@ impl LxcScriptRunner {
             let _ = writeln!(logger, "Container already running.");
         }
 
-        let needs_network = request.policy.requires_firewall();
-
-        if needs_network {
+        if request.policy.requires_firewall() {
             Self::wait_for_network(&container_name, Duration::from_secs(10), logger);
         }
 
-        // Configure network rules
-        let mut fw_manager = NetworkIptablesManager::new(&container_name);
+        // Shapes the pre-start path could not pin: an already running
+        // container, several interfaces, or one the hook cannot rename.
+        if !egress_installed {
+            // Resolve the container's veth interface for scoped rules. The pin hook
+            // persists in a container's config, so a container this runner did not
+            // pin may still have been renamed by an earlier state-aware start; the
+            // container itself is the only thing that knows which.
+            let pinned = NetworkIptablesManager::deterministic_veth_name(&container_name);
+            let pin_hook_present = match container.has_veth_pin_hook(&pinned) {
+                Ok(present) => present,
+                Err(e) => {
+                    // Guessing here picks between two names, one of which filters
+                    // nothing. Report it and resolve nothing rather than scope the
+                    // rules to a name that may already be stale.
+                    let _ = writeln!(logger, "Could not read the veth pin hook: {}", e);
+                    if self.destroy_on_exit || container_created {
+                        let _ = container.destroy();
+                    }
+                    return ScriptResponse::error(
+                        "Failed to resolve the container's network interface.",
+                    );
+                }
+            };
+            if let Some(veth) =
+                NetworkIptablesManager::live_veth_interface(&container_name, pin_hook_present)
+            {
+                let _ = writeln!(logger, "Resolved veth interface: {}", veth);
+                fw_manager.set_veth_interface(&veth);
+                if self.destroy_on_exit {
+                    // Tell the watchdog about the veth so signal-time cleanup
+                    // can also remove the FORWARD hook, not just the chain.
+                    signal_cleanup::set_active_veth(&veth);
+                }
+            }
+
+            match fw_manager.apply_firewall_rules(&request.policy, logger) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if self.destroy_on_exit || container_created {
+                        let _ = container.destroy();
+                    }
+                    return ScriptResponse::error("Failed to apply network firewall rules.");
+                }
+                Err(e) => {
+                    if self.destroy_on_exit || container_created {
+                        let _ = container.destroy();
+                    }
+                    return ScriptResponse::error(&format!("Network policy error: {}", e));
+                }
+            }
+        }
+
+        // Until the container is up, a failure above must still tear down what
+        // the pre-start install put in place.
         fw_manager.set_preserve_policy(!self.cleanup_policy);
-
-        // Resolve the container's veth interface for scoped rules. The pin hook
-        // persists in a container's config, so a container this runner did not
-        // pin may still have been renamed by an earlier state-aware start; the
-        // container itself is the only thing that knows which.
-        let pinned = NetworkIptablesManager::deterministic_veth_name(&container_name);
-        let pin_hook_present = match container.has_veth_pin_hook(&pinned) {
-            Ok(present) => present,
-            Err(e) => {
-                // Guessing here picks between two names, one of which filters
-                // nothing. Report it and resolve nothing rather than scope the
-                // rules to a name that may already be stale.
-                let _ = writeln!(logger, "Could not read the veth pin hook: {}", e);
-                if self.destroy_on_exit || container_created {
-                    let _ = container.destroy();
-                }
-                return ScriptResponse::error(
-                    "Failed to resolve the container's network interface.",
-                );
-            }
-        };
-        if let Some(veth) =
-            NetworkIptablesManager::live_veth_interface(&container_name, pin_hook_present)
-        {
-            let _ = writeln!(logger, "Resolved veth interface: {}", veth);
-            fw_manager.set_veth_interface(&veth);
-            if self.destroy_on_exit {
-                // Tell the watchdog about the veth so signal-time cleanup
-                // can also remove the FORWARD hook, not just the chain.
-                signal_cleanup::set_active_veth(&veth);
-            }
-        }
-
-        match fw_manager.apply_firewall_rules(&request.policy, logger) {
-            Ok(true) => {}
-            Ok(false) => {
-                if self.destroy_on_exit || container_created {
-                    let _ = container.destroy();
-                }
-                return ScriptResponse::error("Failed to apply network firewall rules.");
-            }
-            Err(e) => {
-                if self.destroy_on_exit || container_created {
-                    let _ = container.destroy();
-                }
-                return ScriptResponse::error(&format!("Network policy error: {}", e));
-            }
-        }
 
         // Configure inbound (ingress) network rules inside the container's own
         // netns. This is a separate, orthogonal chain from the egress rules
@@ -683,6 +742,42 @@ fn uuid_simple() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_single_veth_can_be_pinned_before_start() {
+        let net = NetInterfaceConfig {
+            count: 1,
+            sole_kind: Some("veth".to_string()),
+        };
+        assert!(LxcScriptRunner::pinnable_before_start(&net));
+    }
+
+    #[test]
+    fn a_sole_interface_that_is_not_veth_is_left_to_the_post_start_path() {
+        let net = NetInterfaceConfig {
+            count: 1,
+            sole_kind: Some("macvlan".to_string()),
+        };
+        assert!(!LxcScriptRunner::pinnable_before_start(&net));
+    }
+
+    #[test]
+    fn a_container_with_no_interfaces_is_left_to_the_post_start_path() {
+        let net = NetInterfaceConfig {
+            count: 0,
+            sole_kind: None,
+        };
+        assert!(!LxcScriptRunner::pinnable_before_start(&net));
+    }
+
+    #[test]
+    fn a_container_with_several_interfaces_is_left_to_the_post_start_path() {
+        let net = NetInterfaceConfig {
+            count: 2,
+            sole_kind: None,
+        };
+        assert!(!LxcScriptRunner::pinnable_before_start(&net));
+    }
 
     #[test]
     fn uuid_simple_is_8_chars() {
