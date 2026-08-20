@@ -410,8 +410,9 @@ pub fn run_with_pty(mut command: Command, options: PtyOptions) -> Result<PtyOutc
             // never see EOF and an unbounded join would block forever,
             // defeating the very timeout we just enforced. Give the drain a
             // short grace to flush buffered output, then abandon the reader.
-            // The executor process exits right after a (state-aware) exec, so
-            // the OS reaps the detached thread.
+            // A one-shot executor exits immediately afterward and the OS reaps
+            // the thread, but an in-process caller does not, so the thread and
+            // the pty fd survive until its host exits.
             let _ = join_with_timeout(output_thread, DRAIN_GRACE);
         }
     }
@@ -427,8 +428,9 @@ pub fn run_with_pty(mut command: Command, options: PtyOptions) -> Result<PtyOutc
 /// timeout path without risking a permanent hang: a process the timed-out
 /// child left running inside the sandbox can keep the pty open, so the reader
 /// thread never sees EOF and a plain `JoinHandle::join` would block forever.
-/// The abandoned reader thread dies when the (one-shot-per-invocation)
-/// executor process exits.
+/// The abandoned reader thread lives until its host process exits, which is
+/// immediate for a one-shot executor and not immediate for an in-process
+/// caller such as the SDK or the FFI layer.
 ///
 /// Implemented with a helper thread that performs the blocking join and
 /// signals a channel, since the standard library has no join-with-timeout.
