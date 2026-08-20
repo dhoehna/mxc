@@ -17,6 +17,7 @@ use wxc_common::state_aware_backend::{
     DeprovisionResult, ExecConsumer, ExecHandle, ExecOutcome, ProvisionResult, StartResult,
     StatefulSandboxBackend, StopResult,
 };
+use wxc_common::validator::{validate_state_aware_network_policy_support, NetworkPolicySupport};
 
 use windows::Win32::Foundation::HANDLE;
 
@@ -181,6 +182,7 @@ impl StatefulSandboxBackend for IsolationSessionRunner {
         request: &ExecutionRequest,
         config: Option<&IsolationSessionProvisionConfig>,
     ) -> Result<(), MxcError> {
+        validate_state_aware_network_policy_support(request, NetworkPolicySupport::LEGACY)?;
         // Structural only — MXC carries `appId` for a future OS consumer and
         // does not judge what a valid application identity looks like.
         if let Some(app_id) = config.and_then(|c| c.app_id.as_deref()) {
@@ -376,7 +378,7 @@ impl StatefulSandboxBackend for IsolationSessionRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wxc_common::models::{ContainerPolicy, NetworkPolicy};
+    use wxc_common::models::{ContainerPolicy, NetworkPolicy, ProxyAddress, ProxyConfig};
     use wxc_common::mxc_error::MxcErrorCode;
 
     // ====== Wire-format constants ======
@@ -759,6 +761,44 @@ mod tests {
             .validate_deprovision(&valid_sandbox_id(), &req, None)
             .unwrap_err();
         assert_eq!(d.code, MxcErrorCode::PolicyValidation);
+    }
+
+    #[test]
+    fn validate_post_provision_hooks_reject_runtime_proxy() {
+        let runner = IsolationSessionRunner::new();
+        let req = ExecutionRequest {
+            policy: ContainerPolicy {
+                network_proxy: ProxyConfig {
+                    address: Some(ProxyAddress::new("127.0.0.1".to_string(), 8080)),
+                    builtin_test_server: false,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        for (label, result) in [
+            (
+                "start",
+                runner.validate_start(&valid_sandbox_id(), &req, None),
+            ),
+            (
+                "exec",
+                runner.validate_exec(&valid_sandbox_id(), &req, None),
+            ),
+            (
+                "stop",
+                runner.validate_stop(&valid_sandbox_id(), &req, None),
+            ),
+            (
+                "deprovision",
+                runner.validate_deprovision(&valid_sandbox_id(), &req, None),
+            ),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, MxcErrorCode::PolicyValidation, "phase {label}");
+            assert!(error.message.contains("proxy"), "phase {label}: {error:?}");
+        }
     }
 
     // ====== UI policy is refused on every phase ======
