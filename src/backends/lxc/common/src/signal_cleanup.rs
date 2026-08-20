@@ -389,6 +389,16 @@ pub fn install() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
+/// Whether a stop attempt left the container safe to unfilter.
+///
+/// `lxc-stop -k` exits non-zero on a container that is not running, so a kill
+/// that reported failure does not on its own mean the container survived. A
+/// state that could not be read stays a failure, keeping the filtering in
+/// place for a container that might still be transmitting.
+fn stop_left_container_down(killed: bool, running_after: Option<bool>) -> bool {
+    killed || running_after == Some(false)
+}
+
 fn run_watchdog(mask: SigSet) -> ! {
     loop {
         // sigwait isn't normally interruptible; on the unlikely failure, retry.
@@ -402,7 +412,15 @@ fn run_watchdog(mask: SigSet) -> ! {
             let mut buf_logger = Logger::new(Mode::Buffer);
             let plan = rollback_plan(active.rollback, !active.created.is_empty());
             execute_rollback(&plan, &mut |step| match step {
-                RollbackStep::StopContainer => LxcContainer::new(&name, None).kill().is_ok(),
+                RollbackStep::StopContainer => {
+                    let container = LxcContainer::new(&name, None);
+                    // A signal can land after the firewall is installed and
+                    // before the start, where there is nothing to kill.
+                    // Reading that as a failed stop strands the chain, which
+                    // then blocks every later start of this name.
+                    let killed = container.kill().is_ok();
+                    stop_left_container_down(killed, container.is_running().ok())
+                }
                 RollbackStep::RemoveFirewall => {
                     NetworkIptablesManager::force_cleanup(
                         &name,
@@ -482,6 +500,38 @@ mod tests {
             run_plan(&plan, &[RollbackStep::StopContainer]),
             vec![RollbackStep::StopContainer],
             "a failed stop must not be followed by removing the firewall"
+        );
+    }
+
+    #[test]
+    fn a_kill_that_failed_on_a_container_already_down_still_clears_the_way() {
+        // A signal can land between installing the firewall and starting the
+        // container.  `lxc-stop -k` exits non-zero with nothing to kill, and
+        // treating that as a failed stop strands the chain -- which then blocks
+        // every later start of this name with "its chain already exists".
+        assert!(
+            stop_left_container_down(false, Some(false)),
+            "a container that is already down must not strand its chain"
+        );
+    }
+
+    #[test]
+    fn a_kill_that_failed_on_a_running_container_retains_the_firewall() {
+        // This is the case the ordering exists to protect: the container is
+        // still transmitting, so its egress rules must stay.
+        assert!(
+            !stop_left_container_down(false, Some(true)),
+            "a still-running container must keep its filtering"
+        );
+    }
+
+    #[test]
+    fn a_container_state_that_could_not_be_read_retains_the_firewall() {
+        // An unreadable state is indistinguishable from a running one, and
+        // guessing wrong here unfilters a live container.
+        assert!(
+            !stop_left_container_down(false, None),
+            "an unreadable container state must be treated as still running"
         );
     }
 

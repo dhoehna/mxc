@@ -36,6 +36,7 @@ QUARANTINED=0
 QUARANTINE_ACTIVE=""
 QUARANTINE_NOTES=""
 CLEANED_UP=0
+FS_FIXTURES_CREATED=0
 
 cleanup() {
     if [ "$CLEANED_UP" -ne 0 ]; then
@@ -50,6 +51,10 @@ cleanup() {
         fi
         echo "--- cleanup: deprovision $SANDBOX_ID ---"
         run_phase deprovision "$SANDBOX_ID" >/dev/null 2>&1 || true
+    fi
+    if [ "$FS_FIXTURES_CREATED" -ne 0 ]; then
+        rm -rf "$FS_RO_DIR" "$FS_DENIED_DIR"
+        FS_FIXTURES_CREATED=0
     fi
     rm -rf "$WORK_DIR"
 }
@@ -539,8 +544,16 @@ run_filesystem_start_case() {
     local req="$WORK_DIR/case_${case_no}.json"
     local out rc actual status probe
 
-    rm -rf "$FS_RO_DIR" "$FS_DENIED_DIR"
+    # These are absolute paths at the host root, so anything already there
+    # belongs to something else and deleting it would destroy data this test
+    # never created.
+    for fixture_dir in "$FS_RO_DIR" "$FS_DENIED_DIR"; do
+        if [ -e "$fixture_dir" ]; then
+            fail_now "case $case_no found a pre-existing host path '$fixture_dir'; refusing to delete a directory this test did not create.  Remove it by hand if an interrupted run left it behind."
+        fi
+    done
     mkdir -p "$FS_RO_DIR" "$FS_DENIED_DIR" || fail_now "case $case_no could not create its host fixture directories"
+    FS_FIXTURES_CREATED=1
     echo "$FS_SENTINEL" > "$FS_RO_DIR/sentinel"
     echo "$FS_SENTINEL" > "$FS_DENIED_DIR/sentinel"
 
@@ -600,6 +613,7 @@ run_filesystem_start_case() {
 
     finish_current_sandbox "case $case_no" "$config"
     rm -rf "$FS_RO_DIR" "$FS_DENIED_DIR"
+    FS_FIXTURES_CREATED=0
     record_result "$case_no" "$config" "$cause" "$expected" "$actual" "$status"
 }
 

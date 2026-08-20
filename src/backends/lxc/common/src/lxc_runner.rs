@@ -64,6 +64,28 @@ impl LxcScriptRunner {
         net.count == 1 && net.sole_kind.as_deref() == Some("veth")
     }
 
+    /// Halt a container after a failure that happened once it was already
+    /// running, retaining its filtering if it could not be halted.
+    ///
+    /// A run that will not destroy the container -- `destroy_on_exit` off on
+    /// one it did not create -- otherwise returns while the container keeps
+    /// running, and the managers then drop their rules on the way out. The
+    /// result is a live container with its egress filtering removed, reported
+    /// to the caller as a failure. Preserving the policy when the stop fails
+    /// keeps the rules in place for whatever is still transmitting.
+    fn halt_after_failed_start(
+        &self,
+        container: &LxcContainer,
+        container_created: bool,
+        fw_manager: &mut NetworkIptablesManager,
+    ) {
+        if self.destroy_on_exit || container_created {
+            let _ = container.destroy();
+        } else if container.stop().is_err() {
+            fw_manager.set_preserve_policy(true);
+        }
+    }
+
     /// Wait for the container's network stack to initialize.
     /// Polls `lxc-info` until the container has an IP address or the timeout is reached.
     fn wait_for_network(container_name: &str, timeout: Duration, logger: &mut Logger) -> bool {
@@ -228,19 +250,52 @@ impl LxcScriptRunner {
         };
         let mut fw_manager = NetworkIptablesManager::new(&container_name);
 
+        // Read once, so the refusal below and the pin decision cannot disagree
+        // about the same container.
+        let net_config = if request.policy.requires_firewall() {
+            match container.configured_net_interfaces() {
+                Ok(net) => Some(net),
+                Err(e) => {
+                    let _ = writeln!(logger, "Could not read the network config: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // The FORWARD hook matches a single veth, so traffic on any other
+        // interface never reaches the chain and the policy goes unenforced.
+        // A container with no usable veth already fails when the rules are
+        // applied, because nothing calls `allow_missing_veth_interface` on this
+        // path; one with several interfaces instead resolves the first and
+        // silently bypasses the rest, so it is refused here. A read that failed
+        // keeps the pre-existing behavior rather than turning an unreadable
+        // config into a new way to fail.
+        if let Some(net) = net_config.as_ref() {
+            if net.count > 1 {
+                if self.destroy_on_exit || container_created {
+                    let _ = container.destroy();
+                }
+                return ScriptResponse::error(&format!(
+                    "Container {:?} has {} configured network interfaces; a firewall-enforced \
+                     network policy can only be applied to a container with a single interface, \
+                     because traffic on the others would bypass it",
+                    container_name, net.count,
+                ));
+            }
+        }
+
         // Install egress before the container starts, so nothing inside it
         // transmits during an interval MXC already reports as deny-all.
         // iptables accepts a rule naming an interface that does not exist yet,
         // so the name is pinned here and the interface catches up at start.
         let mut egress_installed = false;
         if !running && request.policy.requires_firewall() {
-            let pinnable = match container.configured_net_interfaces() {
-                Ok(net) => Self::pinnable_before_start(&net),
-                Err(e) => {
-                    let _ = writeln!(logger, "Could not read the network config: {}", e);
-                    false
-                }
-            };
+            let pinnable = net_config
+                .as_ref()
+                .map(Self::pinnable_before_start)
+                .unwrap_or(false);
             if pinnable {
                 let veth = NetworkIptablesManager::deterministic_veth_name(&container_name);
                 if let Err(e) = container.ensure_veth_pin_hook(&veth) {
@@ -307,9 +362,7 @@ impl LxcScriptRunner {
                     // nothing. Report it and resolve nothing rather than scope the
                     // rules to a name that may already be stale.
                     let _ = writeln!(logger, "Could not read the veth pin hook: {}", e);
-                    if self.destroy_on_exit || container_created {
-                        let _ = container.destroy();
-                    }
+                    self.halt_after_failed_start(&container, container_created, &mut fw_manager);
                     return ScriptResponse::error(
                         "Failed to resolve the container's network interface.",
                     );
@@ -330,15 +383,11 @@ impl LxcScriptRunner {
             match fw_manager.apply_firewall_rules(&request.policy, logger) {
                 Ok(true) => {}
                 Ok(false) => {
-                    if self.destroy_on_exit || container_created {
-                        let _ = container.destroy();
-                    }
+                    self.halt_after_failed_start(&container, container_created, &mut fw_manager);
                     return ScriptResponse::error("Failed to apply network firewall rules.");
                 }
                 Err(e) => {
-                    if self.destroy_on_exit || container_created {
-                        let _ = container.destroy();
-                    }
+                    self.halt_after_failed_start(&container, container_created, &mut fw_manager);
                     return ScriptResponse::error(&format!("Network policy error: {}", e));
                 }
             }
@@ -367,17 +416,21 @@ impl LxcScriptRunner {
                 match mgr.apply_firewall_rules(&request.policy, logger) {
                     Ok(true) => {}
                     Ok(false) => {
-                        if self.destroy_on_exit || container_created {
-                            let _ = container.destroy();
-                        }
+                        self.halt_after_failed_start(
+                            &container,
+                            container_created,
+                            &mut fw_manager,
+                        );
                         return ScriptResponse::error(
                             "Failed to apply inbound network firewall rules.",
                         );
                     }
                     Err(e) => {
-                        if self.destroy_on_exit || container_created {
-                            let _ = container.destroy();
-                        }
+                        self.halt_after_failed_start(
+                            &container,
+                            container_created,
+                            &mut fw_manager,
+                        );
                         return ScriptResponse::error(&format!(
                             "Inbound network policy error: {}",
                             e
@@ -401,9 +454,7 @@ impl LxcScriptRunner {
                 // namespace by init PID; other backends reach their firewall
                 // handling through their own runners and never construct an
                 // `IngressManager`.
-                if self.destroy_on_exit || container_created {
-                    let _ = container.destroy();
-                }
+                self.halt_after_failed_start(&container, container_created, &mut fw_manager);
                 return ScriptResponse::error(
                     "Failed to discover the container init PID; cannot enter the container \
                      network namespace to enforce the inbound firewall. Aborting rather than \
