@@ -76,7 +76,7 @@ Throughout this document, the deny-all-except-proxy posture (the GA goal) refers
 - **When allowed:** Only when explicitly allowed by IP/CIDR + port + protocol rules in `egress.allow`. In model 2 there is no direct egress path, so these connections are not possible regardless of any allow rules.
 - **Use case:** e.g. SSH to a specific dev server, a direct TCP connection to a database, UDP to a specific endpoint, ICMP for diagnostics.
 - **Caveat (coarse filtering):** Rules match IP/CIDR + port + protocol, not the application protocol. A port number does not identify a service (DNS need not use 53; a database may listen on any port), so allowing or denying a port is a blunt control rather than service-level filtering.
-- **Enforcement:** WFP filters (Windows process containers), network namespace + iptables (WSLc/LXC/Bubblewrap). Model 1 for macOS is not supported for GA. Seatbelt cannot filter arbitrary destinations and macOS packet filtering is not fine-grained enough for per-sandbox scenarios out of the box.
+- **Enforcement:** WFP filters (Windows process containers), network namespace + iptables (WSLc/LXC/Bubblewrap). Model 1 for macOS is not supported for GA. Seatbelt cannot filter arbitrary destinations and macOS packet filtering is not fine-grained enough for per-sandbox scenarios out of the box. On Bubblewrap, model 1 egress is enforced from schema 0.8+ inside the sandbox's own network namespace — see "LXC and Bubblewrap: GA enforcement" below for what is and is not covered there.
 
 **Example:**
 
@@ -269,6 +269,8 @@ sockets come with their own security questions and should be outlined in a separ
 
 **Elevation caveat:** Installing these filters (WFP on Windows, iptables on the Linux backends) generally requires elevation. Elevating on every sandbox launch is out of the question, so MXC applies them through a privileged broker/service rather than from the unelevated launch path. A per-platform, per-technology elevation story must be defined in a separate MXC elevation design doc and is a prerequisite for this enforcement.
 
+> **Bubblewrap does not need this.** The caveat above holds only for filters installed on the *host*. Bubblewrap gives the sandbox its own network namespace and programs iptables inside it from a supervisor holding `CAP_NET_ADMIN` in an unprivileged user namespace — namespace-scoped capabilities are not host privilege, so the rules install with no elevation and no broker. The sandbox still cannot alter them, because it drops `CAP_NET_ADMIN` before the workload runs. Shipped at schema 0.8; see `docs/bwrap-support/bubblewrap-backend.md`. The elevation design remains a prerequisite for the host-filter backends only.
+
 ### D3: IP literals and CIDRs only (no DNS names)
 
 **Decision:** Rule addresses must be IPv4/IPv6 literals or CIDRs. DNS names are rejected at validation time. The backend does not resolve names on behalf of callers.
@@ -403,6 +405,21 @@ egress allow-list.
 LXC and Bubblewrap use iptables/nftables on the container network path. Their INPUT policy applies `ingress.default`
 and the host-to-container half of `ingress.hostLoopback`; routing and output policy enforce its container-to-host half.
 Model 2 permits only the proxy endpoint.
+
+> **Implementation status (Bubblewrap).** Egress is enforced from schema 0.8+,
+> but not on the path described above. Unprivileged Bubblewrap has no host-side
+> veth, so no chain can be hooked into `FORWARD`. Instead the sandbox gets its
+> own network namespace and a supervisor holding namespace-scoped
+> `CAP_NET_ADMIN` filters on `OUTPUT` inside it (see the D2 note above). Rule
+> addresses must be IP literals or CIDRs per D3; a hostname is rejected.
+> Model 2 is enforced by the same chain, which opens only the proxy endpoint.
+>
+> Not yet covered: `ingress.default` and `ingress.hostLoopback` are parsed but
+> not enforced as an `INPUT` policy. Inbound is instead a property of the
+> namespace — no port forwarding is configured, so nothing outside the sandbox
+> can reach in. Schema 0.6/0.7 keeps the previous warn-and-continue behavior.
+> LXC is unaffected: it has a veth and runs privileged, and enforces as
+> described.
 
 ### macOS (Seatbelt): GA enforcement
 
