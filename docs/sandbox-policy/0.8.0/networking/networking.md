@@ -460,11 +460,26 @@ Model 2 permits only the proxy endpoint.
 > `CAP_NET_ADMIN` filters on `OUTPUT` inside it (see the D2 note above). Rule
 > addresses must be IP literals or CIDRs per D3; a hostname is rejected.
 > Model 2 is enforced by the same chain, which opens only the proxy endpoint.
+> An `INPUT` chain applies the inbound deny posture in the same transaction,
+> accepting loopback and reply traffic and dropping new inbound connections. It
+> requires `nf_conntrack`; the sandbox fails to launch without it rather than
+> running unenforced.
 >
-> Not yet covered: `ingress.default` and `ingress.hostLoopback` are parsed but
-> not enforced as an `INPUT` policy. Inbound is instead a property of the
-> namespace — no port forwarding is configured, so nothing outside the sandbox
-> can reach in. Schema 0.6/0.7 keeps the previous warn-and-continue behavior.
+> Not yet covered: the `ingress` section exists in the 0.8 schema and parses
+> into `ContainerPolicy::network_ingress`, but Bubblewrap declares
+> `NetworkPolicySupport::LEGACY`, so a config carrying `ingress.default` or
+> `ingress.hostLoopback` is rejected in `validate` as an unsupported *backend
+> feature* — not as an unknown field. (Supplying `ingress` marks the request as
+> directional, so the message names `network.egress.default`.) The inbound
+> posture is instead derived from the existing `network.allowLocalNetwork`, and
+> at 0.8 that field is rejected outright when it is `true` on a
+> private-namespace mode (there is no inbound-only primitive to honor it with).
+> Deny is therefore the only reachable posture today; wiring `ingress` — and
+> declaring the matching support bits — is what will make `allow` expressible.
+> Inbound denial also does not currently depend on the `INPUT`
+> chain in practice: no port forwarding is configured, so nothing outside the
+> sandbox can reach in regardless. Schema 0.6/0.7 keeps the previous
+> warn-and-continue behavior.
 > LXC is unaffected: it has a veth and runs privileged, and enforces as
 > described.
 

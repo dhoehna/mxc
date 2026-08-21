@@ -23,7 +23,9 @@ use wxc_common::logger::Logger;
 use wxc_common::models::{ContainerPolicy, ProxyAddress, ProxyHostPin};
 
 use crate::bwrap_command::COMMAND_TAIL;
-use crate::network_rules::EgressPlan;
+use crate::network_rules::{
+    payload_file_name, render_filter_payloads, EgressPlan, IngressPlan, RuleFamily,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a single `iptables` call may block on the host's `/run/xtables.lock`.
@@ -36,48 +38,49 @@ const XTABLES_LOCK_WAIT: Duration = Duration::from_secs(5);
 /// Lock file the legacy `iptables` backend opens before touching any table.
 /// `nf_tables` does not use it. See [`iptables_backend_is_usable`].
 const XTABLES_LOCK_PATH: &str = "/run/xtables.lock";
-/// Ceiling on the rule-installation budget. The per-command sum below is
-/// caller-scaled and host lists are uncapped, so without this a large policy
-/// could authorize hours of blocked startup. Covers ~50 fully contended
-/// commands.
-const RULE_INSTALL_TIMEOUT_CAP: Duration = Duration::from_secs(300);
-/// Floor for the deadline clamp: slirp startup plus one contended call. Setup
-/// has an irreducible cost, so a shorter workload timeout bounds the workload,
-/// not the sandbox that has to exist to run it.
-const RULE_INSTALL_TIMEOUT_FLOOR: Duration =
-    Duration::from_secs(STARTUP_TIMEOUT.as_secs() + XTABLES_LOCK_WAIT.as_secs());
-
-/// Budget for the rule-installation phase, which begins once slirp is up.
+/// Budget for the phase that starts slirp and installs the rules.
 ///
-/// Sized so that lock contention -- the expected reason a rule stalls -- cannot
-/// exhaust the budget before `-w` has had a chance to succeed. A single
+/// The worst-case lock wait for every transaction plus explicit headroom,
+/// because the timer starts in [`ProxyNetworkNamespace::attach`] *before* slirp
+/// signals readiness and so also covers slirp startup. A single
 /// [`STARTUP_TIMEOUT`] cannot cover this: it would reject a viable sandbox the
 /// moment one call waited on a busy host.
 ///
-/// Computed from the plan rather than fixed, so a large rule list gets a
-/// proportionate budget instead of being timed out for being large. On top of
-/// the lock sum it carries [`STARTUP_TIMEOUT`] plus one second per command,
-/// because the same deadline also spans slirp readiness and one `nsenter`
-/// launch per rule. Headroom only -- the supervisor raises a single signal for
-/// both phases, so they cannot be budgeted separately.
+/// A large policy needs more than one transaction per family, so this scales
+/// with the rendered payload count -- but only up to [`RULE_INSTALL_CEILING`].
+/// Scaling without a ceiling is what made the previous per-rule budget
+/// unusable: a long host list could push startup past any sane bound. The
+/// ceiling keeps a wedged host bounded, and it is generous enough that a
+/// policy reaching it is contending for the lock rather than merely large.
 ///
-/// Bounded twice, because this phase runs before the child's own timeout
-/// exists: by [`RULE_INSTALL_TIMEOUT_CAP`], and by `script_timeout` when the
-/// caller set one, down to [`RULE_INSTALL_TIMEOUT_FLOOR`].
-fn rule_install_timeout(plan: &EgressPlan, script_timeout_ms: u32) -> Duration {
-    let commands = plan.command_count() as u64;
-    let budget = Duration::from_secs(
-        XTABLES_LOCK_WAIT.as_secs() * commands + STARTUP_TIMEOUT.as_secs() + commands,
-    )
-    .min(RULE_INSTALL_TIMEOUT_CAP);
+/// Also clamped to the caller's `script_timeout` when there is one, so setup
+/// cannot silently outlast the deadline the request asked for -- it is spent
+/// before the child's own timeout exists. The clamp stops at
+/// [`RULE_INSTALL_FLOOR`]: setup has an irreducible cost, so a shorter workload
+/// timeout bounds the workload, not the sandbox that has to exist to run it.
+fn rule_install_timeout(transactions: usize, script_timeout_ms: u32) -> Duration {
+    let waits = XTABLES_LOCK_WAIT
+        .checked_mul(u32::try_from(transactions).unwrap_or(u32::MAX))
+        .unwrap_or(RULE_INSTALL_CEILING);
+    let budget = waits
+        .saturating_add(RULE_INSTALL_HEADROOM)
+        .min(RULE_INSTALL_CEILING);
 
     if script_timeout_ms == 0 {
         return budget;
     }
     budget
         .min(Duration::from_millis(u64::from(script_timeout_ms)))
-        .max(RULE_INSTALL_TIMEOUT_FLOOR)
+        .max(RULE_INSTALL_FLOOR)
 }
+/// Slack for slirp startup and process spawn inside [`rule_install_timeout`].
+const RULE_INSTALL_HEADROOM: Duration = Duration::from_secs(20);
+/// Upper bound on [`rule_install_timeout`], however large the policy is.
+const RULE_INSTALL_CEILING: Duration = Duration::from_secs(120);
+/// Floor the caller-deadline clamp will not go below: slirp startup plus one
+/// contended transaction.
+const RULE_INSTALL_FLOOR: Duration =
+    Duration::from_secs(STARTUP_TIMEOUT.as_secs() + XTABLES_LOCK_WAIT.as_secs());
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Ceiling for a single dependency probe. Generous next to a `--version` call,
 /// which returns in milliseconds, so only a genuinely wedged binary trips it.
@@ -92,6 +95,8 @@ const SLIRP_NETWORK: &str = "10.0.2.0/24";
 const SANDBOX_HOSTS_PATH: &str = "/etc/hosts";
 /// Egress chain installed inside the sandbox's own network namespace.
 const EGRESS_CHAIN: &str = "MXC_EGRESS";
+/// Chain carrying the inbound posture, hooked into `INPUT`.
+const INGRESS_CHAIN: &str = "MXC_INGRESS";
 /// Descriptor numbers the supervisor script hardcodes. They must stay single
 /// digit and below [`FD_STAGING_BASE`]: dash cannot name a descriptor >= 10 in
 /// a redirection, which is the whole reason the parent pins them.
@@ -111,10 +116,7 @@ const FD_STAGING_BASE: RawFd = 10;
 const SUPERVISOR_SCRIPT: &str = r#"
 set -eu
 state_dir="$1"
-chain="$2"
-lock_wait="$3"
-v4_terminal="$4"
-v6_terminal="$5"
+lock_wait="$2"
 # Inherited descriptors are remapped to fixed numbers by the parent (see
 # `remap_descriptors`): 3 is the parent's PID pipe, 4 is slirp's exit pipe.
 # They are hardcoded rather than passed in argv because /bin/sh is dash on
@@ -153,51 +155,39 @@ while [ ! -s "$state_dir/slirp.internal" ]; do
 done
 
 ns="/proc/$child_pid/ns/net"
-# Per-destination filtering, programmed here because it needs CAP_NET_ADMIN in
-# the owning user namespace, which this supervisor holds (`--keep-caps`) and
-# the caller does not.
+# Network filtering in both directions, programmed here because it needs
+# CAP_NET_ADMIN in the owning user namespace, which this supervisor holds
+# (`--keep-caps`) and the caller does not.
 #
-# Both families open with their chain and the loopback exemption, then take the
-# caller's rules in order, then close on the terminal verdict and the OUTPUT
-# hook. Loopback is exempt because it is the sandbox's own isolated loopback,
-# so it never leaves the sandbox. Ordering is the policy: the chain matches
-# first-wins, and the rules file is written deny-first so an explicit deny
-# overrides a broader allow.
+# Each family's rules arrive as one or more `iptables-restore` transactions,
+# numbered so this glob applies them in order. Both built-in hooks travel in
+# the *last* transaction of a family, so a hook is never live over a partially
+# built chain and the rules cannot be observed half-installed. Splitting is
+# forced by the kernel: one restore is one bounded netlink transaction, and a
+# large host list would otherwise exceed it and install nothing. The payloads
+# are rendered in Rust from parsed addresses, so nothing here echoes caller
+# text.
 #
 # -w matters only on the legacy backend, the one that takes a lock: nsenter
 # enters the network namespace but not the mount namespace, so concurrent
 # sandboxes contend for the *host's* /run/xtables.lock, and set -e turns a lost
 # race into a dead supervisor. nf_tables takes no lock and ignores the wait.
 # A backend that cannot take the lock at all is refused by probe_dependencies.
-nsenter --net="$ns" -- iptables -w "$lock_wait" -N "$chain"
-nsenter --net="$ns" -- iptables -w "$lock_wait" -A "$chain" -o lo -j ACCEPT
-nsenter --net="$ns" -- ip6tables -w "$lock_wait" -N "$chain"
-nsenter --net="$ns" -- ip6tables -w "$lock_wait" -A "$chain" -o lo -j ACCEPT
-# Five fixed fields per record, every one produced by re-rendering a parsed
-# address rather than echoing caller text, so nothing here can carry shell
-# metacharacters. `-` stands in for an absent protocol/port.
-while IFS=' ' read -r family verdict address proto port; do
-    [ -n "$family" ] || continue
-    case "$family" in
-        4) tool=iptables ;;
-        6) tool=ip6tables ;;
-        *) echo "mxc: unrecognized rule family '$family'" >&2; exit 1 ;;
-    esac
-    if [ "$proto" = "-" ]; then
-        nsenter --net="$ns" -- "$tool" -w "$lock_wait" \
-            -A "$chain" -d "$address" -j "$verdict"
-    else
-        nsenter --net="$ns" -- "$tool" -w "$lock_wait" \
-            -A "$chain" -p "$proto" -d "$address" --dport "$port" -j "$verdict"
-    fi
-done < "$state_dir/egress.rules"
-# The terminal verdict closes each family. A family with no rules of its own
-# still gets it, so IPv6 under an IPv4-only rule set fails closed rather than
-# being left open.
-nsenter --net="$ns" -- iptables -w "$lock_wait" -A "$chain" -j "$v4_terminal"
-nsenter --net="$ns" -- iptables -w "$lock_wait" -A OUTPUT -j "$chain"
-nsenter --net="$ns" -- ip6tables -w "$lock_wait" -A "$chain" -j "$v6_terminal"
-nsenter --net="$ns" -- ip6tables -w "$lock_wait" -A OUTPUT -j "$chain"
+# -n keeps the restore additive, so it never clears a table it did not write
+# and so a later transaction appends to the chain an earlier one declared.
+#
+# A rejected transaction applies nothing, so a host that cannot support a rule
+# fails closed here rather than starting an unenforced sandbox. The most likely
+# cause is worth naming, because iptables reports it only as "Invalid argument".
+conntrack_hint="mxc: could not install the sandbox network policy. If the error above says \
+'Invalid argument', this host is missing the nf_conntrack kernel module that the inbound \
+connection-state match requires, and an unprivileged sandbox cannot load it."
+for payload in "$state_dir"/rules.v4.*; do
+    nsenter --net="$ns" -- iptables-restore -w "$lock_wait" -n "$payload" || { echo "$conntrack_hint" >&2; exit 1; }
+done
+for payload in "$state_dir"/rules.v6.*; do
+    nsenter --net="$ns" -- ip6tables-restore -w "$lock_wait" -n "$payload" || { echo "$conntrack_hint" >&2; exit 1; }
+done
 
 # Signalled by path, not through a descriptor: this is a plain file the parent
 # polls, so it needs no shell redirection and cannot hit dash's fd limit.
@@ -629,22 +619,28 @@ pub(crate) struct ProxyNetworkNamespace {
     userns: Option<File>,
     /// Hosts file mounted over `/etc/hosts`, when the endpoint is a hostname.
     hosts: Option<PathBuf>,
-    /// Budget for the readiness signal, sized from the plan's rule count.
-    rule_install_timeout: Duration,
+    /// Restore transactions the supervisor will apply, which sizes the
+    /// readiness budget in [`Self::attach`].
+    transactions: usize,
+    /// The request's `script_timeout` in ms, 0 when absent. Clamps the same
+    /// budget, which is spent before the child's own timeout exists.
+    script_timeout_ms: u32,
 }
 
 impl ProxyNetworkNamespace {
     /// Create the capability-retaining namespace supervisor.
     ///
-    /// `plan` is the complete filtering posture the sandbox runs under once the
+    /// `plan` is the outbound filtering posture the sandbox runs under once the
     /// supervisor signals readiness; anything it does not accept is dropped.
-    /// `pin` is the hosts-file entry the sandbox needs to agree with the plan,
-    /// which only a hostname proxy endpoint produces.
+    /// `ingress` is the matching inbound posture. `pin` is the hosts-file entry
+    /// the sandbox needs to agree with the plan, which only a hostname proxy
+    /// endpoint produces.
     ///
     /// Callers reach this only after `BwrapRunner::validate` has already run
     /// [`probe_dependencies`], so the probe is not repeated here.
     pub(crate) fn start(
         plan: &EgressPlan,
+        ingress: &IngressPlan,
         pin: Option<&ProxyHostPin>,
         logger: &mut Logger,
         script_timeout_ms: u32,
@@ -655,12 +651,24 @@ impl ProxyNetworkNamespace {
             .map_err(|error| {
                 format!("Bubblewrap: failed to create proxy-network state: {error}")
             })?;
-        // Written before the supervisor is spawned: the script reads it during
-        // startup, so a missing or partial file must not be possible.
-        let rules_path = state_dir.path().join("egress.rules");
-        std::fs::write(&rules_path, plan.render()).map_err(|error| {
-            format!("Bubblewrap: failed to write egress rules to {rules_path:?}: {error}")
-        })?;
+        // Written before the supervisor is spawned: the script reads them
+        // during startup, so a missing or partial file must not be possible.
+        // A family renders to as many transactions as its size needs; the
+        // supervisor applies them in name order.
+        let mut transactions = 0usize;
+        for family in [RuleFamily::V4, RuleFamily::V6] {
+            let payloads =
+                render_filter_payloads(plan, ingress, family, EGRESS_CHAIN, INGRESS_CHAIN);
+            transactions += payloads.len();
+            for (index, payload) in payloads.iter().enumerate() {
+                let path = state_dir
+                    .path()
+                    .join(payload_file_name(family, index, payloads.len()));
+                std::fs::write(&path, payload).map_err(|error| {
+                    format!("Bubblewrap: failed to write network rules to {path:?}: {error}")
+                })?;
+            }
+        }
         let stderr_path = state_dir.path().join("supervisor.stderr");
         let stderr = File::create(&stderr_path).map_err(|error| {
             format!("Bubblewrap: failed to create proxy-network diagnostics: {error}")
@@ -683,10 +691,7 @@ impl ProxyNetworkNamespace {
                 "mxc-bwrap-proxy-supervisor",
             ])
             .arg(state_dir.path())
-            .arg(EGRESS_CHAIN)
             .arg(XTABLES_LOCK_WAIT.as_secs().to_string())
-            .arg(plan.v4_terminal().target())
-            .arg(plan.v6_terminal().target())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr));
@@ -754,7 +759,8 @@ impl ProxyNetworkNamespace {
             pid_writer: Some(pid_writer),
             userns: Some(userns),
             hosts,
-            rule_install_timeout: rule_install_timeout(plan, script_timeout_ms),
+            transactions,
+            script_timeout_ms,
         })
     }
 
@@ -835,14 +841,13 @@ impl ProxyNetworkNamespace {
             self.state_dir.path().join("slirp.ready"),
             &mut self.supervisor,
             &self.state_dir.path().join("supervisor.stderr"),
-            // Names both phases: this signal is written after slirp is up *and*
-            // every egress rule is installed, so attributing a stall to
-            // slirp alone would send the reader to the wrong place.
-            "slirp4netns startup and egress rule installation",
-            self.rule_install_timeout,
+            // Written after slirp is up *and* both rule sets are installed, so
+            // naming slirp alone would send the reader to the wrong place.
+            "slirp4netns startup and network rule installation",
+            rule_install_timeout(self.transactions, self.script_timeout_ms),
         )?;
         logger.log_line(
-            "Bubblewrap: slirp4netns configured the private network namespace and the egress \
+            "Bubblewrap: slirp4netns configured the private network namespace and the network \
              rules are in force",
         );
         Ok(())
@@ -1279,6 +1284,8 @@ fn probe_dependencies_uncached(use_case: PrivateNetworkUse) -> Result<(), String
         ("nsenter", "--version", false),
         ("iptables", "--version", true),
         ("ip6tables", "--version", true),
+        ("iptables-restore", "--version", true),
+        ("ip6tables-restore", "--version", true),
     ] {
         let mut command = Command::new(binary);
         command.arg(probe);
@@ -2104,96 +2111,50 @@ mod tests {
     }
 
     #[test]
-    fn script_accepts_loopback_before_applying_any_rule() {
-        // iptables is first-match, so the ordering *is* the policy: loopback is
-        // exempted first, the caller's rules are applied in the order the plan
-        // holds them, and only then does the terminal verdict close the chain.
-        // A terminal appended ahead of the loop would black-hole every rule.
-        let loopback = script_offset(r#"iptables -A "$chain" -o lo -j ACCEPT"#);
-        let loop_start = script_offset("while IFS=' ' read -r family verdict");
-        let terminal = script_offset(r#"-A "$chain" -j "$v4_terminal""#);
-
-        assert!(loopback < loop_start, "loopback accept must come first");
-        assert!(
-            loop_start < terminal,
-            "the caller's rules must precede the terminal verdict"
-        );
-    }
-
-    #[test]
     fn script_signals_readiness_only_after_rules_are_installed() {
         // The caller releases the workload on this signal, so emitting it early
         // would let the workload run with egress wide open.
-        let last_rule = script_offset(r#"ip6tables -A OUTPUT -j "$chain""#);
+        let last_restore = script_offset("ip6tables-restore");
         let ready = script_offset(r#"printf ready > "$state_dir/slirp.ready""#);
 
         assert!(
-            last_rule < ready,
-            "readiness must be signalled after the final rule"
+            last_restore < ready,
+            "readiness must be signalled after the final restore"
         );
     }
 
     #[test]
-    fn the_script_hardcodes_no_accept_but_loopback() {
-        // Every other accept must come from the plan, which is what makes the
-        // posture auditable in one place. A hardcoded exemption here -- a port
-        // 53 accept being the obvious temptation -- would be invisible to the
-        // rule model and to every policy test written against it.
-        let accepts: Vec<String> = normalised_script()
-            .lines()
-            .filter(|line| line.contains("-j ACCEPT"))
-            .map(str::to_owned)
-            .collect();
-
-        assert_eq!(
-            accepts,
-            vec![
-                r#"nsenter --net="$ns" -- iptables -A "$chain" -o lo -j ACCEPT"#,
-                r#"nsenter --net="$ns" -- ip6tables -A "$chain" -o lo -j ACCEPT"#,
-            ],
-            "only the sandbox's own loopback may be accepted outside the plan"
-        );
-    }
-
-    #[test]
-    fn the_script_hardcodes_no_destination_of_its_own() {
-        // Destinations reach iptables only through the rules file, whose every
-        // address was re-rendered from a parsed one. A `-d` written into the
-        // script would bypass that and could carry anything.
+    fn the_script_hardcodes_no_rule_of_its_own() {
+        // Every rule reaches iptables through a restore payload rendered in
+        // Rust from parsed addresses, which is what makes the posture auditable
+        // in one place and keeps caller text out of the shell entirely. A rule
+        // written into the script -- a port 53 accept being the obvious
+        // temptation -- would be invisible to the rule model and to every
+        // policy test written against it.
         for line in normalised_script().lines() {
-            assert!(
-                !line.contains(" -d ") || line.contains(r#"-d "$address""#),
-                "the script names a destination that did not come from the rules file: {line}"
-            );
+            for fragment in [" -j ACCEPT", " -j DROP", " -d ", " -A ", " -N "] {
+                assert!(
+                    !line.contains(fragment),
+                    "the script names a rule that did not come from the payload: {line}"
+                );
+            }
         }
     }
 
     #[test]
-    fn script_closes_ipv6_on_its_own_terminal() {
-        // v6 gets its own terminal verdict rather than sharing v4's chain, so
-        // a v4-only rule set still closes v6 instead of leaving it open.
-        let v6_terminal = script_offset(r#"ip6tables -A "$chain" -j "$v6_terminal""#);
-        let v6_hook = script_offset(r#"ip6tables -A OUTPUT -j "$chain""#);
-
-        assert!(
-            v6_terminal < v6_hook,
-            "the v6 chain must be closed before being hooked"
-        );
-    }
-
-    #[test]
-    fn script_hooks_both_chains_into_output() {
-        // An unhooked chain is never consulted and enforces nothing.
-        script_offset(r#"iptables -A OUTPUT -j "$chain""#);
-        script_offset(r#"ip6tables -A OUTPUT -j "$chain""#);
+    fn script_restores_both_families() {
+        // A family left unrestored is a family with no chain and no terminal
+        // verdict, so it would stay wide open.
+        script_offset("-- iptables-restore ");
+        script_offset("-- ip6tables-restore ");
     }
 
     #[test]
     fn script_installs_rules_synchronously() {
-        // Offset-based ordering assertions only hold if the rules run inline.
-        // Backgrounding any of them would satisfy those tests while destroying
+        // Offset-based ordering assertions only hold if the restores run
+        // inline. Backgrounding one would satisfy those tests while destroying
         // the guarantee that rules precede readiness.
-        let rules_start = script_offset(r#"nsenter --net="$ns" -- iptables -N "$chain""#);
+        let rules_start = script_offset("-- iptables-restore ");
         let ready = script_offset(r#"printf ready > "$state_dir/slirp.ready""#);
         let script = normalised_script();
         let region = &script[rules_start..ready];
@@ -2410,8 +2371,8 @@ mod tests {
         }
     }
 
-    /// Every rule call must wait for the shared host lock. One unguarded call
-    /// is enough to fail a concurrent launch under `set -e`.
+    /// Every restore call must wait for the shared host lock. One unguarded
+    /// call is enough to fail a concurrent launch under `set -e`.
     #[test]
     fn every_rule_command_waits_for_the_xtables_lock() {
         let code: Vec<&str> = SUPERVISOR_SCRIPT
@@ -2420,64 +2381,83 @@ mod tests {
             .filter(|line| !line.starts_with('#'))
             .collect();
 
-        // The fixed scaffolding: per family a chain creation, the loopback
-        // exemption, the terminal verdict and the OUTPUT hook. Matched on the
-        // invocation, so the loop's `tool=iptables` assignments do not count.
-        let fixed: Vec<&&str> = code
+        let restores: Vec<&&str> = code
             .iter()
-            .filter(|line| line.contains("-- iptables ") || line.contains("-- ip6tables "))
+            .filter(|line| line.contains("tables-restore"))
             .collect();
         assert_eq!(
-            fixed.len() as u32,
-            crate::network_rules::BASE_RULE_COMMANDS,
-            "BASE_RULE_COMMANDS is stale, so the rule-install budget is wrong"
-        );
-
-        // The per-rule calls, which reach iptables or ip6tables through the
-        // family the record selects.
-        let dispatched: Vec<&&str> = code
-            .iter()
-            .filter(|line| line.contains(r#"-- "$tool""#))
-            .collect();
-        assert_eq!(
-            dispatched.len(),
+            restores.len(),
             2,
-            "the rule loop should have exactly a ported and an unported branch"
+            "one restore call site per family; the per-family loop is what scales"
         );
 
-        for rule in fixed.into_iter().chain(dispatched) {
+        for restore in &restores {
             assert!(
-                rule.contains(r#"-w "$lock_wait""#),
-                "rule may fail instantly on a contended host lock: {rule}"
+                restore.contains(r#"-w "$lock_wait""#),
+                "restore may fail instantly on a contended host lock: {restore}"
+            );
+            assert!(
+                restore.contains(" -n "),
+                "restore without -n flushes tables it did not write: {restore}"
+            );
+        }
+
+        // The whole policy travels in the restore payloads now, so any
+        // surviving per-rule invocation would be an unbatched leftover.
+        assert!(
+            !code
+                .iter()
+                .any(|line| line.contains("-- iptables ") || line.contains("-- ip6tables ")),
+            "rule installation must go through iptables-restore, not per-rule calls"
+        );
+    }
+
+    /// The budget must cover the worst case it was sized for, or `-w` just
+    /// moves the failure from iptables to the parent's timeout.
+    #[test]
+    fn rule_install_budget_covers_every_transaction_blocking_on_the_lock() {
+        for transactions in [2usize, 5, 11] {
+            let budget = rule_install_timeout(transactions, 0);
+            assert!(
+                budget > XTABLES_LOCK_WAIT * transactions as u32,
+                "a fully contended host would time out before -w could succeed, and the \
+                 budget also covers slirp startup, so it needs headroom above the lock \
+                 waits: {transactions} transactions got {budget:?}"
             );
         }
     }
 
-    /// Equality with the lock sum is not enough: the same deadline also spans
-    /// slirp startup and one process launch per rule.
+    /// The reason the budget scales at all is a large policy, so it must not
+    /// scale without bound -- that is the failure mode the previous per-rule
+    /// budget had.
     #[test]
-    fn rule_install_budget_covers_every_command_blocking_on_the_lock() {
-        for plan in [
-            EgressPlan::for_proxy(Ipv4Addr::new(10, 1, 2, 3), 3128),
-            plan_with_rule_count(0),
-            plan_with_rule_count(25),
-        ] {
-            let contended = XTABLES_LOCK_WAIT * plan.command_count();
-            let budget = rule_install_timeout(&plan, 0);
-            assert!(
-                budget > contended,
-                "a fully contended host would time out before -w could succeed"
-            );
-            assert!(
-                budget - contended >= STARTUP_TIMEOUT,
-                "the budget leaves no room for slirp startup on top of lock contention"
-            );
-            assert!(
-                budget - contended - STARTUP_TIMEOUT
-                    >= Duration::from_secs(plan.command_count() as u64),
-                "the budget leaves no room to spawn one nsenter per rule"
-            );
-        }
+    fn the_rule_install_budget_is_bounded_however_large_the_policy_is() {
+        assert_eq!(rule_install_timeout(usize::MAX, 0), RULE_INSTALL_CEILING);
+        assert!(
+            rule_install_timeout(2, 0) < RULE_INSTALL_CEILING,
+            "an ordinary policy must not be charged the ceiling"
+        );
+    }
+
+    /// This budget is spent before the child's own timeout exists, so without
+    /// the clamp setup could outlast the deadline the caller asked for.
+    #[test]
+    fn rule_install_budget_never_outlasts_the_requested_deadline() {
+        let deadline = Duration::from_secs(25);
+        assert!(rule_install_timeout(2, 0) > deadline, "premise");
+        assert_eq!(rule_install_timeout(2, 25_000), deadline);
+    }
+
+    /// Setup has an irreducible cost, so clamping all the way down would fail
+    /// every sandbox with a short workload timeout.
+    #[test]
+    fn the_deadline_clamp_stops_at_the_startup_floor() {
+        assert_eq!(rule_install_timeout(2, 1_000), RULE_INSTALL_FLOOR);
+    }
+
+    #[test]
+    fn an_absent_deadline_leaves_the_budget_unclamped() {
+        assert!(rule_install_timeout(2, 0) > RULE_INSTALL_FLOOR);
     }
 
     /// A plan whose rule count is what the test cares about. Sized through the
@@ -2488,57 +2468,62 @@ mod tests {
             ..Default::default()
         };
         request.policy.allowed_hosts = (0..count)
-            .map(|n| format!("10.{}.{}.{}", (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff))
+            .map(|n| format!("10.0.{}.{}", n / 256, n % 256))
             .collect();
         EgressPlan::for_policy(&request).expect("literal addresses must build a plan")
     }
 
-    /// The budget grows with the rule list, so a large policy is not timed out
-    /// for being large.
+    /// A rejected transaction installs nothing, so the supervisor must fail
+    /// closed *and* name the likeliest cause: iptables reports a missing
+    /// `nf_conntrack` only as "Invalid argument", which is unactionable.
     #[test]
-    fn rule_install_budget_grows_with_the_rule_list() {
+    fn a_rejected_transaction_surfaces_the_conntrack_hint() {
+        let plan = plan_with_rule_count(3);
+        for transaction in 1..=2 {
+            let mut supervisor =
+                spawn_fake_supervisor_with_plan(&plan, &denied_ingress(), Some(transaction), false);
+            supervisor.publish_sandbox_pid();
+            let status = supervisor.wait_for_exit();
+
+            assert!(
+                !status.success(),
+                "transaction {transaction} failed but the supervisor lived on"
+            );
+            let stderr = supervisor.stderr();
+            assert!(
+                stderr.contains("nf_conntrack"),
+                "a rejected transaction must name the missing kernel module, got: {stderr}"
+            );
+        }
+    }
+
+    /// The payload filenames are a contract between the Rust renderer and the
+    /// shell globs that apply them. They live in different languages, so
+    /// nothing but this test stops one side from drifting.
+    #[test]
+    fn the_script_globs_match_the_rendered_payload_names() {
+        for family in [RuleFamily::V4, RuleFamily::V6] {
+            let glob = format!("\"$state_dir\"/{}*", family.payload_prefix());
+            assert!(
+                SUPERVISOR_SCRIPT.contains(&glob),
+                "the script has no glob {glob} for the payloads the renderer writes"
+            );
+            assert!(
+                payload_file_name(family, 0, 1).starts_with(family.payload_prefix()),
+                "the renderer stopped using the prefix the glob matches"
+            );
+        }
+    }
+
+    /// IPv6 stays off until the rules carry the RFC 4890 ICMPv6 exemptions:
+    /// enabling it without them would break neighbour discovery and PMTUD
+    /// behind a chain that ends in DROP.
+    #[test]
+    fn the_supervisor_leaves_ipv6_disabled_in_the_namespace() {
         assert!(
-            rule_install_timeout(&plan_with_rule_count(50), 0)
-                > rule_install_timeout(&plan_with_rule_count(1), 0)
+            !SUPERVISOR_SCRIPT.contains("--enable-ipv6"),
+            "slirp4netns must not offer IPv6 while the ingress chain lacks ICMPv6 exemptions"
         );
-    }
-
-    /// Host lists are uncapped and this budget is consumed before the child's
-    /// own timeout exists, so an unbounded sum would authorize hours of startup.
-    #[test]
-    fn rule_install_budget_is_capped_for_a_pathological_rule_list() {
-        let budget = rule_install_timeout(&plan_with_rule_count(10_000), 0);
-        assert_eq!(budget, RULE_INSTALL_TIMEOUT_CAP);
-        // The uncapped sum is what makes the cap load-bearing.
-        assert!(
-            Duration::from_secs(10_000 * XTABLES_LOCK_WAIT.as_secs()) > RULE_INSTALL_TIMEOUT_CAP
-        );
-    }
-
-    #[test]
-    fn rule_install_budget_never_outlasts_the_requested_deadline() {
-        // 30s workload deadline against a list whose uncapped budget exceeds it.
-        let plan = plan_with_rule_count(25);
-        let deadline = Duration::from_secs(30);
-        assert!(rule_install_timeout(&plan, 0) > deadline, "premise");
-        assert_eq!(rule_install_timeout(&plan, 30_000), deadline);
-    }
-
-    #[test]
-    fn the_deadline_clamp_stops_at_the_startup_floor() {
-        // A 1s workload timeout cannot starve slirp startup: setup has an
-        // irreducible cost, and clamping to it would fail every sandbox.
-        let plan = plan_with_rule_count(25);
-        assert_eq!(
-            rule_install_timeout(&plan, 1_000),
-            RULE_INSTALL_TIMEOUT_FLOOR
-        );
-    }
-
-    #[test]
-    fn an_absent_deadline_leaves_the_budget_unclamped() {
-        let plan = plan_with_rule_count(5);
-        assert!(rule_install_timeout(&plan, 0) > RULE_INSTALL_TIMEOUT_FLOOR);
     }
 
     #[test]
@@ -2782,9 +2767,21 @@ mod tests {
         assert_eq!(stderr_detail(&empty), "no stderr output");
     }
 
-    /// Counts the rule commands and fails the one named by `MXC_TEST_FAIL_AT`.
-    /// The real `nsenter` needs a live namespace and `CAP_SYS_ADMIN`; the
-    /// script only cares whether it succeeded.
+    /// Chain name the fake supervisor installs into. Distinct from
+    /// [`EGRESS_CHAIN`] so a test can never pass by matching production text.
+    const TEST_CHAIN: &str = "mxc-test-chain";
+    /// Inbound counterpart to [`TEST_CHAIN`].
+    const TEST_INGRESS_CHAIN: &str = "mxc-test-ingress";
+
+    /// Counts the restore commands and fails the one named by
+    /// `MXC_TEST_FAIL_AT`. The real `nsenter` needs a live namespace and
+    /// `CAP_SYS_ADMIN`; the script only cares whether it succeeded.
+    ///
+    /// The payload each restore would have applied is logged as
+    /// `<tool> <line>`, so tests can still assert on the rules that reached
+    /// iptables rather than only on the argument vector. The payload is found
+    /// by being the one argument that names an existing file, so the stub does
+    /// not have to track the renderer's filename scheme.
     const FAKE_NSENTER: &str = r#"#!/bin/sh
 count=$(cat "$MXC_TEST_COUNT" 2>/dev/null || echo 0)
 count=$((count + 1))
@@ -2793,6 +2790,20 @@ printf '%s\n' "$*" >> "$MXC_TEST_ARGS"
 if [ "${MXC_TEST_FAIL_AT:-0}" = "$count" ]; then
     echo "fake nsenter: forced failure on rule $count" >&2
     exit 1
+fi
+tool=""
+payload=""
+for arg in "$@"; do
+    case "$arg" in
+        iptables-restore|ip6tables-restore) tool="${arg%-restore}" ;;
+        -*) ;;
+        *) [ -f "$arg" ] && payload="$arg" ;;
+    esac
+done
+if [ -n "$tool" ] && [ -n "$payload" ]; then
+    while IFS= read -r line; do
+        printf '%s %s\n' "$tool" "$line" >> "$MXC_TEST_PAYLOAD"
+    done < "$payload"
 fi
 exit 0
 "#;
@@ -2827,7 +2838,7 @@ exec sleep 30
             self.dir.path().join("state")
         }
 
-        /// How many rule commands actually ran.
+        /// How many restore commands actually ran.
         fn rule_invocations(&self) -> u32 {
             fs::read_to_string(self.dir.path().join("rules.count"))
                 .ok()
@@ -2854,14 +2865,29 @@ exec sleep 30
         }
 
         /// The `-A <chain>` rules, stripped to the part that expresses policy.
+        ///
+        /// Read from the restore payloads the supervisor actually handed to
+        /// iptables: the count and argument vector alone cannot distinguish a
+        /// correct chain from one whose rules carry the wrong address, verdict
+        /// or order.
         fn chain_rules(&self) -> Vec<String> {
-            self.rule_log()
-                .into_iter()
+            let prefix = format!(" -A {TEST_CHAIN} ");
+            fs::read_to_string(self.dir.path().join("rules.payload"))
+                .unwrap_or_default()
+                .lines()
                 .filter_map(|line| {
-                    let (tool, rest) = line.split_once(" -w 1 -A mxc-test-chain ")?;
-                    let tool = tool.rsplit(' ').next()?;
+                    let (tool, rest) = line.split_once(&prefix)?;
                     Some(format!("{tool} {rest}"))
                 })
+                .collect()
+        }
+
+        /// Every line of every restore payload, prefixed with its tool.
+        fn payload_lines(&self) -> Vec<String> {
+            fs::read_to_string(self.dir.path().join("rules.payload"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
                 .collect()
         }
 
@@ -2946,13 +2972,19 @@ exec sleep 30
     fn spawn_fake_supervisor(fail_at: Option<u32>, slirp_dies: bool) -> FakeSupervisor {
         spawn_fake_supervisor_with_plan(
             &EgressPlan::for_proxy(SLIRP_HOST_GATEWAY_IP, 3128),
+            &denied_ingress(),
             fail_at,
             slirp_dies,
         )
     }
 
+    fn denied_ingress() -> IngressPlan {
+        IngressPlan::for_policy(&Default::default())
+    }
+
     fn spawn_fake_supervisor_with_plan(
         plan: &EgressPlan,
+        ingress: &IngressPlan,
         fail_at: Option<u32>,
         slirp_dies: bool,
     ) -> FakeSupervisor {
@@ -2961,7 +2993,17 @@ exec sleep 30
         let state = dir.path().join("state");
         fs::create_dir_all(&bin).expect("bin dir");
         fs::create_dir_all(&state).expect("state dir");
-        fs::write(state.join("egress.rules"), plan.render()).expect("rules file");
+        for family in [RuleFamily::V4, RuleFamily::V6] {
+            let payloads =
+                render_filter_payloads(plan, ingress, family, TEST_CHAIN, TEST_INGRESS_CHAIN);
+            for (index, payload) in payloads.iter().enumerate() {
+                fs::write(
+                    state.join(payload_file_name(family, index, payloads.len())),
+                    payload,
+                )
+                .expect("rules payload");
+            }
+        }
         install_stub(&bin.join("nsenter"), FAKE_NSENTER);
         install_stub(&bin.join("slirp4netns"), FAKE_SLIRP);
 
@@ -2980,13 +3022,11 @@ exec sleep 30
         command
             .args(["-c", SUPERVISOR_SCRIPT, "mxc-test-supervisor"])
             .arg(&state)
-            .arg("mxc-test-chain")
             .arg("1")
-            .arg(plan.v4_terminal().target())
-            .arg(plan.v6_terminal().target())
             .env("PATH", path)
             .env("MXC_TEST_COUNT", dir.path().join("rules.count"))
             .env("MXC_TEST_ARGS", dir.path().join("rules.args"))
+            .env("MXC_TEST_PAYLOAD", dir.path().join("rules.payload"))
             .env("MXC_TEST_SLIRP_PID", dir.path().join("slirp.pid"))
             .env(
                 "MXC_TEST_FAIL_AT",
@@ -3015,77 +3055,192 @@ exec sleep 30
         }
     }
 
-    /// Executing the script also re-checks the command count against the
-    /// number of commands that actually run, which the text-offset tests can
-    /// only approximate.
+    /// An ordinary policy still fits one transaction per family, and both hooks
+    /// ride in it, so a hook is never live over a partially built chain.
+    #[test]
+    fn each_family_is_restored_from_its_own_payload_in_one_transaction() {
+        let mut supervisor = spawn_fake_supervisor(None, false);
+        supervisor.publish_sandbox_pid();
+        supervisor.wait_until_ready();
+
+        let calls = supervisor.rule_log();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        for (call, tool) in calls.iter().zip(["iptables-restore", "ip6tables-restore"]) {
+            assert!(call.contains(tool), "{calls:?}");
+            assert!(call.contains(" -n "), "restore must be additive: {call}");
+        }
+
+        for tool in ["iptables", "ip6tables"] {
+            let lines: Vec<String> = supervisor
+                .payload_lines()
+                .into_iter()
+                .filter_map(|line| line.strip_prefix(&format!("{tool} ")).map(str::to_owned))
+                .collect();
+            assert_eq!(lines.first().map(String::as_str), Some("*filter"), "{tool}");
+            assert_eq!(
+                lines[lines.len() - 3],
+                format!("-A OUTPUT -j {TEST_CHAIN}"),
+                "the {tool} egress hook must be committed with its chain"
+            );
+            assert_eq!(
+                lines[lines.len() - 2],
+                format!("-A INPUT -j {TEST_INGRESS_CHAIN}"),
+                "the {tool} ingress hook must be committed with its chain"
+            );
+            assert_eq!(lines.last().map(String::as_str), Some("COMMIT"), "{tool}");
+        }
+    }
+
+    /// The inbound chain has to survive the trip through the supervisor, not
+    /// just the renderer: it is only real once iptables receives it.
+    #[test]
+    fn the_supervisor_installs_the_inbound_chain_alongside_the_outbound_one() {
+        let mut supervisor = spawn_fake_supervisor(None, false);
+        supervisor.publish_sandbox_pid();
+        supervisor.wait_until_ready();
+
+        for tool in ["iptables", "ip6tables"] {
+            let lines: Vec<String> = supervisor
+                .payload_lines()
+                .into_iter()
+                .filter_map(|line| line.strip_prefix(&format!("{tool} ")).map(str::to_owned))
+                .collect();
+            assert!(
+                lines.contains(&format!(":{TEST_INGRESS_CHAIN} - [0:0]")),
+                "{tool} must declare the inbound chain: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("ESTABLISHED,RELATED -j ACCEPT")),
+                "{tool} must keep replies flowing: {lines:?}"
+            );
+        }
+
+        assert_eq!(
+            supervisor.rule_log().len(),
+            2,
+            "the inbound chain must not cost an extra transaction"
+        );
+    }
+
+    /// Executing the script also re-checks that the whole policy travels in
+    /// the restore transactions the budget is sized for.
     #[test]
     fn the_supervisor_signals_readiness_only_after_every_rule_is_installed() {
-        let plan = EgressPlan::for_proxy(SLIRP_HOST_GATEWAY_IP, 3128);
         let mut supervisor = spawn_fake_supervisor(None, false);
         supervisor.publish_sandbox_pid();
         supervisor.wait_until_ready();
 
         assert_eq!(
             supervisor.rule_invocations(),
-            plan.command_count(),
-            "readiness was signalled after a different number of rules than the \
+            2,
+            "readiness was signalled after a different number of restores than the \
              startup budget is sized for; stderr: {}",
             supervisor.stderr()
         );
     }
 
-    /// A multi-rule policy must install every one of its rules before the
-    /// sandbox is released, not just the fixed scaffolding.
+    /// Batching is the point: an ordinary policy costs two transactions however
+    /// many host rules it carries.
     #[test]
-    fn a_policy_plan_installs_one_command_per_rule() {
-        for rule_count in [0, 1, 5] {
+    fn a_policy_plan_installs_a_fixed_number_of_commands() {
+        for rule_count in [0, 1, 5, 50] {
             let plan = plan_with_rule_count(rule_count);
-            let mut supervisor = spawn_fake_supervisor_with_plan(&plan, None, false);
+            let mut supervisor =
+                spawn_fake_supervisor_with_plan(&plan, &denied_ingress(), None, false);
             supervisor.publish_sandbox_pid();
             supervisor.wait_until_ready();
 
             assert_eq!(
                 supervisor.rule_invocations(),
-                crate::network_rules::BASE_RULE_COMMANDS + rule_count as u32,
+                2,
                 "a {rule_count}-rule policy installed the wrong number of commands; \
                  stderr: {}",
                 supervisor.stderr()
             );
+            assert_eq!(
+                supervisor
+                    .chain_rules()
+                    .iter()
+                    .filter(|rule| rule.contains(" -d "))
+                    .count(),
+                rule_count,
+                "a {rule_count}-rule policy reached iptables with the wrong rule count"
+            );
         }
     }
 
-    /// The fail-closed guarantee of the whole feature: a rule that does not
-    /// install must take the supervisor down *before* readiness, so the parent
+    /// The regression the byte budget exists for. A policy too large for one
+    /// netlink transaction must still arrive complete and in order, spread over
+    /// as many restores as it takes -- the previous single-transaction renderer
+    /// failed the whole table instead, and installed nothing.
+    #[test]
+    fn a_policy_too_large_for_one_transaction_is_split_and_still_arrives_whole() {
+        let rule_count = 2000;
+        let plan = plan_with_rule_count(rule_count);
+        let mut supervisor = spawn_fake_supervisor_with_plan(&plan, &denied_ingress(), None, false);
+        supervisor.publish_sandbox_pid();
+        supervisor.wait_until_ready();
+
+        assert!(
+            supervisor.rule_invocations() > 2,
+            "a {rule_count}-rule policy must not fit two transactions, or this test \
+             is not exercising the split"
+        );
+
+        let installed: Vec<String> = supervisor
+            .chain_rules()
+            .into_iter()
+            .filter(|rule| rule.contains(" -d "))
+            .collect();
+        assert_eq!(
+            installed.len(),
+            rule_count,
+            "splitting dropped rules; stderr: {}",
+            supervisor.stderr()
+        );
+        // Order is the policy, so the split must preserve it end to end.
+        for (index, rule) in installed.iter().enumerate() {
+            let expected = format!(" -d 10.0.{}.{} ", index / 256, index % 256);
+            assert!(
+                rule.contains(&expected),
+                "rule {index} arrived out of order: {rule}"
+            );
+        }
+    }
+
+    /// The fail-closed guarantee of the whole feature: a restore that does not
+    /// apply must take the supervisor down *before* readiness, so the parent
     /// never releases a sandbox whose egress is unenforced.
     ///
-    /// Asserting it for every rule position is the point. A future edit that
-    /// moves one command into a pipeline, an `if` condition or a subshell
-    /// escapes `set -e` and would start an unenforced sandbox while every
-    /// text-matching test above stayed green.
+    /// Asserting it for every position is the point. A future edit that moves
+    /// one command into a pipeline, an `if` condition or a subshell escapes
+    /// `set -e` and would start an unenforced sandbox while every text-matching
+    /// test above stayed green.
     #[test]
     fn a_failed_rule_kills_the_supervisor_instead_of_signalling_readiness() {
-        // Every position, including the per-rule ones inside the loop: a body
-        // that escapes `set -e` would start an unenforced sandbox.
         let plan = plan_with_rule_count(3);
-        for rule in 1..=plan.command_count() {
-            let mut supervisor = spawn_fake_supervisor_with_plan(&plan, Some(rule), false);
+        for rule in 1..=2 {
+            let mut supervisor =
+                spawn_fake_supervisor_with_plan(&plan, &denied_ingress(), Some(rule), false);
             supervisor.publish_sandbox_pid();
             let status = supervisor.wait_for_exit();
 
             assert!(
                 !status.success(),
-                "rule {rule} failed but the supervisor exited successfully; stderr: {}",
+                "restore {rule} failed but the supervisor exited successfully; stderr: {}",
                 supervisor.stderr()
             );
             assert!(
                 !supervisor.signalled_ready(),
-                "rule {rule} failed yet the sandbox was signalled ready -- it would \
+                "restore {rule} failed yet the sandbox was signalled ready -- it would \
                  have run with unenforced egress"
             );
             assert_eq!(
                 supervisor.rule_invocations(),
                 rule,
-                "rule {rule} failed but the script carried on installing rules"
+                "restore {rule} failed but the script carried on installing rules"
             );
         }
     }
@@ -3101,7 +3256,7 @@ exec sleep 30
         request.policy.allowed_hosts = vec!["203.0.113.7".into(), "2001:db8::/32".into()];
         let plan = EgressPlan::for_policy(&request).expect("literals must build a plan");
 
-        let mut supervisor = spawn_fake_supervisor_with_plan(&plan, None, false);
+        let mut supervisor = spawn_fake_supervisor_with_plan(&plan, &denied_ingress(), None, false);
         supervisor.publish_sandbox_pid();
         supervisor.wait_until_ready();
 
@@ -3109,10 +3264,10 @@ exec sleep 30
             supervisor.chain_rules(),
             vec![
                 "iptables -o lo -j ACCEPT".to_string(),
-                "ip6tables -o lo -j ACCEPT".to_string(),
                 "iptables -d 203.0.113.7 -j ACCEPT".to_string(),
-                "ip6tables -d 2001:db8::/32 -j ACCEPT".to_string(),
                 "iptables -j DROP".to_string(),
+                "ip6tables -o lo -j ACCEPT".to_string(),
+                "ip6tables -d 2001:db8::/32 -j ACCEPT".to_string(),
                 "ip6tables -j DROP".to_string(),
             ],
             "stderr: {}",
@@ -3131,7 +3286,7 @@ exec sleep 30
         request.policy.allowed_hosts = vec!["198.51.100.9".into()];
         let plan = EgressPlan::for_policy(&request).expect("literals must build a plan");
 
-        let mut supervisor = spawn_fake_supervisor_with_plan(&plan, None, false);
+        let mut supervisor = spawn_fake_supervisor_with_plan(&plan, &denied_ingress(), None, false);
         supervisor.publish_sandbox_pid();
         supervisor.wait_until_ready();
 
@@ -3164,7 +3319,7 @@ exec sleep 30
     #[test]
     fn the_proxy_posture_is_unchanged_by_the_rule_list() {
         let plan = EgressPlan::for_proxy(Ipv4Addr::new(10, 1, 2, 3), 3128);
-        let mut supervisor = spawn_fake_supervisor_with_plan(&plan, None, false);
+        let mut supervisor = spawn_fake_supervisor_with_plan(&plan, &denied_ingress(), None, false);
         supervisor.publish_sandbox_pid();
         supervisor.wait_until_ready();
 
@@ -3172,9 +3327,9 @@ exec sleep 30
             supervisor.chain_rules(),
             vec![
                 "iptables -o lo -j ACCEPT".to_string(),
-                "ip6tables -o lo -j ACCEPT".to_string(),
                 "iptables -p tcp -d 10.1.2.3 --dport 3128 -j ACCEPT".to_string(),
                 "iptables -j DROP".to_string(),
+                "ip6tables -o lo -j ACCEPT".to_string(),
                 "ip6tables -j DROP".to_string(),
             ],
             "stderr: {}",
@@ -3191,7 +3346,7 @@ exec sleep 30
         request.policy.allowed_hosts = vec!["203.0.113.7".into()];
         let plan = EgressPlan::for_policy(&request).expect("literals must build a plan");
 
-        let mut supervisor = spawn_fake_supervisor_with_plan(&plan, None, false);
+        let mut supervisor = spawn_fake_supervisor_with_plan(&plan, &denied_ingress(), None, false);
         supervisor.publish_sandbox_pid();
         supervisor.wait_until_ready();
 

@@ -28,13 +28,17 @@ requiring root privileges or a container runtime.
   the backend as unavailable — with the detected version — when the host is
   below that floor.
 - **Schema 0.8 private-namespace modes:** `slirp4netns` installed and on PATH,
-  plus `nsenter`, `iptables`, and `ip6tables` for the egress rules. These are
-  needed by **both** 0.8 modes that build a private network namespace — proxy
-  mode (`network.proxy`) and firewall enforcement
-  (`enforcementMode: "firewall"`), which share the same slirp-backed namespace
-  and the same dependency probe. None are required when neither applies: a
-  policy with no `network.proxy` and no 0.8 firewall enforcement, or a 0.6/0.7
-  policy using the legacy proxy and host-rule behavior.
+  plus `nsenter`, `iptables`, `ip6tables`, `iptables-restore`, and
+  `ip6tables-restore` for the in-namespace egress and ingress rules, and the
+  `nf_conntrack` kernel module loaded for the inbound chain's connection-state
+  match (unprivileged Bubblewrap cannot load it on demand).
+
+  This covers **both** 0.8 modes that get a private network namespace —
+  `network.proxy` (proxy-only egress) *and* `network.enforcementMode:
+  "firewall"` with host lists — because `validate` runs the same dependency
+  probe for each, and both render the same two chains. None are required when
+  the request resolves to neither mode (no proxy and no enforced host lists),
+  or when a 0.6/0.7 policy uses the legacy proxy behavior.
 
   > `ip6tables` is required to *deny* IPv6, not to carry it. slirp4netns is
   > launched without `--enable-ipv6`, so the sandbox namespace has no IPv6
@@ -318,7 +322,7 @@ namespace choice alone decides the outcome:
 
 | `allowLocalNetwork` | Namespace | Result |
 |---------------------|-----------|--------|
-| `false` (default) | private (`--unshare-net`; isolated, plus 0.8 proxy and firewall modes) | Honored at the sandbox boundary — nothing outside can reach in. `bind()`/`listen()` still succeed on the sandbox's own loopback, so its processes can talk to each other; that is already inside the caller's trust boundary |
+| `false` (default) | private (`--unshare-net`; isolated, plus 0.8 proxy and firewall modes) | Honored at the sandbox boundary — nothing outside can reach in, and on 0.8 the proxy and firewall modes additionally drop new inbound connections in an `MXC_INGRESS` chain (see below). `bind()`/`listen()` still succeed on the sandbox's own loopback, so its processes can talk to each other; that is already inside the caller's trust boundary |
 | `false` | shared with host | **Not honored** — the process can bind/listen on host-local addresses |
 | `true` | private (`--unshare-net`) | **Partially honored** — the listener is reachable only from inside the sandbox |
 | `true` | shared with host | Honored |
@@ -339,6 +343,47 @@ is still a request for inbound denial and is rejected the same way: a bare
 Callers who want the shared namespace acknowledge the exposure with
 `allowLocalNetwork: true` (row 4), the same acknowledgment IsolationSession
 requires for this field.
+
+#### Inbound is closed by the namespace, and by a chain
+On schema `0.8.0-alpha` and later, the modes that build a private network
+namespace (proxy and firewall-enforced) also install an `MXC_INGRESS` chain
+hooked into `INPUT`, for both families:
+
+```
+-i lo -j ACCEPT
+-m state --state ESTABLISHED,RELATED -j ACCEPT
+-m state --state NEW -j DROP
+-j DROP
+```
+
+Be honest about what this buys. It is **not** new protection: nothing outside
+the sandbox can reach in already, because the runner configures no port
+forwarding into the namespace, so there is no path for an inbound packet to
+arrive on. The chain is defense in depth against a future change that adds
+one, and the mechanism the GA networking spec expects a backend to apply
+`ingress.default` through. The terminal `DROP` is deliberately independent of
+`network.defaultPolicy`, which governs egress only — an open outbound posture
+must not open inbound as a side effect.
+
+The `ESTABLISHED,RELATED` accept is not optional. A terminal `INPUT` drop
+applies to reply packets too, so without it the sandbox would lose all
+networking rather than gain an inbound restriction.
+
+That connection-state match requires `nf_conntrack` on the host. Unprivileged
+Bubblewrap cannot `modprobe`, so if the module is not already loaded the
+`iptables-restore` transaction fails, iptables rolls the whole table back, and
+the supervisor aborts before releasing the workload. The failure is loud and
+fail-closed by construction, not a silently unenforced sandbox. No separate
+probe is performed: the transaction is a stricter check than probing the
+userspace extension would be, because it exercises the match in the actual
+namespace.
+
+No RFC 4890 ICMPv6 exemptions are emitted. `slirp4netns` runs without
+`--enable-ipv6`, so the namespace has no IPv6 for them to govern; they must be
+added in the same change that enables it.
+
+Legacy schemas are unaffected. Below `0.8.0-alpha`, proxy mode resolves to the
+shared host network namespace, where no chain of any kind is installed.
 
 ### Process Settings
 
@@ -373,9 +418,10 @@ request fails if its private namespace cannot be configured.
 
 0. Before anything is launched, `validate` probes the host tools this mode
    depends on — `slirp4netns`, `unshare` (checked for `--map-current-user` and
-   `--keep-caps`), `nsenter`, `iptables`, and `ip6tables` — so a host that is
+   `--keep-caps`), `nsenter`, `iptables`, `ip6tables`, `iptables-restore`, and
+   `ip6tables-restore` — so a host that is
    missing one fails immediately with a message naming it, rather than partway
-   through supervisor startup. For `iptables`/`ip6tables` presence is not
+   through supervisor startup. For the `iptables` family presence is not
    enough: the probe also reads the backend from the version banner and refuses
    a legacy backend whose `/run/xtables.lock` this user cannot open, because
    the unprivileged supervisor would otherwise die at the first rule. Each
@@ -396,8 +442,19 @@ request fails if its private namespace cannot be configured.
    through slirp's `10.0.2.2` host gateway. Once slirp is up, the supervisor
    programs a default-DROP `MXC_EGRESS` chain into that namespace via
    `nsenter`, permitting only loopback and the proxy endpoint (IPv6 gets a
-   DROP-only chain). The workload is released only after every rule is
-   installed, so it can never run with egress open. A failure to program any
+   DROP-only chain), plus a default-DROP `MXC_INGRESS` chain on `INPUT`
+   (see [Inbound](#inbound-is-closed-by-the-namespace-and-by-a-chain)).
+   Each family's whole table — both chains, their rules in
+   order, the terminal verdicts and the `OUTPUT` / `INPUT` hooks — is applied
+   with `iptables-restore` rather than rule by rule, so the cost of a policy
+   does not grow with the caller's host lists. One restore is one bounded
+   netlink transaction, so a table too large for it is split across numbered
+   payload files against a byte budget and applied in order (`-n`, so each
+   later transaction appends). Both built-in hooks ride in the *last*
+   transaction of a family, so a hook is never live over a half-built chain
+   and a partial apply leaves the policy unhooked rather than half-enforced.
+   The workload is released only after every transaction is
+   applied, so it can never run with egress open. A failure to program any
    rule aborts the supervisor rather than starting an unenforced sandbox.
 
    Bubblewrap joins the supervisor's user namespace (`--userns`) rather than
@@ -580,7 +637,7 @@ resolution.
 | Rootfs | Downloads distro rootfs | Bind-mounts host filesystem |
 | Startup | Create → Start → Attach | Single `bwrap` exec; the 0.8 private-namespace modes (proxy and firewall enforcement) add a user/network-namespace supervisor, a `slirp4netns` instance and an egress rule set |
 | Network isolation | iptables + veth | `--unshare-net`, private netns + slirp4netns, or iptables |
-| Dependencies | `lxc-*` tools, templates | `bwrap`; the 0.8 private-namespace modes also need `slirp4netns`, util-linux `unshare` and `nsenter`, plus `iptables` and `ip6tables` on the `nf_tables` backend |
+| Dependencies | `lxc-*` tools, templates | `bwrap`; the 0.8 private-namespace modes also need `slirp4netns`, util-linux `unshare` and `nsenter`, plus `iptables`, `ip6tables` and their `-restore` counterparts on the `nf_tables` backend |
 | Lifecycle | Create/destroy containers | Process dies on exit; proxy mode's supervisor is reaped with it |
 
 **When to use Bubblewrap:**
