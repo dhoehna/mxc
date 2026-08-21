@@ -24,7 +24,7 @@ use wxc_common::state_aware_backend::{
 use crate::filesystem_mounts;
 use crate::lxc_bindings::{mint_exec_marker, LxcContainer};
 use crate::network_ingress::IngressManager;
-use crate::network_iptables::{CreatedResources, NetworkIptablesManager};
+use crate::network_iptables::{requires_firewall, CreatedResources, NetworkIptablesManager};
 use crate::signal_cleanup;
 
 /// Stateless state-aware LXC runner.
@@ -326,7 +326,7 @@ fn apply_network_policy(
     // whether to install rules, so the pin hook and the multi-interface guard
     // run exactly when a chain will be scoped to the veth, and never when the
     // apply is a no-op.
-    if policy.requires_firewall() {
+    if requires_firewall(&policy) {
         // Exactly one interface gets a pinned veth, and apply_firewall_rules
         // hooks exactly one interface. A container this run created has exactly
         // that one interface, but provision also adopts containers it did not
@@ -864,7 +864,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             // answer that does not report enforcement that never happened.
             if has_filesystem_policy(&request.policy)
                 || has_network_policy(&request.policy)
-                || request.policy.requires_firewall()
+                || requires_firewall(&request.policy)
             {
                 return Err(MxcError::already_started(
                     "LXC container is already running; start policy cannot be reapplied",

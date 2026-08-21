@@ -792,13 +792,6 @@ impl ContainerPolicy {
             &self.blocked_hosts,
         )
     }
-
-    pub fn requires_firewall(&self) -> bool {
-        self.default_network_policy == NetworkPolicy::Block
-            || !self.allowed_hosts.is_empty()
-            || !self.blocked_hosts.is_empty()
-            || self.network_proxy.is_enabled()
-    }
 }
 
 /// Windows denial-capture settings (from `processContainer.captureDenials`).

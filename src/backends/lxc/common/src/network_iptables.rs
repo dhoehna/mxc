@@ -368,6 +368,24 @@ pub fn ingress_chain_name_for(container_name: &str) -> String {
     chain_name_with_prefix("MXCI-", INGRESS_CHAIN_SLUG_LEN, container_name)
 }
 
+/// True when a policy obliges this module to install egress rules.
+///
+/// `default_network_policy` defaults to `Block`, so a request carrying no
+/// `network` section is a deny-all. `enforcementMode` is deliberately not
+/// consulted: a caller may get more enforcement than the mode asked for, never
+/// less.
+///
+/// This lives here rather than on `ContainerPolicy` because it describes what
+/// *this* firewall implementation must do, not a property of the policy. Both
+/// LXC and Bubblewrap reach it through [`NetworkIptablesManager`], and no other
+/// backend enforces this way.
+pub(crate) fn requires_firewall(policy: &ContainerPolicy) -> bool {
+    policy.default_network_policy == NetworkPolicy::Block
+        || !policy.allowed_hosts.is_empty()
+        || !policy.blocked_hosts.is_empty()
+        || policy.network_proxy.is_enabled()
+}
+
 /// Shared chain-name builder: `<prefix><slug>-<hash>`, or `<prefix><hash>` when
 /// the container name yields no slug. The hash is the leading
 /// [`CHAIN_HASH_BYTES`] of the SHA-256 of the original container name, base32
@@ -2048,7 +2066,7 @@ impl NetworkIptablesManager {
     ) -> Result<bool, String> {
         // `enforcementMode` is deliberately not consulted here; a caller may get
         // more enforcement than the mode asked for, never less.
-        if !policy.requires_firewall() {
+        if !requires_firewall(policy) {
             logger.log_line(
                 "Network policy requires no egress firewall (permissive default, no host \
                  lists, no proxy); skipping iptables.",

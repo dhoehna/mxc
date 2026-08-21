@@ -17,7 +17,7 @@ use wxc_common::validator::{validate_network_policy_support, NetworkPolicySuppor
 use crate::filesystem_mounts;
 use crate::lxc_bindings::{LxcContainer, NetInterfaceConfig};
 use crate::network_ingress::IngressManager;
-use crate::network_iptables::NetworkIptablesManager;
+use crate::network_iptables::{requires_firewall, NetworkIptablesManager};
 use crate::signal_cleanup;
 
 /// Comment marker on every `/etc/hosts` line this runner writes, so a later
@@ -252,7 +252,7 @@ impl LxcScriptRunner {
 
         // Read once, so the refusal below and the pin decision cannot disagree
         // about the same container.
-        let net_config = if request.policy.requires_firewall() {
+        let net_config = if requires_firewall(&request.policy) {
             match container.configured_net_interfaces() {
                 Ok(net) => Some(net),
                 Err(e) => {
@@ -291,7 +291,7 @@ impl LxcScriptRunner {
         // iptables accepts a rule naming an interface that does not exist yet,
         // so the name is pinned here and the interface catches up at start.
         let mut egress_installed = false;
-        if !running && request.policy.requires_firewall() {
+        if !running && requires_firewall(&request.policy) {
             let pinnable = net_config
                 .as_ref()
                 .map(Self::pinnable_before_start)
@@ -343,7 +343,7 @@ impl LxcScriptRunner {
             let _ = writeln!(logger, "Container already running.");
         }
 
-        if request.policy.requires_firewall() {
+        if requires_firewall(&request.policy) {
             Self::wait_for_network(&container_name, Duration::from_secs(10), logger);
         }
 
