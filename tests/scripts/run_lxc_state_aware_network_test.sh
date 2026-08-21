@@ -306,8 +306,14 @@ finish_current_sandbox() {
         fi
         echo "=== deprovision $SANDBOX_ID ==="
         run_phase deprovision "$SANDBOX_ID"
-        check "deprovision after $1 exits 0 for input $2" $?
-        SANDBOX_ID=""
+        local deprovision_rc=$?
+        check "deprovision after $1 exits 0 for input $2" "$deprovision_rc"
+        # Release the ID only once the container is actually gone. Clearing it
+        # after a failed deprovision disarms the EXIT trap, so a container this
+        # case could not remove leaks into every later case in the matrix.
+        if [ "$deprovision_rc" -eq 0 ]; then
+            SANDBOX_ID=""
+        fi
     fi
 }
 
