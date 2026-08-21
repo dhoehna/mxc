@@ -1054,6 +1054,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             stdout: null_pipe_handle(),
             stderr: null_pipe_handle(),
             stdin: null_pipe_handle(),
+            stdin_closer: None,
             waiter: Box::new(move || Ok(ExecOutcome::Exited(exit_code))),
             terminator: Box::new(|| Ok(())),
         })
@@ -1357,8 +1358,7 @@ mod tests {
             )
             .expect_err("an in-process caller must be refused");
         assert!(
-            err.message
-                .contains("does not support exec for an in-process caller"),
+            err.message.contains("cannot return exec streams"),
             "expected the shared refusal ahead of the id check, got: {}",
             err.message
         );
