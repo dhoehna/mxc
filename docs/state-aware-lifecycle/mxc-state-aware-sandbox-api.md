@@ -1651,7 +1651,7 @@ wire `version` field) plus any cross-cutting fields the matrix marks as honored 
 that phase (for IsolationSession's `provision`, the required `network`
 acknowledgment). The Rust struct receives only what the wire's
 `experimental.isolation_session.provision` block carries —
-`{ "appId": "Contoso.App_8wekyb3d8bbwe" }` — because that is what the dispatcher
+`{ "appId": "PFN:Contoso.App_8wekyb3d8bbwe" }` — because that is what the dispatcher
 deserialises into `Self::ProvisionConfig` (§9.3). The SDK is responsible for splitting
 the consumer Config into top-level wire fields (cross-cutting, `version`) and the
 experimental sub-block; Rust sees only the post-split shape.
@@ -1994,7 +1994,7 @@ calls (and the executor stops gating them behind `--experimental`). For example,
   "network": { "defaultPolicy": "allow", "allowLocalNetwork": true },
   "experimental": {
     "isolation_session": {
-      "provision": { "appId": "Contoso.App_8wekyb3d8bbwe" }
+      "provision": { "appId": "PFN:Contoso.App_8wekyb3d8bbwe" }
     }
   }
 }
@@ -2009,7 +2009,7 @@ to this shape after the backend's state-aware path graduates:
   "containment": "isolation_session",
   "network": { "defaultPolicy": "allow", "allowLocalNetwork": true },
   "isolation_session": {
-    "provision": { "appId": "Contoso.App_8wekyb3d8bbwe" }
+    "provision": { "appId": "PFN:Contoso.App_8wekyb3d8bbwe" }
   }
 }
 ```
