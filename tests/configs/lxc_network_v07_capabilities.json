@@ -1,9 +1,9 @@
 {
   "version": "0.7.0-alpha",
-  "containerId": "CLI-LXC-Network-Proxy-Credentials-Rejected",
+  "containerId": "CLI-LXC-V07-Capabilities",
   "containment": "lxc",
   "process": {
-    "commandLine": "echo THIS_MUST_NEVER_RUN"
+    "commandLine": "echo MXC_WORKLOAD_RAN"
   },
   "lifecycle": {
     "destroyOnExit": true
@@ -14,7 +14,6 @@
   },
   "network": {
     "defaultPolicy": "block",
-    "enforcementMode": "firewall",
-    "proxy": { "url": "http://alice:hunter2@10.0.3.1:3128" }
+    "blockedHosts": ["example.com"]
   }
 }
