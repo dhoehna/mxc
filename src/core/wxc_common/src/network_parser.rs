@@ -67,7 +67,11 @@ enum NetworkFormat {
     Directional,
 }
 
-/// Returns whether a proxy host names a loopback address.
+/// Any address in `127.0.0.0/8`, plus `::1` and `localhost`.
+///
+/// Use this to *reject* a host (LXC treats all of `127/8` as the container's
+/// own namespace loopback). Breadth is fail-safe here: a wider match rejects
+/// more. To *admit* a host, use [`host_is_canonical_loopback`].
 pub(crate) fn host_is_loopback(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
@@ -76,6 +80,22 @@ pub(crate) fn host_is_loopback(host: &str) -> bool {
         .parse::<IpAddr>()
         .map(|ip| ip.is_loopback())
         .unwrap_or(false)
+}
+
+/// Only `127.0.0.1` and `::1`, plus `localhost`; bracketed or not, any case.
+///
+/// Use this to *admit* a proxy host. The accept-set is exactly what Seatbelt's
+/// `(remote ip "localhost:<port>")` enforces — measured, not assumed: under
+/// that rule `127.0.0.1` and `::1` connect while `127.0.0.2` gets `EPERM`.
+/// Matching `127.0.0.0/8` here would admit a proxy the sandbox then blocks.
+pub fn host_is_canonical_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    matches!(
+        unbracket_host(host).parse::<IpAddr>(),
+        Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)) | Ok(IpAddr::V6(Ipv6Addr::LOCALHOST))
+    )
 }
 
 fn convert_wire_proxy_at(proxy: wire::Proxy, path: &str) -> Result<ProxyConfig, WxcError> {
@@ -335,7 +355,7 @@ fn apply_directional_network(
             .as_ref()
             .map(ProxyAddress::host)
             .unwrap_or_default();
-        if !runtime_proxy_host_is_supported(host) {
+        if !host_is_canonical_loopback(host) {
             return Err(WxcError::ConfigParse(
                 "runtimeConfig.networkProxy must use localhost, 127.0.0.1, or [::1]".to_string(),
             ));
@@ -365,16 +385,6 @@ fn validate_directional_proxy_policy(policy: &ContainerPolicy) -> Result<(), Wxc
         ));
     }
     Ok(())
-}
-
-fn runtime_proxy_host_is_supported(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    matches!(
-        unbracket_host(host).parse::<IpAddr>(),
-        Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)) | Ok(IpAddr::V6(Ipv6Addr::LOCALHOST))
-    )
 }
 
 fn convert_action(action: wire::NetworkAction) -> NetworkAction {
