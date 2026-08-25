@@ -308,12 +308,15 @@ finish_current_sandbox() {
         run_phase deprovision "$SANDBOX_ID"
         local deprovision_rc=$?
         check "deprovision after $1 exits 0 for input $2" "$deprovision_rc"
-        # Release the ID only once the container is actually gone. Clearing it
-        # after a failed deprovision disarms the EXIT trap, so a container this
-        # case could not remove leaks into every later case in the matrix.
-        if [ "$deprovision_rc" -eq 0 ]; then
-            SANDBOX_ID=""
+        if [ "$deprovision_rc" -ne 0 ]; then
+            # SANDBOX_ID is the EXIT trap's only handle on a container that is
+            # still up, and the next case's provision overwrites it. Stop here
+            # so the trap can still reach it, and so its stray veth and
+            # iptables state never reaches a later case's assertions.
+            echo "ABORT: deprovision failed for $SANDBOX_ID; refusing to run later cases against a dirty host."
+            exit 1
         fi
+        SANDBOX_ID=""
     fi
 }
 
