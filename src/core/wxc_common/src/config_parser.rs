@@ -495,29 +495,35 @@ fn normalize_filesystem_paths(policy: &mut ContainerPolicy, logger: &mut Logger)
 
 fn present_backend_sections(cfg: &wire::MxcConfig) -> Vec<&'static str> {
     let mut sections: Vec<&'static str> = Vec::new();
-    let mut push = |backend: ContainmentBackend| {
-        if let Some(path) = backend.section_path() {
+    let mut push = |path: Option<&'static str>| {
+        if let Some(path) = path {
             sections.push(path);
         }
     };
     if cfg.process_container.is_some() {
-        push(ContainmentBackend::ProcessContainer);
+        push(ContainmentBackend::ProcessContainer.section_path());
     }
     if cfg.lxc.is_some() {
-        push(ContainmentBackend::Lxc);
+        push(ContainmentBackend::Lxc.section_path());
     }
     if cfg.seatbelt.is_some() {
-        push(ContainmentBackend::Seatbelt);
+        push(ContainmentBackend::Seatbelt.section_path());
     }
     if let Some(experimental) = cfg.experimental.as_ref() {
         if experimental.windows_sandbox.is_some() {
-            push(ContainmentBackend::WindowsSandbox);
+            push(ContainmentBackend::WindowsSandbox.section_path());
         }
         if experimental.wslc.is_some() {
-            push(ContainmentBackend::Wslc);
+            push(ContainmentBackend::Wslc.section_path());
         }
         if experimental.isolation_session.is_some() {
-            push(ContainmentBackend::IsolationSession);
+            push(ContainmentBackend::IsolationSession.section_path());
+        }
+        // LXC is the one backend reachable under two spellings, and the
+        // state-aware payload arrives under this one, so it cannot borrow the
+        // top-level `section_path`.
+        if experimental.lxc.is_some() {
+            push(Some("experimental.lxc"));
         }
     }
     sections
@@ -569,21 +575,28 @@ fn validate_experimental_backend_keys(
         return Ok(());
     };
 
-    let matching_key = match containment {
-        Some(ContainmentBackend::Lxc) => Some("lxc"),
-        _ => containment
-            .and_then(|c| c.section_path())
-            .and_then(|path| path.strip_prefix("experimental.")),
-    };
-
     let present: Vec<&'static str> = KNOWN_EXPERIMENTAL_BACKENDS
         .iter()
         .copied()
         .filter(|key| map.contains_key(*key))
         .collect();
 
-    let rejected: Vec<&'static str> = match matching_key {
-        Some(allowed) => present.into_iter().filter(|k| *k != allowed).collect(),
+    let rejected: Vec<&'static str> = match containment {
+        // LXC is the one backend whose domain section is the top-level `lxc`
+        // while its state-aware payload arrives under `experimental.lxc`, so
+        // the allowed key cannot be derived from `section_path`.
+        Some(ContainmentBackend::Lxc) => present.into_iter().filter(|k| *k != "lxc").collect(),
+        // A backend that owns no `experimental.*` section matches no key, so
+        // every key present here is foreign.
+        Some(resolved) => {
+            let allowed = resolved
+                .section_path()
+                .and_then(|path| path.strip_prefix("experimental."));
+            present
+                .into_iter()
+                .filter(|k| Some(*k) != allowed)
+                .collect()
+        }
         None if present.len() > 1 => present,
         None => return Ok(()),
     };
@@ -6417,6 +6430,32 @@ mod tests {
         );
     }
 
+    // A provision naming one backend must not carry another backend's
+    // experimental block, whichever backend it names.
+    #[test]
+    fn state_aware_provision_with_foreign_experimental_lxc_rejected() {
+        let json = r#"{
+            "phase": "provision",
+            "containment": "process",
+            "experimental": {
+                "lxc": {"provision": {"distribution": "alpine", "release": "3.20"}}
+            }
+        }"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+        let err = load_mxc_request(&encoded, &mut logger, true)
+            .expect_err("provision naming process containment must not carry experimental.lxc");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Multiple containment backends configured"),
+            "error did not mention multi-backend rejection: {msg}"
+        );
+        assert!(
+            msg.contains("experimental.lxc"),
+            "error did not name the foreign section: {msg}"
+        );
+    }
+
     #[test]
     fn state_aware_lxc_experimental_backend_key_is_accepted() {
         let json = r#"{
@@ -6444,10 +6483,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn one_shot_foreign_experimental_wslc_rejected() {
+        assert_multi_backend_rejected(
+            "process",
+            r#""experimental": {"wslc": {"image": "alpine:latest"}}"#,
+            "experimental.wslc",
+        );
+    }
+
+    // A one-shot request carrying `experimental.lxc` names a backend it did not
+    // select, and the caller's distribution and release cannot survive the
+    // conversion, so it must be rejected rather than run as another backend.
+    #[test]
+    fn one_shot_foreign_experimental_lxc_rejected() {
+        assert_multi_backend_rejected(
+            "process",
+            r#""experimental": {"lxc": {"provision": {"distribution": "alpine", "release": "3.20"}}}"#,
+            "experimental.lxc",
+        );
+    }
+
     // ---- Abstract-intent coverage ----
     // Backend sections paired with `containment: "process"` / "vm" must be
     // accepted iff the intent resolves to the owning backend on this OS.
-
     #[cfg(target_os = "windows")]
     #[test]
     fn abstract_process_with_process_container_accepted_on_windows() {
