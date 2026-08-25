@@ -230,7 +230,7 @@ describe('IsolationSessionStopConfig and IsolationSessionDeprovisionConfig', () 
 describe('LxcStartConfig', () => {
   it('accepts the network fields LXC actually enforces', () => {
     const cfg: StartConfigFor<'lxc'> = {
-      version: '0.6.0-alpha',
+      version: '0.8.0-alpha',
       filesystem: { readwritePaths: ['/workspace'] },
       network: {
         defaultPolicy: 'block',

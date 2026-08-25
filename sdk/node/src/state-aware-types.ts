@@ -121,16 +121,12 @@ export interface LxcProvisionConfig {
  *   (`reject_unenforceable_network_policy`). The container's inbound chain can
  *   only open a source range, and opening every source is broader than the
  *   local-network access requested.
- * - `enforcementMode` is not offered.  On a directional schema (`version`
- *   `0.8.0-alpha` or later) these three fields drive enforcement on their own
- *   and the mode is ignored, so the field would advertise nothing.  The wire
- *   still accepts it, so a `network` object shared with another backend keeps
+ * - `enforcementMode` is not offered.  At the version this SDK sends
+ *   (`0.8.0-alpha`) `defaultPolicy`, `allowedHosts`, and `blockedHosts` drive
+ *   enforcement on their own and the mode is ignored.  An explicit pre-0.8
+ *   `version` records these fields and installs no firewall.  The wire still
+ *   accepts the field; a `network` object shared with another backend keeps
  *   parsing.
- *
- *   At LXC's default `version` of `0.6.0-alpha` these fields are recorded but
- *   no chain is installed: a schema that predates `enforcementMode` must not be
- *   handed a firewall it never asked for.  Pass `version: '0.8.0-alpha'` on
- *   `LxcStartConfig` to have `defaultPolicy` enforced.
  */
 export interface LxcNetworkConfig {
   defaultPolicy?: NetworkConfig['defaultPolicy'];

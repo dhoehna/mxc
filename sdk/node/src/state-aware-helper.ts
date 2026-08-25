@@ -17,6 +17,11 @@ export const STATE_AWARE_VERSION = '0.6.0-alpha';
 // See `DEFAULT_STATE_AWARE_VERSION`.
 export const WSLC_STATE_AWARE_VERSION = '0.8.0-alpha';
 
+// LXC's network surface is the directional field set, which a pre-0.8 schema
+// does not enforce.  On the shared default a policy would be accepted and no
+// firewall installed.
+export const LXC_STATE_AWARE_VERSION = '0.8.0-alpha';
+
 // Wire-format cross-cutting fields that live at the envelope's top level.
 // Anything else on a per-(backend, phase) Config is backend-specific and is
 // nested under `experimental.<backend>.<phase>`.
@@ -37,7 +42,7 @@ export const WSLC_ID_PREFIX = 'wslc';
 // global constant.
 const DEFAULT_STATE_AWARE_VERSION: Record<StateAwareContainmentBackend, string> = {
   isolation_session: STATE_AWARE_VERSION,
-  lxc: STATE_AWARE_VERSION,
+  lxc: LXC_STATE_AWARE_VERSION,
   windows_sandbox: STATE_AWARE_VERSION,
   wslc: WSLC_STATE_AWARE_VERSION,
 };

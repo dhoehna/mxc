@@ -633,6 +633,42 @@ describe('windows_sandbox state-aware lifecycle', () => {
   });
 });
 
+describe('lxc state-aware lifecycle', () => {
+  it('defaults the version to 0.8.0-alpha so a network policy is enforced', () => {
+    const env = buildStateAwareEnvelope({
+      phase: 'start',
+      backendKey: 'lxc',
+      sandboxId: 'lxc:abc',
+      config: { network: { defaultPolicy: 'block' } },
+    });
+    assert.strictEqual(env.version, '0.8.0-alpha');
+    assert.deepStrictEqual(env.network, { defaultPolicy: 'block' });
+  });
+
+  it('still honors a caller-supplied version over the lxc default', () => {
+    const env = buildStateAwareEnvelope({
+      phase: 'start',
+      backendKey: 'lxc',
+      sandboxId: 'lxc:abc',
+      config: { version: '0.6.0-alpha' },
+    });
+    assert.strictEqual(env.version, '0.6.0-alpha');
+  });
+
+  describe('round-trip via the typed API', { skip: platformSkip }, () => {
+    afterEach(() => { _resetSpawnImpl(); });
+
+    it('startSandbox sends a blocking policy on a version that enforces it', async () => {
+      const fake = fakeSpawn({ stdout: '{"result":{}}', exitCode: 0 });
+      _setSpawnImpl(fake.spawn);
+      const id = 'lxc:0123abcd' as SandboxId<'lxc'>;
+      await startSandbox(id, { network: { defaultPolicy: 'block' } }, testOptions());
+      assert.strictEqual(fake.captured.envelope?.version, '0.8.0-alpha');
+      assert.deepStrictEqual(fake.captured.envelope?.network, { defaultPolicy: 'block' });
+    });
+  });
+});
+
 describe('wslc state-aware lifecycle', () => {
   it('defaults the version to 0.8.0-alpha (not the isolation_session default)', () => {
     const env = buildStateAwareEnvelope({
