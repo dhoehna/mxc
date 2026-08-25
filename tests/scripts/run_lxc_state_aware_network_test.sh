@@ -429,7 +429,7 @@ run_start_case() {
             fi
         fi
 
-        if [ "$assert_default_deny" = "1" ] && [ "$rc" -eq 0 ]; then
+        if [ -n "$assert_default_deny" ] && [ "$rc" -eq 0 ]; then
             local veth chain direct terminal
             # The roadmap asks that the hook be applied, which a zero exit does
             # not show: a run that skipped enforcement and still reported success
@@ -453,7 +453,20 @@ run_start_case() {
             fi
 
             echo "=== case $case_no default-deny: live veth=${veth:-<none>} physdev->${chain:-<none>} direct->${direct:-<none>} ==="
-            if [ -n "$veth" ] && [ -n "$chain" ] && [ "$direct" = "$chain" ]; then
+            if [ "$assert_default_deny" = "none" ]; then
+                # Asserting the absence, rather than dropping the assertion, is
+                # what keeps this case able to fail: a start that quietly began
+                # installing chains again would still exit 0 and still run the
+                # container.
+                if [ -z "$chain" ] && [ -z "$direct" ]; then
+                    check "case $case_no leaves live veth ${veth:-<none>} out of every FORWARD chain -- $clause" 0
+                    actual="$actual; FORWARD carries no hook for veth ${veth:-<none>}"
+                else
+                    check "case $case_no leaves live veth ${veth:-<none>} out of every FORWARD chain -- $clause" 1
+                    actual="$actual; physdev hook=${chain:-<none>} direct hook=${direct:-<none>} for veth ${veth:-<none>}"
+                    status="FAIL"
+                fi
+            elif [ -n "$veth" ] && [ -n "$chain" ] && [ "$direct" = "$chain" ]; then
                 check "case $case_no hooks live veth $veth into $chain on both the physdev and direct paths -- (N1) default-deny outbound" 0
                 actual="$actual; FORWARD hooks $veth to $chain on both paths"
             else
@@ -462,15 +475,17 @@ run_start_case() {
                 status="FAIL"
             fi
 
-            terminal="$(iptables -S "$chain" 2>/dev/null | tail -1)"
-            echo "=== case $case_no terminal rule: ${terminal:-<none>} ==="
-            if [ -n "$chain" ] && [ "${terminal##* }" = "DROP" ]; then
-                check "case $case_no hooked chain ends in DROP -- (N1) default-deny outbound" 0
-                actual="$actual; chain ends in DROP"
-            else
-                check "case $case_no hooked chain ends in DROP -- (N1) default-deny outbound" 1
-                actual="$actual; terminal rule was ${terminal:-<none>}"
-                status="FAIL"
+            if [ "$assert_default_deny" != "none" ]; then
+                terminal="$(iptables -S "$chain" 2>/dev/null | tail -1)"
+                echo "=== case $case_no terminal rule: ${terminal:-<none>} ==="
+                if [ -n "$chain" ] && [ "${terminal##* }" = "DROP" ]; then
+                    check "case $case_no hooked chain ends in DROP -- (N1) default-deny outbound" 0
+                    actual="$actual; chain ends in DROP"
+                else
+                    check "case $case_no hooked chain ends in DROP -- (N1) default-deny outbound" 1
+                    actual="$actual; terminal rule was ${terminal:-<none>}"
+                    status="FAIL"
+                fi
             fi
         fi
     else
@@ -713,19 +728,29 @@ command -v lxc-create >/dev/null 2>&1 || skip "LXC state-aware network matrix UN
 
 echo "Running LXC state-aware network policy matrix test..."
 
+# Cases 1, 2, 5, 6, and 13 are the legacy half of the enforcement split, and
+# they assert an absence. A 0.7 request never writes `enforcementMode`, so it
+# gets the `capabilities` default and no firewall -- the compatibility
+# guarantee run_lxc_network_v07_schema_test.sh states from the other direction,
+# that a config predating the field is not handed a chain it never asked for.
+# The 0.8 reading of the same intent installs unconditionally and is covered by
+# run_lxc_network_ga_egress_test.sh.
+#
+# A caller who states hosts here is told nothing and gets nothing. That gap is
+# the price of the compatibility guarantee, not an oversight of these cases.
 run_start_case "1" "$CONFIG_NO_NETWORK" \
     'no network block at start' \
-    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    'start succeeds, exec proves the container runs, and no FORWARD chain is installed' \
     "1" "1" \
-    'an absent network block inherits deny-by-default and is enforced' \
-    "1"
+    '0.7 compatibility: an inherited default-deny policy installs no firewall on its own' \
+    "none"
 
 run_start_case "2" "$CONFIG_BLOCK_CAPS" \
     'defaultPolicy=block with enforcementMode omitted at start' \
-    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    'start succeeds, exec proves the container runs, and no FORWARD chain is installed' \
     "1" "1" \
-    'defaultPolicy=block is enforced when enforcementMode is omitted' \
-    "1"
+    '0.7 compatibility: defaultPolicy=block alone installs no firewall' \
+    "none"
 
 #
 # This is the direct observable proof of roadmap item 13's "ensure hook is
@@ -750,17 +775,17 @@ run_start_case "4" "$CONFIG_ALLOW_CAPS" \
 
 run_start_case "5" "$CONFIG_EMPTY_ALLOWED" \
     'allowedHosts empty list with enforcementMode omitted at start' \
-    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    'start succeeds, exec proves the container runs, and no FORWARD chain is installed' \
     "1" "1" \
-    'an empty list does not relax the inherited default-deny policy' \
-    "1"
+    '0.7 compatibility: an empty allowedHosts list installs no firewall' \
+    "none"
 
 run_start_case "6" "$CONFIG_NONEMPTY_ALLOWED" \
     'allowedHosts non-empty with enforcementMode omitted at start' \
-    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    'start succeeds, exec proves the container runs, and no FORWARD chain is installed' \
     "1" "1" \
-    'a non-empty allowedHosts policy is enforced when enforcementMode is omitted' \
-    "1"
+    '0.7 compatibility: a non-empty allowedHosts list installs no firewall' \
+    "none"
 
 # Clause: roadmap item 13 (N1) asks that default-deny outbound be enforced.  It
 # says nothing about how the container numbers its interfaces, and an interface
@@ -805,12 +830,14 @@ run_start_case "12" "$CONFIG_ALLOWED_FIREWALL" \
     '(N3) a non-empty allowedHosts policy remains enforceable with an explicit firewall mode' \
     "1"
 
+# The last of the legacy-compatibility group; see case 1 for why these assert
+# an absence.
 run_start_case "13" "$CONFIG_BLOCKED_CAPS" \
     'blockedHosts non-empty with enforcementMode omitted at start' \
-    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
+    'start succeeds, exec proves the container runs, and no FORWARD chain is installed' \
     "1" "1" \
-    '(N4) a non-empty blockedHosts policy is enforced when enforcementMode is omitted' \
-    "1"
+    '0.7 compatibility: a config that never wrote enforcementMode is not given a firewall' \
+    "none"
 
 # Clause: roadmap item 14 (N2) is explicit -- "reject `hostLoopback: "allow"`
 # rather than guessing ports or exposing the container IP." The roadmap records
