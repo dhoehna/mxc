@@ -31,6 +31,7 @@
 //! - [`Error`] / [`ErrorCode`] — the crate-owned error facade over
 //!   `wxc_common`'s internal error type.
 
+pub mod configs;
 mod dispatch;
 mod error;
 #[cfg(target_os = "windows")]
@@ -49,10 +50,13 @@ pub use platform::isolation_session_available;
 pub use platform::{platform_support, PlatformSupport};
 pub use policy::{
     available_tools_policy, build_request, build_request_with_containment, temporary_files_policy,
-    user_profile_policy, Containment, FilesystemPolicyResult, SandboxPolicy, SandboxRequest,
-    WslcSection,
+    user_profile_policy, Containment, FilesystemPolicyResult, NetworkAction, NetworkEgressSection,
+    NetworkIngressSection, NetworkPeerSection, NetworkPortSection, NetworkProtocol,
+    NetworkRuleSection, RuntimeConfigSection, SandboxPolicy, SandboxRequest, WslcSection,
 };
 pub use probe::{available_backends, AvailableBackend, BackendCapability};
+#[cfg(target_os = "windows")]
+pub use run::resolve_runner_for_audit;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub use run::{resolve_runner, run, ResolvedRunner};
 pub use state_aware::{

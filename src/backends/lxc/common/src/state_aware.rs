@@ -24,7 +24,7 @@ use wxc_common::state_aware_backend::{
 use crate::filesystem_mounts;
 use crate::lxc_bindings::{mint_exec_marker, LxcContainer};
 use crate::network_ingress::IngressManager;
-use crate::network_iptables::{requires_firewall, CreatedResources, NetworkIptablesManager};
+use crate::network_iptables::{installs_firewall, CreatedResources, NetworkIptablesManager};
 use crate::signal_cleanup;
 
 /// Stateless state-aware LXC runner.
@@ -262,7 +262,10 @@ fn apply_filesystem_policy(
 /// the apply path is invisible to it -- and a dry run that answers "this start
 /// is fine" for a policy the real start refuses is worse than no dry run, since
 /// the caller has asked precisely that question and been told the wrong answer.
-fn reject_unenforceable_network_policy(policy: &ContainerPolicy) -> Result<(), MxcError> {
+fn reject_unenforceable_network_policy(
+    policy: &ContainerPolicy,
+    uses_directional_schema: bool,
+) -> Result<(), MxcError> {
     if policy.network_proxy.is_enabled() {
         return Err(MxcError::policy_validation(
             "LXC state-aware start does not support network.proxy",
@@ -270,13 +273,15 @@ fn reject_unenforceable_network_policy(policy: &ContainerPolicy) -> Result<(), M
     }
 
     // A dry run stops before the ingress apply, so without this it would report
-    // success for a start that `IngressManager` refuses.
-    if policy.allow_local_network {
-        return Err(MxcError::policy_validation(
-            "LXC state-aware start does not support network.allowLocalNetwork: the container's \
-             inbound chain can only open a source range, and opening every source is broader \
-             than the local-network access requested. See microsoft/mxc AB#63505947.",
-        ));
+    // success for a start that `IngressManager` refuses. The classification is
+    // borrowed from the applier rather than restated here, so the two verdicts
+    // cannot drift apart as the schema grows new ways to ask for the same thing.
+    if let Some(field) = IngressManager::permissive_inbound_field(policy, uses_directional_schema) {
+        return Err(MxcError::policy_validation(format!(
+            "LXC state-aware start does not support {field}: the container's inbound chain can \
+             only open a source range, and opening every source is broader than the local-network \
+             access requested. See microsoft/mxc AB#63505947."
+        )));
     }
 
     Ok(())
@@ -290,7 +295,10 @@ fn reject_unenforceable_network_policy(policy: &ContainerPolicy) -> Result<(), M
 fn validate_start_policy(request: &ExecutionRequest) -> Result<(), MxcError> {
     let mut logger = Logger::new(Mode::Buffer);
     let policy = normalized_policy(request, &mut logger)?;
-    reject_unenforceable_network_policy(&policy)
+    reject_unenforceable_network_policy(
+        &policy,
+        wxc_common::supports_directional_network(&request.schema_version),
+    )
 }
 
 /// Apply the network policy, returning the record of what it installed.
@@ -303,11 +311,13 @@ fn apply_network_policy(
     request: &ExecutionRequest,
     logger: &mut Logger,
 ) -> Result<CreatedResources, MxcError> {
-    reject_unenforceable_network_policy(&request.policy)?;
+    let uses_directional_schema = wxc_common::supports_directional_network(&request.schema_version);
+    reject_unenforceable_network_policy(&request.policy, uses_directional_schema)?;
 
     let policy = normalized_policy(request, logger)?;
 
     let mut fw_manager = NetworkIptablesManager::new(container.name());
+    fw_manager.set_directional_schema(uses_directional_schema);
 
     // When the policy requires the egress firewall, MXC installs a
     // `lxc.hook.start-host` hook that renames the container's host-side veth to
@@ -326,7 +336,7 @@ fn apply_network_policy(
     // whether to install rules, so the pin hook and the multi-interface guard
     // run exactly when a chain will be scoped to the veth, and never when the
     // apply is a no-op.
-    if requires_firewall(&policy) {
+    if installs_firewall(&policy, uses_directional_schema) {
         // Exactly one interface gets a pinned veth, and apply_firewall_rules
         // hooks exactly one interface. A container this run created has exactly
         // that one interface, but provision also adopts containers it did not
@@ -490,9 +500,12 @@ fn apply_ingress_policy(
     logger: &mut Logger,
 ) -> Result<(), MxcError> {
     let policy = normalized_policy(request, logger)?;
+    let uses_directional_schema = wxc_common::supports_directional_network(&request.schema_version);
 
     let Some(pid) = container.init_pid() else {
-        // Ingress installs unconditionally, so a missing netns is always fatal.
+        if !installs_firewall(&policy, uses_directional_schema) {
+            return Ok(());
+        }
         // Enforcing inbound means entering the container's netns, and the init
         // PID is the only handle on it. Continuing would silently drop the
         // inbound deny, so refuse the start instead.
@@ -502,7 +515,7 @@ fn apply_ingress_policy(
         ));
     };
 
-    let mut manager = IngressManager::new(container_name, pid);
+    let mut manager = IngressManager::new(container_name, pid, uses_directional_schema);
     let applied = manager
         .apply_firewall_rules(&policy, logger)
         .map_err(|e| MxcError::backend_error(format!("Inbound network policy error: {e}")))?;
@@ -859,12 +872,14 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             .is_running()
             .map_err(|e| probe_failed("is running", container_name, e))?
         {
-            // A running container cannot receive this start's chain, and an
-            // absent network section now owes one, so refusing is the only
-            // answer that does not report enforcement that never happened.
+            // A running container cannot receive this start's chain, so
+            // refusing is the only answer that does not report enforcement
+            // that never happened.
+            let uses_directional_schema =
+                wxc_common::supports_directional_network(&request.schema_version);
             if has_filesystem_policy(&request.policy)
                 || has_network_policy(&request.policy)
-                || requires_firewall(&request.policy)
+                || installs_firewall(&request.policy, uses_directional_schema)
             {
                 return Err(MxcError::already_started(
                     "LXC container is already running; start policy cannot be reapplied",
@@ -1204,7 +1219,9 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
 mod tests {
     use super::*;
     use wxc_common::models::LifecycleConfig;
+    use wxc_common::models::NetworkAction;
     use wxc_common::models::NetworkEnforcementMode;
+    use wxc_common::models::NetworkIngressPolicy;
     use wxc_common::models::NetworkPolicy;
     use wxc_common::models::ProxyConfig;
     use wxc_common::mxc_error::MxcErrorCode;
@@ -1225,52 +1242,54 @@ mod tests {
 
     #[test]
     fn a_host_restriction_without_an_enforcement_mode_is_accepted_not_rejected() {
-        // The core change, seen through the start-only rejection: enforcement is
-        // policy-driven, so a host restriction no longer needs
-        // `enforcementMode: firewall` to be honored. Under the default
-        // (capabilities) mode the real start now installs iptables rules, so
-        // this must accept the policy rather than refuse it as unenforceable.
-        assert!(reject_unenforceable_network_policy(&restrictive_policy()).is_ok());
-        assert!(reject_unenforceable_network_policy(&ContainerPolicy {
-            allowed_hosts: vec!["example.com".to_string()],
-            ..Default::default()
-        })
+        // This gate refuses only what LXC cannot enforce at all: a proxy, and
+        // permissive inbound. A host restriction is enforceable whatever the
+        // enforcement mode decides about the firewall, so it passes here and
+        // the mode question is settled later, by `installs_firewall`.
+        assert!(reject_unenforceable_network_policy(&restrictive_policy(), false).is_ok());
+        assert!(reject_unenforceable_network_policy(
+            &ContainerPolicy {
+                allowed_hosts: vec!["example.com".to_string()],
+                ..Default::default()
+            },
+            false
+        )
         .is_ok());
     }
 
     #[test]
     fn an_explicit_default_block_without_an_enforcement_mode_is_accepted() {
-        // `defaultPolicy: "block"` with no `enforcementMode` is now enforced
-        // rather than silently dropped, so the start-only rejection no longer
-        // fires for it.
-        assert!(reject_unenforceable_network_policy(&ContainerPolicy {
-            default_network_policy: NetworkPolicy::Block,
-            ..Default::default()
-        })
+        // `defaultPolicy: "block"` states a restriction this gate can leave
+        // alone; whether it reaches iptables is the enforcement mode's business,
+        // not a reason to refuse the start.
+        assert!(reject_unenforceable_network_policy(
+            &ContainerPolicy {
+                default_network_policy: NetworkPolicy::Block,
+                ..Default::default()
+            },
+            false
+        )
         .is_ok());
     }
 
     #[test]
-    fn an_explicit_capabilities_mode_is_ignored_not_rejected() {
-        // A caller may set `enforcementMode: "capabilities"` explicitly. LXC
-        // ignores the value now, so a restriction carried alongside it is
-        // accepted and enforced -- the caller gets more enforcement than asked
-        // for, never a rejection.
+    fn an_explicit_capabilities_mode_is_not_rejected() {
+        // A caller may set `enforcementMode: "capabilities"` explicitly. That
+        // is a statement about which mechanism enforces the policy, not an
+        // unenforceable request, so this gate passes it through.
         let policy = ContainerPolicy {
             network_enforcement_mode: NetworkEnforcementMode::Capabilities,
             ..restrictive_policy()
         };
-        assert!(reject_unenforceable_network_policy(&policy).is_ok());
+        assert!(reject_unenforceable_network_policy(&policy, false).is_ok());
     }
 
     #[test]
     fn allow_local_network_is_rejected_whatever_the_enforcement_mode() {
-        // `IngressManager` refuses this once invoked, and ingress now installs
-        // unconditionally, so it is always invoked. A dry run stops before the
+        // `IngressManager` refuses this once invoked. A dry run stops before the
         // ingress apply, so this request-only rejection is what gives the dry
-        // run the same verdict as the real start. Mode no longer changes the
-        // outcome; looping the modes only shows the verdict does not depend on
-        // it.
+        // run the same verdict as the real start. Looping the modes shows the
+        // verdict does not depend on them.
         for mode in [
             NetworkEnforcementMode::Capabilities,
             NetworkEnforcementMode::Firewall,
@@ -1281,7 +1300,7 @@ mod tests {
                 allow_local_network: true,
                 ..Default::default()
             };
-            let err = reject_unenforceable_network_policy(&policy)
+            let err = reject_unenforceable_network_policy(&policy, false)
                 .expect_err("allowLocalNetwork has no enforceable LXC implementation");
             assert!(
                 format!("{err}").contains("allowLocalNetwork"),
@@ -1291,10 +1310,52 @@ mod tests {
     }
 
     #[test]
+    fn directional_permissive_ingress_is_rejected_by_the_dry_run_too() {
+        // 0.8 states permissive inbound in two fields the legacy shape has no
+        // word for. The real start refuses both; a dry run that approved them
+        // would answer the caller's question wrongly.
+        for (field, ingress) in [
+            (
+                "network.ingress.default",
+                NetworkIngressPolicy {
+                    default: NetworkAction::Allow,
+                    ..Default::default()
+                },
+            ),
+            (
+                "network.ingress.hostLoopback",
+                NetworkIngressPolicy {
+                    host_loopback: NetworkAction::Allow,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let policy = ContainerPolicy {
+                network_ingress: Some(ingress),
+                ..Default::default()
+            };
+            let err = reject_unenforceable_network_policy(&policy, true)
+                .expect_err("permissive directional inbound has no enforceable LXC implementation");
+            assert!(
+                format!("{err}").contains(field),
+                "the refusal has to name the field the caller set, got {err}"
+            );
+
+            // The same request read as legacy states nothing about inbound, so
+            // the refusal must come from the directional reading, not from the
+            // gate refusing everything it is handed.
+            assert!(
+                reject_unenforceable_network_policy(&policy, false).is_ok(),
+                "a directional ingress section is not a legacy refusal"
+            );
+        }
+    }
+
+    #[test]
     fn a_policy_that_leaves_allow_local_network_alone_is_not_rejected_for_it() {
         // The negative control: the gate above must not swallow ordinary
         // starts.
-        assert!(reject_unenforceable_network_policy(&ContainerPolicy::default()).is_ok());
+        assert!(reject_unenforceable_network_policy(&ContainerPolicy::default(), false).is_ok());
     }
 
     #[test]

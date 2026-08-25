@@ -96,12 +96,10 @@ enum RollbackStep {
 ///
 /// The inbound rules are different in kind. They live inside the container's
 /// own network namespace, reachable only by entering it through the init PID,
-/// so they cease to exist when the container does. That is why only the
-/// one-shot path removes them, and why it does so before `destroy` -- after
-/// that there is no namespace left to enter. The stop path deliberately omits
-/// them: the only moment it could remove them is *before* the stop, which is
-/// exactly the unfiltered-and-still-running state this ordering exists to
-/// prevent, and stopping discards them anyway.
+/// so they cease to exist when the container does. Nothing removes them
+/// explicitly: a successful destroy takes the namespace with it, leaving no
+/// chain for a rollback to strip and no window in which the container is up
+/// but unfiltered.
 ///
 /// A process that never created the chain must not remove one: the chain name
 /// depends only on the container name, so the name may by now answer for a
@@ -175,11 +173,8 @@ fn execute_rollback(plan: &[RollbackStep], run_step: &mut impl FnMut(RollbackSte
 /// What the watchdog needs to roll back on a fatal signal: the container
 /// name (so we can `lxc-destroy` it), the host-side veth interface when
 /// known (so we can also remove the iptables FORWARD hook the runner
-/// installed against it), the set of egress chains and hooks the runner has
-/// actually created so far (so we remove only those), and the container's init
-/// PID when known (so we can also remove the container-netns iptables INPUT
-/// rules the inbound chain installed inside it, before the container is
-/// destroyed).
+/// installed against it), and the set of egress chains and hooks the runner
+/// has actually created so far (so we remove only those).
 ///
 /// All live behind one mutex on purpose. The watchdog takes a single
 /// snapshot of the whole struct, so it can never pair one container's
