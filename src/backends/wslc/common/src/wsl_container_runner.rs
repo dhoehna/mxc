@@ -629,7 +629,7 @@ pub(crate) fn wslc_prerequisite_error(missing: WslcComponentFlags) -> String {
     }
     if needs_wsl_package {
         guidance
-            .push("install WSL 2.9.3 or newer and run `wsl --update --pre-release`".to_string());
+            .push("install WSL 2.9.9 or newer and run `wsl --update --pre-release`".to_string());
     }
     if needs_sdk_update {
         // MXC's vendored SDK is behind the installed WSL, so the fix is on MXC's
@@ -2611,7 +2611,7 @@ mod tests {
         let message = wslc_prerequisite_error(WslcComponentFlags::WSLC_COMPONENT_FLAG_WSL_PACKAGE);
 
         assert!(message.contains("WslPackage"));
-        assert!(message.contains("2.9.3"));
+        assert!(message.contains("2.9.9"));
         assert!(message.contains("wsl --update --pre-release"));
         assert!(!message.contains("Virtual Machine Platform"));
     }
