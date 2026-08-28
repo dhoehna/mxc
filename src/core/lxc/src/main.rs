@@ -17,6 +17,8 @@ use wxc_common::telemetry;
 
 use lxc_common::signal_cleanup;
 
+const STATE_AWARE_MIN_SCHEMA_VERSION: &str = "0.8.0";
+
 #[derive(Parser)]
 #[command(name = "lxc-exec", about = "Linux Container Executor")]
 struct Cli {
@@ -169,6 +171,18 @@ fn run_state_aware_main(
     }
 }
 
+fn below_minimum_schema_error(declared: &str) -> MxcError {
+    let declared = if declared.trim().is_empty() {
+        "no schema version".to_string()
+    } else {
+        format!("schema version '{}'", declared)
+    };
+    MxcError::malformed_request(format!(
+        "the LXC state-aware lifecycle requires schema version \
+         {STATE_AWARE_MIN_SCHEMA_VERSION} or later; this request declares {declared}"
+    ))
+}
+
 /// Serialise `error` to its JSON response-envelope string, including the
 /// last-resort fallback for when the envelope itself fails to serialise.
 ///
@@ -279,13 +293,31 @@ fn main() {
             }
             req
         }
-        Ok(MxcRequest::StateAware(parsed)) => run_state_aware_main(
-            parsed,
-            cli.dry_run,
-            cli.experimental,
-            cli.allow_testing_features,
-            &mut logger,
-        ),
+        Ok(MxcRequest::StateAware(parsed)) => {
+            let declared = parsed.request.schema_version.as_str();
+
+            // State aware for LXC missed the 0.7.0 cut off.
+            // LXC's state-aware can run for versions 0.8.0 and up.
+            // Check that here.
+            if !lxc_common::state_aware::schema_version_is_at_least(
+                declared,
+                STATE_AWARE_MIN_SCHEMA_VERSION,
+            ) {
+                println!(
+                    "{}",
+                    error_envelope_string(&below_minimum_schema_error(declared))
+                );
+                eprint!("{}", logger.get_buffer());
+                process::exit(1);
+            }
+            run_state_aware_main(
+                parsed,
+                cli.dry_run,
+                cli.experimental,
+                cli.allow_testing_features,
+                &mut logger,
+            )
+        }
         Err(ParseError::OneShot(_)) | Err(ParseError::Decode(_)) => {
             eprint!("Request error\n{}", logger.get_buffer());
             process::exit(1);

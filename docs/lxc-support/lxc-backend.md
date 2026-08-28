@@ -92,6 +92,7 @@ them:
 
 ```json
 {
+    "version": "0.8.0-alpha",
     "phase": "provision",
     "containment": "lxc",
     "experimental": {
@@ -104,6 +105,10 @@ them:
     }
 }
 ```
+
+The LXC lifecycle requires `version` 0.8.0 or later.  A lifecycle request
+declaring an older schema, or none at all, is refused with
+`malformed_request`.  The one-shot surface is unaffected and still accepts 0.7.
 
 `provision` is the only phase that takes LXC-specific configuration.  `start`,
 `exec`, `stop`, and `deprovision` carry no `experimental.lxc` payload — they

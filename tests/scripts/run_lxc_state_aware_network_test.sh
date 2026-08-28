@@ -69,7 +69,7 @@ run_phase() {
     local req="$WORK_DIR/$phase.json"
 
     {
-        printf '{\n  "phase": "%s"' "$phase"
+        printf '{\n  "version": "0.8.0-alpha",\n  "phase": "%s"' "$phase"
         if [ "$phase" = "provision" ]; then
             printf ',\n  "containment": "lxc"'
         fi
@@ -731,29 +731,22 @@ command -v lxc-create >/dev/null 2>&1 || skip "LXC state-aware network matrix UN
 
 echo "Running LXC state-aware network policy matrix test..."
 
-# Cases 1, 2, 5, 6, and 13 are the legacy half of the enforcement split, and
-# they assert an absence. A 0.7 request never writes `enforcementMode`, so it
-# gets the `capabilities` default and no firewall -- the compatibility
-# guarantee run_lxc_network_v07_schema_test.sh states from the other direction,
-# that a config predating the field is not handed a chain it never asked for.
-# The 0.8 reading of the same intent installs unconditionally and is covered by
-# run_lxc_network_ga_egress_test.sh.
-#
-# A caller who states hosts here is told nothing and gets nothing. That gap is
-# the price of the compatibility guarantee, not an oversight of these cases.
+# Cases 1, 2, 5, 6, and 13 omit `enforcementMode`. Under 0.8 the directional
+# field set enforces on its own, and each of these installs a chain with no
+# explicit mode asked for. Case 3 states that clause; these five pin it.
 run_start_case "1" "$CONFIG_NO_NETWORK" \
     'no network block at start' \
-    'start succeeds, exec proves the container runs, and no FORWARD chain is installed' \
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
     "1" "1" \
-    '0.7 compatibility: an inherited default-deny policy installs no firewall on its own' \
-    "none"
+    'an inherited default-deny policy installs a firewall with no enforcementMode asked for' \
+    "1"
 
 run_start_case "2" "$CONFIG_BLOCK_CAPS" \
     'defaultPolicy=block with enforcementMode omitted at start' \
-    'start succeeds, exec proves the container runs, and no FORWARD chain is installed' \
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
     "1" "1" \
-    '0.7 compatibility: defaultPolicy=block alone installs no firewall' \
-    "none"
+    'defaultPolicy=block alone installs a firewall' \
+    "1"
 
 #
 # This is the direct observable proof of roadmap item 13's "ensure hook is
@@ -778,17 +771,17 @@ run_start_case "4" "$CONFIG_ALLOW_CAPS" \
 
 run_start_case "5" "$CONFIG_EMPTY_ALLOWED" \
     'allowedHosts empty list with enforcementMode omitted at start' \
-    'start succeeds, exec proves the container runs, and no FORWARD chain is installed' \
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
     "1" "1" \
-    '0.7 compatibility: an empty allowedHosts list installs no firewall' \
-    "none"
+    'an empty allowedHosts list installs a firewall' \
+    "1"
 
 run_start_case "6" "$CONFIG_NONEMPTY_ALLOWED" \
     'allowedHosts non-empty with enforcementMode omitted at start' \
-    'start succeeds, exec proves the container runs, and no FORWARD chain is installed' \
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
     "1" "1" \
-    '0.7 compatibility: a non-empty allowedHosts list installs no firewall' \
-    "none"
+    'a non-empty allowedHosts list installs a firewall' \
+    "1"
 
 # Clause: roadmap item 13 (N1) asks that default-deny outbound be enforced.  It
 # says nothing about how the container numbers its interfaces, and an interface
@@ -833,14 +826,13 @@ run_start_case "12" "$CONFIG_ALLOWED_FIREWALL" \
     '(N3) a non-empty allowedHosts policy remains enforceable with an explicit firewall mode' \
     "1"
 
-# The last of the legacy-compatibility group; see case 1 for why these assert
-# an absence.
+# The last of the enforcementMode-omitted group; see case 1.
 run_start_case "13" "$CONFIG_BLOCKED_CAPS" \
     'blockedHosts non-empty with enforcementMode omitted at start' \
-    'start succeeds, exec proves the container runs, and no FORWARD chain is installed' \
+    'start succeeds, exec proves the container runs, and FORWARD drops by default' \
     "1" "1" \
-    '0.7 compatibility: a config that never wrote enforcementMode is not given a firewall' \
-    "none"
+    'a config that never wrote enforcementMode still gets a firewall' \
+    "1"
 
 # Clause: roadmap item 14 (N2) is explicit -- "reject `hostLoopback: "allow"`
 # rather than guessing ports or exposing the container IP." The roadmap records

@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use semver::Version;
+
 use wxc_common::id::mint_random_token;
 use wxc_common::logger::{Logger, Mode};
 use wxc_common::models::{ContainerPolicy, ExecutionRequest, LxcConfig};
@@ -285,6 +287,14 @@ fn reject_unenforceable_network_policy(
     }
 
     Ok(())
+}
+
+pub fn schema_version_is_at_least(declared: &str, minimum: &str) -> bool {
+    let minimum = Version::parse(minimum).expect("the minimum is a literal semver version");
+    let minimum = Version::new(minimum.major, minimum.minor, minimum.patch);
+    Version::parse(declared).is_ok_and(|declared| {
+        Version::new(declared.major, declared.minor, declared.patch) >= minimum
+    })
 }
 
 /// Every start rejection that needs only the request, in the order the real
@@ -862,8 +872,8 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             .is_defined()
             .map_err(|e| probe_failed("exists", container_name, e))?
         {
-            return Err(MxcError::not_provisioned(format!(
-                "LXC container {:?} is not provisioned",
+            return Err(MxcError::stale_id(format!(
+                "LXC container {:?} does not exist",
                 container_name
             )));
         }
@@ -1021,8 +1031,8 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             .is_defined()
             .map_err(|e| probe_failed("exists", container_name, e))?
         {
-            return Err(MxcError::not_provisioned(format!(
-                "LXC container {:?} is not provisioned",
+            return Err(MxcError::stale_id(format!(
+                "LXC container {:?} does not exist",
                 container_name
             )));
         }
@@ -1094,8 +1104,8 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
             .is_defined()
             .map_err(|e| probe_failed("exists", container_name, e))?
         {
-            return Err(MxcError::not_provisioned(format!(
-                "LXC container {:?} is not provisioned",
+            return Err(MxcError::stale_id(format!(
+                "LXC container {:?} does not exist",
                 container_name
             )));
         }
@@ -1109,14 +1119,22 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         // the stop fails, propagate the error and leave the rules in place
         // rather than exposing a still-running container.
         let veth = enforced_veth_name(container_name);
-        if container
+        if !container
             .is_running()
             .map_err(|e| probe_failed("is running", container_name, e))?
         {
-            container
-                .stop()
-                .map_err(|e| MxcError::backend_error(format!("Failed to stop container: {e}")))?;
+            // A container that exited on its own still has this start's rules
+            // on the host. Tear them down before refusing, or they outlive the
+            // container until deprovision.
+            cleanup_network_authoritative(container_name, veth.as_deref(), &mut logger)?;
+            return Err(MxcError::already_stopped(format!(
+                "LXC container {:?} is not running",
+                container_name
+            )));
         }
+        container
+            .stop()
+            .map_err(|e| MxcError::backend_error(format!("Failed to stop container: {e}")))?;
         cleanup_network_authoritative(container_name, veth.as_deref(), &mut logger)?;
         Ok(StopResult { metadata: None })
     }
@@ -1928,6 +1946,43 @@ mod tests {
             .validate_exec("lxc:mxc-abcd1234", &req, None)
             .unwrap_err();
         assert_eq!(err.code, MxcErrorCode::PolicyValidation);
+    }
+
+    #[test]
+    fn a_lower_version_is_below_the_minimum() {
+        assert!(!schema_version_is_at_least("0.7.0-alpha", "0.8.0"));
+    }
+
+    #[test]
+    fn an_absent_version_is_below_the_minimum() {
+        assert!(!schema_version_is_at_least("", "0.8.0"));
+    }
+
+    #[test]
+    fn an_unparsable_version_is_below_the_minimum() {
+        assert!(!schema_version_is_at_least("banana", "0.8.0"));
+    }
+
+    #[test]
+    fn a_pre_release_of_the_minimum_is_at_or_above_it() {
+        assert!(schema_version_is_at_least("0.8.0-alpha", "0.8.0"));
+    }
+
+    #[test]
+    fn a_higher_version_is_at_or_above_the_minimum() {
+        assert!(schema_version_is_at_least("0.9.0-alpha", "0.8.0"));
+    }
+
+    #[test]
+    fn a_phase_hook_does_not_carry_the_version_gate() {
+        // The gate is `lxc-exec`'s, applied once ahead of the lifecycle. A hook
+        // that refused a below-floor request here would be a second copy.
+        let runner = LxcStateAwareRunner::new();
+        let req = ExecutionRequest {
+            schema_version: "0.7.0-alpha".to_string(),
+            ..Default::default()
+        };
+        assert!(runner.validate_stop("lxc:mxc-abcd1234", &req, None).is_ok());
     }
 
     #[test]

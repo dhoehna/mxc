@@ -67,6 +67,7 @@ done
 INVALID_TYPE_CONFIG="$(mktemp)"
 cat > "$INVALID_TYPE_CONFIG" <<'JSON'
 {
+  "version": "0.8.0-alpha",
   "phase": "provision",
   "containment": "lxc",
   "experimental": {
