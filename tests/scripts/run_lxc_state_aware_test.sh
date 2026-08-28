@@ -157,6 +157,20 @@ else
     check "exec relays a nonzero exit code (got $EXEC_RC, want 7)" 1
 fi
 
+echo "=== exec (timeout) ==="
+# A script that outruns process.timeout surfaces as a sentinel exit code
+# rather than an error envelope. Returning well before the sleep could have
+# finished is what separates the kill from any other nonzero exit.
+TIMEOUT_STARTED=$(date +%s)
+run_phase exec "$SANDBOX_ID" '"process": { "commandLine": "sleep 30", "timeout": 1000 }' >/dev/null 2>&1
+TIMEOUT_RC=$?
+TIMEOUT_ELAPSED=$(( $(date +%s) - TIMEOUT_STARTED ))
+if [ "$TIMEOUT_RC" -ne 0 ] && [ "$TIMEOUT_ELAPSED" -lt 25 ]; then
+    check "exec kills a script that outruns process.timeout (rc=$TIMEOUT_RC, ${TIMEOUT_ELAPSED}s)" 0
+else
+    check "exec kills a script that outruns process.timeout (rc=$TIMEOUT_RC, ${TIMEOUT_ELAPSED}s)" 1
+fi
+
 # --- stop ------------------------------------------------------------------
 echo "=== stop ==="
 run_phase stop "$SANDBOX_ID"

@@ -183,6 +183,17 @@ echo "=== start after deprovision ==="
 expect_error_code "start against a destroyed sandbox is refused as $STALE_ID" \
     "$STALE_ID" start "$SANDBOX_ID"
 
+echo "=== exec after deprovision ==="
+expect_error_code "exec against a destroyed sandbox is refused as $STALE_ID" \
+    "$STALE_ID" exec "$SANDBOX_ID" '"process": { "commandLine": "echo unreachable" }'
+
+# Stop answered already_stopped while the container existed but had never run.
+# Once it is destroyed the same call answers stale_id, because the probe that
+# told those two apart no longer has a container to read.
+echo "=== stop after deprovision ==="
+expect_error_code "stop against a destroyed sandbox is refused as $STALE_ID" \
+    "$STALE_ID" stop "$SANDBOX_ID"
+
 if [ "$DEPROVISION_RC" -eq 0 ]; then
     SANDBOX_ID=""
 fi

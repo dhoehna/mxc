@@ -78,6 +78,23 @@ cat > "$INVALID_TYPE_CONFIG" <<'JSON'
 }
 JSON
 
+# A well-formed request naming a release that does not exist passes validation
+# and fails inside container creation, which is the cheapest normal-use route
+# to a backend_error.
+BAD_RELEASE_CONFIG="$(mktemp)"
+cat > "$BAD_RELEASE_CONFIG" <<'JSON'
+{
+  "version": "0.8.0-alpha",
+  "phase": "provision",
+  "containment": "lxc",
+  "experimental": {
+    "lxc": {
+      "provision": { "distribution": "alpine", "release": "0.0-no-such-release" }
+    }
+  }
+}
+JSON
+
 # The positive control provisions a real container, so this test owns its
 # removal on every exit path rather than leaving it for the runner or the next
 # test to trip over.
@@ -86,7 +103,7 @@ cleanup() {
     if [ -n "$CONTROL_CONTAINER" ]; then
         lxc-destroy -n "$CONTROL_CONTAINER" -f >/dev/null 2>&1
     fi
-    rm -f "$INVALID_TYPE_CONFIG"
+    rm -f "$INVALID_TYPE_CONFIG" "$BAD_RELEASE_CONFIG"
     return 0
 }
 trap cleanup EXIT
@@ -162,6 +179,30 @@ fi
 # satisfy every assertion above while verifying nothing. This asserts only the
 # absence of the two field diagnostics: the run is expected to fail later on a
 # host with no LXC runtime, and that failure is not what is under test.
+# The container name is minted before creation is attempted, so a failed create
+# can leave one behind. Whatever appeared during this case is removed here
+# rather than trusting the failure path to be clean.
+echo "=== provision naming a release that does not exist ==="
+BEFORE_CONTAINERS="$(lxc-ls -1 2>/dev/null | sort)"
+run_config "$BAD_RELEASE_CONFIG"
+echo "$OUT"
+for name in $(lxc-ls -1 2>/dev/null | sort); do
+    case " $BEFORE_CONTAINERS " in
+        *" $name "*) ;;
+        *)
+            echo "--- removing the container left by the failed create: $name ---"
+            lxc-destroy -n "$name" -f >/dev/null 2>&1
+            ;;
+    esac
+done
+if [ "$RUN_RC" -eq 0 ]; then
+    fail "a provision naming a nonexistent release was accepted (exit 0); the request should fail."
+elif echo "$OUT" | grep -Fq 'backend_error'; then
+    pass "a container create that fails is reported as backend_error"
+else
+    fail "a container create that fails was not reported as backend_error"
+fi
+
 echo "=== control: both fields present and well typed ==="
 run_config "$VALID_CONFIG"
 echo "$OUT"
