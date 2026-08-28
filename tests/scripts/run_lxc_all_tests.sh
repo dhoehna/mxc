@@ -83,6 +83,7 @@ run_test "LXC State-Aware Lifecycle" "$SCRIPT_DIR/run_lxc_state_aware_test.sh"
 run_test "LXC State-Aware Network Matrix" "$SCRIPT_DIR/run_lxc_state_aware_network_test.sh"
 run_test "LXC State-Aware Version Floor" "$SCRIPT_DIR/run_lxc_state_aware_version_floor_test.sh"
 run_test "LXC State-Aware Phase Ordering" "$SCRIPT_DIR/run_lxc_state_aware_phase_ordering_test.sh"
+run_test "LXC State-Aware Routing" "$SCRIPT_DIR/run_lxc_state_aware_routing_test.sh"
 run_test "LXC Conflicting Backends" "$SCRIPT_DIR/run_lxc_conflicting_backends_test.sh"
 run_test "LXC Experimental Provision Fields" "$SCRIPT_DIR/run_lxc_experimental_provision_fields_test.sh"
 

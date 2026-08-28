@@ -172,7 +172,7 @@ that needs them ordered has to sequence them itself.
 
 ## Error mapping
 
-LXC emits eight of the twelve codes in the specification's closed union.
+LXC emits nine of the twelve codes in the specification's closed union.
 
 | Observable condition | Wire `error.code` | Trigger |
 |---|---|---|
@@ -184,6 +184,7 @@ LXC emits eight of the twelve codes in the specification's closed union.
 | The container is not running, at stop | `already_stopped` | See the idempotence table. |
 | A phase received policy it does not accept | `policy_validation` | See the honor matrix.  Also covers a network policy LXC cannot enforce on this host. |
 | A container state probe could not be read | `backend_error` | LXC could not answer whether the container exists or is running.  An unreadable probe is never treated as "gone" or "stopped".  Also returned when an in-process caller asks exec for the sandbox's streams, which LXC cannot hand back. |
+| The `lxc-*` tools are absent from the host | `backend_unavailable` | LXC drives every phase by spawning those tools.  Reported by all five phases before any container is touched, which separates a machine without LXC installed from a container operation that failed. |
 
 ### Precedence
 
@@ -207,9 +208,11 @@ What follows from that split is the part callers can rely on:
 each stage.  Neither code identifies which stage produced it; the message
 does.
 
-### The remaining four codes
+### The remaining three codes
 
-None of these is emitted by the LXC backend.
+None of these is emitted by LXC backend code.  Two of the three still reach a
+caller of `lxc-exec`, because shared routing decides them before any backend is
+chosen.
 
 **`not_provisioned` is unreachable.**  The specification reserves it for a
 sandbox whose id is recognized but whose resources have not been created.  LXC
@@ -217,16 +220,14 @@ has no such state — `lxc-create` runs during provision, and the container is
 defined from the moment an id exists.  Every condition that would reach
 `not_provisioned` on another backend reaches `stale_id` here.
 
-**`unsupported_containment` cannot reach an LXC caller.**  Shared routing
-returns it for a sandbox-id prefix with no registered backend.  `lxc` is
-registered, and an id carrying it routes here instead.
-
-**`backend_unavailable` is not part of LXC's vocabulary.**  Other backends use
-it to report that their runtime is absent on this host.  LXC reports a failed
-container operation as `backend_error`.
+**`unsupported_containment` answers a sandbox id naming no known backend.**
+Shared routing returns it for a prefix with no entry in the lookup table, which
+is the outcome the specification assigns to a direct wire call.  An id carrying
+the `lxc` prefix routes to this backend instead.
 
 **`unsupported_phase` comes from shared dispatch**, above the backend, never
-from LXC code.
+from LXC code.  A caller reaches it by naming a backend that has no state-aware
+lifecycle on this host.
 
 ## Known issues
 

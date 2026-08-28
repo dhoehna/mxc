@@ -199,6 +199,29 @@ fn probe_failed(question: &str, container_name: &str, detail: String) -> MxcErro
     ))
 }
 
+/// Refuse a phase when the `lxc-*` command-line tools are not on this host.
+///
+/// Every phase drives LXC by spawning those tools, and a host without them
+/// fails the first probe with a spawn error that reads as a broken container
+/// rather than as a machine that never had LXC installed.  The contract
+/// separates the two: a missing runtime dependency is `backend_unavailable`,
+/// while `backend_error` is a container operation that genuinely failed.
+///
+/// Asking `lxc-info` for its version is the cheapest question that still spawns
+/// the real binary, which catches a tool that is present but not executable.
+/// A nonzero exit answers the question -- the tool ran.
+fn reject_if_lxc_tooling_missing() -> Result<(), MxcError> {
+    match std::process::Command::new("lxc-info")
+        .arg("--version")
+        .output()
+    {
+        Ok(_) => Ok(()),
+        Err(e) => Err(MxcError::backend_unavailable(format!(
+            "the LXC command-line tools are not available on this host: failed to run lxc-info: {e}"
+        ))),
+    }
+}
+
 fn has_filesystem_policy(policy: &ContainerPolicy) -> bool {
     !policy.readwrite_paths.is_empty()
         || !policy.readonly_paths.is_empty()
@@ -1189,7 +1212,8 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
     ) -> Result<(), MxcError> {
         validate_lxc_config(config)?;
         resolve_container_name(request)?;
-        reject_start_policy_on_other_phase("provision", &request.policy)
+        reject_start_policy_on_other_phase("provision", &request.policy)?;
+        reject_if_lxc_tooling_missing()
     }
 
     fn validate_start(
@@ -1199,7 +1223,8 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         _config: Option<&()>,
     ) -> Result<(), MxcError> {
         extract_container_name(sandbox_id)?;
-        validate_start_policy(request)
+        validate_start_policy(request)?;
+        reject_if_lxc_tooling_missing()
     }
 
     fn validate_exec(
@@ -1209,7 +1234,8 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         _config: Option<&()>,
     ) -> Result<(), MxcError> {
         extract_container_name(sandbox_id)?;
-        reject_start_policy_on_other_phase("exec", &request.policy)
+        reject_start_policy_on_other_phase("exec", &request.policy)?;
+        reject_if_lxc_tooling_missing()
     }
 
     fn validate_stop(
@@ -1219,7 +1245,8 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         _config: Option<&()>,
     ) -> Result<(), MxcError> {
         extract_container_name(sandbox_id)?;
-        reject_start_policy_on_other_phase("stop", &request.policy)
+        reject_start_policy_on_other_phase("stop", &request.policy)?;
+        reject_if_lxc_tooling_missing()
     }
 
     fn validate_deprovision(
@@ -1229,7 +1256,8 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         _config: Option<&()>,
     ) -> Result<(), MxcError> {
         extract_container_name(sandbox_id)?;
-        reject_start_policy_on_other_phase("deprovision", &request.policy)
+        reject_start_policy_on_other_phase("deprovision", &request.policy)?;
+        reject_if_lxc_tooling_missing()
     }
 }
 
