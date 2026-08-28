@@ -254,3 +254,8 @@ verified before any flush or delete.  Tracked in AB#62953349.
 - `tests/scripts/run_lxc_state_aware_network_test.sh` — the honor matrix.
 - `tests/scripts/run_lxc_state_aware_version_floor_test.sh` — the schema
   version floor.
+- `tests/scripts/run_lxc_state_aware_routing_test.sh` — the refusals decided
+  from the sandbox id alone, the missing runtime dependency, and the envelope
+  discipline stdout has to keep.
+- `tests/scripts/run_lxc_state_aware_adopt_test.sh` — the identifier form and
+  adopt-or-create.

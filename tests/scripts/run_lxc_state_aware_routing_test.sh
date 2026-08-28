@@ -180,6 +180,34 @@ else
     fi
 fi
 
+echo "=== stdout carries the envelope and nothing else ==="
+# The SDK tells a dispatch failure from a script that exited non-zero by
+# parsing stdout whole (§7.3). That rule holds only while MXC keeps its own
+# diagnostics on stderr, so anything printed alongside the envelope -- a
+# warning, a progress line -- breaks a consumer rather than this test.
+write_request 'lxc:bad name'
+ENVELOPE_OUT="$("$LXC_EXEC" "$WORK_DIR/request.json" 2>/dev/null)"
+if [ "$(printf '%s' "$ENVELOPE_OUT" | wc -l)" -eq 0 ] &&
+    printf '%s' "$ENVELOPE_OUT" | grep -Eq '^\{.*"error".*\}$'; then
+    check "a refusal writes one envelope and nothing else to stdout" 0
+else
+    check "a refusal writes one envelope and nothing else to stdout" 1
+    echo "    got: $ENVELOPE_OUT"
+fi
+
+# §7.3 reserves operation, nativeCode, and remediation for a failure that
+# happened inside a platform API call. An id rejected by the parser never
+# reached one, and a consumer reading those fields would be told an API failed
+# when none ran.
+for diagnostic_field in operation nativeCode remediation; do
+    if printf '%s' "$ENVELOPE_OUT" | grep -q "\"$diagnostic_field\""; then
+        check "a refusal raised outside any API call omits $diagnostic_field" 1
+        echo "    got: $ENVELOPE_OUT"
+    else
+        check "a refusal raised outside any API call omits $diagnostic_field" 0
+    fi
+done
+
 echo "================================"
 echo "Results: $PASSED passed, $FAILED failed"
 if [ "$FAILED" -gt 0 ]; then
