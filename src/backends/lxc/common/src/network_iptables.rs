@@ -603,6 +603,40 @@ impl NetworkIptablesManager {
         Self::discover_veth_interface(container_name)
     }
 
+    /// The host's own IPv4 address on the bridge this veth is attached to.
+    ///
+    /// Read from the bridge on the host rather than from inside the container.
+    /// That makes it available as soon as the veth exists. The container's
+    /// routing table is empty for several seconds after LXC reports it
+    /// running, which makes the container's own default route useless at
+    /// policy-install time.
+    ///
+    /// `None` when the veth is not bridged, or the bridge carries no IPv4
+    /// address. Both mean there is no bridge address for the container to
+    /// reach the host at.
+    pub fn host_gateway_for_veth(veth: &str) -> Option<String> {
+        let master = std::fs::read_link(format!("/sys/class/net/{veth}/master")).ok()?;
+        let bridge = master.file_name()?.to_str()?.to_string();
+
+        let output = Command::new("ip")
+            .args(["-4", "-o", "addr", "show", "dev", &bridge])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        // Each line reads "<index>: <device> inet <address>/<prefix> ...".
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut tokens = text.split_whitespace();
+        while let Some(token) = tokens.next() {
+            if token == "inet" {
+                return tokens.next()?.split('/').next().map(str::to_string);
+            }
+        }
+        None
+    }
+
     /// Set the veth interface name for the container.
     pub fn set_veth_interface(&mut self, iface: &str) {
         self.veth_interface = Some(iface.to_string());

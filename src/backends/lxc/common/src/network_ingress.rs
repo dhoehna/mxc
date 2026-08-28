@@ -179,6 +179,15 @@ pub struct IngressManager {
     v6_chain_created: bool,
     v4_hooked: bool,
     v6_hooked: bool,
+    /// The host's own address on the bridge the container's veth joins, when
+    /// the caller could determine it. From inside the container namespace this
+    /// address *is* the host. It is what the container-to-host half of
+    /// `ingress.hostLoopback` has to close.
+    host_gateway: Option<String>,
+    /// Whether this run installed the container-to-host drop. Tracked apart
+    /// from the chain flags because the drop lives in the namespace's built-in
+    /// `OUTPUT` chain rather than in a chain this run created.
+    host_loopback_dropped: bool,
     /// Whether the caller asked for a successfully installed policy to outlive
     /// this run (the lifecycle's `preservePolicy`). Consulted by [`Drop`] and
     /// not only by the runner's explicit teardown call, because `Drop` fires on
@@ -424,6 +433,8 @@ impl IngressManager {
             v6_chain_created: false,
             v4_hooked: false,
             v6_hooked: false,
+            host_gateway: None,
+            host_loopback_dropped: false,
             preserve_policy: false,
             uses_directional_schema,
         }
@@ -459,7 +470,53 @@ impl IngressManager {
     /// from the per-resource flags rather than stored, so it can never disagree
     /// with what teardown will actually remove.
     pub fn rules_applied(&self) -> bool {
-        self.v4_chain_created || self.v6_chain_created || self.v4_hooked || self.v6_hooked
+        self.v4_chain_created
+            || self.v6_chain_created
+            || self.v4_hooked
+            || self.v6_hooked
+            || self.host_loopback_dropped
+    }
+
+    /// Tell the manager where the host sits on the container's bridge.
+    ///
+    /// The caller resolves this on the host, before the guest has configured
+    /// anything, because the container's own routing table is empty for several
+    /// seconds after LXC reports the container running.
+    pub fn set_host_gateway(&mut self, address: &str) {
+        self.host_gateway = Some(address.to_string());
+    }
+
+    /// Whether the policy closes the host-loopback path.
+    ///
+    /// An absent 0.8 ingress section still denies: the contract's default
+    /// stance for `hostLoopback` is `deny`, and a caller who wrote no ingress
+    /// section did not ask to open it.
+    fn denies_host_loopback(policy: &ContainerPolicy, uses_directional_schema: bool) -> bool {
+        if !uses_directional_schema {
+            return false;
+        }
+        Self::stated_ingress(policy, uses_directional_schema)
+            .is_some_and(|ingress| ingress.host_loopback == NetworkAction::Deny)
+    }
+
+    /// The rule closing the container-to-host path, dropped into the
+    /// namespace's own `OUTPUT` chain.
+    ///
+    /// Inserted at the head: `OUTPUT` is first-match, and a later accept
+    /// covering the gateway would otherwise reopen the path.
+    fn build_host_loopback_drop_args(gateway: &str) -> Vec<String> {
+        ["-I", "OUTPUT", "-d", gateway, "-j", "DROP"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    /// The same rule as a deletion.
+    fn build_host_loopback_undrop_args(gateway: &str) -> Vec<String> {
+        ["-D", "OUTPUT", "-d", gateway, "-j", "DROP"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
     }
 
     /// Record that this run created `family`'s chain.
@@ -653,7 +710,47 @@ impl IngressManager {
             self.install_family(IpFamily::V6, &ipv6_rules, &mut runner, logger)?;
         }
 
+        // IPv4 only, matching the one route LXC's default bridge gives the
+        // container to the host. `lxc-net` ships an IPv4 address and leaves
+        // `LXC_IPV6_ADDR` unset, leaving no IPv6 path to close.
+        if Self::denies_host_loopback(policy, uses_directional_schema) {
+            self.install_host_loopback_drop(&mut runner, logger)?;
+        }
+
         Ok(true)
+    }
+
+    /// Close the container-to-host half of `ingress.hostLoopback: deny`.
+    ///
+    /// Fails the start when the host address is unknown. The alternative is a
+    /// container running with the path open under a policy that says it is
+    /// shut, which is the unenforceable-policy case this file already refuses
+    /// for inbound IPv6.
+    fn install_host_loopback_drop(
+        &mut self,
+        runner: &mut dyn CommandRunner,
+        logger: &mut Logger,
+    ) -> Result<(), String> {
+        let Some(gateway) = self.host_gateway.clone() else {
+            return Err(format!(
+                "network.ingress.hostLoopback='deny' has to block the container-to-host \
+                 path, and the host's address on the container's bridge could not be \
+                 determined for chain '{}'. Refusing to start with an unenforceable \
+                 host-loopback policy.",
+                self.chain_name
+            ));
+        };
+
+        let args = Self::build_host_loopback_drop_args(&gateway);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(runner, IpFamily::V4.binary(), &arg_refs, logger)
+            .map_err(RunError::into_message)?;
+        self.host_loopback_dropped = true;
+
+        logger.log_line(&format!(
+            "Host-loopback deny: container traffic to the host at {gateway} is dropped."
+        ));
+        Ok(())
     }
 
     /// Install one family's chain: reset any leftover to a known-empty baseline,
@@ -922,7 +1019,49 @@ impl IngressManager {
         ));
 
         let steps = self.owned_teardown_steps();
-        self.execute_teardown(&steps, runner, logger)
+        let chain_result = self.execute_teardown(&steps, runner, logger);
+        let host_loopback_result = self.remove_host_loopback_drop(runner, logger);
+
+        match (chain_result, host_loopback_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(chain), Ok(())) => Err(chain),
+            (Ok(()), Err(loopback)) => Err(loopback),
+            (Err(chain), Err(loopback)) => Err(format!("{chain}; {loopback}")),
+        }
+    }
+
+    /// Remove the container-to-host drop this run installed.
+    ///
+    /// Keeps ownership on a real failure so [`Drop`] retries, and treats
+    /// iptables' own missing-rule message as done.
+    fn remove_host_loopback_drop(
+        &mut self,
+        runner: &mut dyn CommandRunner,
+        logger: &mut Logger,
+    ) -> Result<(), String> {
+        if !self.host_loopback_dropped {
+            return Ok(());
+        }
+        let Some(gateway) = self.host_gateway.clone() else {
+            self.host_loopback_dropped = false;
+            return Ok(());
+        };
+
+        let args = Self::build_host_loopback_undrop_args(&gateway);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        match self.run(runner, IpFamily::V4.binary(), &arg_refs, logger) {
+            Ok(()) => {
+                self.host_loopback_dropped = false;
+                Ok(())
+            }
+            Err(RunError::Exit { ref stderr, .. })
+                if StepKind::Unhook.stderr_means_absent(stderr) =>
+            {
+                self.host_loopback_dropped = false;
+                Ok(())
+            }
+            Err(e) => Err(e.into_message()),
+        }
     }
 
     /// Execute an ordered list of teardown [`TeardownStep`]s, clearing each

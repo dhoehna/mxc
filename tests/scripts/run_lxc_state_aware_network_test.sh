@@ -142,6 +142,8 @@ CONFIG_ALLOW_LOCAL="$CONFIG_DIR/lxc_state_aware_start_allow_local_network.json"
 CONFIG_PROXY="$CONFIG_DIR/lxc_state_aware_start_proxy.json"
 CONFIG_PROXY_EXTERNAL="$CONFIG_DIR/lxc_state_aware_start_proxy_external.json"
 CONFIG_FILESYSTEM_PATHS="$CONFIG_DIR/lxc_state_aware_start_filesystem_paths.json"
+CONFIG_HOSTLOOPBACK_ALLOW="$CONFIG_DIR/lxc_state_aware_start_hostloopback_allow_rejected.json"
+CONFIG_HOSTLOOPBACK_DENY="$CONFIG_DIR/lxc_state_aware_start_hostloopback_deny.json"
 RESULTS=""
 
 verify_fixture_contracts() {
@@ -150,9 +152,15 @@ verify_fixture_contracts() {
         "$CONFIG_PROVISION_NETWORK" "$CONFIG_PROVISION_FILESYSTEM" \
         "$CONFIG_BLOCK_BOTH" "$CONFIG_ALLOWED_FIREWALL" "$CONFIG_BLOCKED_CAPS" \
         "$CONFIG_ALLOW_LOCAL" "$CONFIG_PROXY" "$CONFIG_PROXY_EXTERNAL" \
-        "$CONFIG_FILESYSTEM_PATHS"; do
+        "$CONFIG_FILESYSTEM_PATHS" "$CONFIG_HOSTLOOPBACK_ALLOW" \
+        "$CONFIG_HOSTLOOPBACK_DENY"; do
         [ -f "$cfg" ] || fail_now "fixture not found: $cfg"
     done
+
+    grep -q '"hostLoopback"[[:space:]]*:[[:space:]]*"allow"' "$CONFIG_HOSTLOOPBACK_ALLOW" \
+        || fail_now "fixture drift in $CONFIG_HOSTLOOPBACK_ALLOW: must carry ingress.hostLoopback=allow"
+    grep -q '"hostLoopback"[[:space:]]*:[[:space:]]*"deny"' "$CONFIG_HOSTLOOPBACK_DENY" \
+        || fail_now "fixture drift in $CONFIG_HOSTLOOPBACK_DENY: must carry ingress.hostLoopback=deny"
 
     # Case 8's fixture is guarded here rather than in the block below so the
     # existing seven keep their positional indices.
@@ -517,6 +525,69 @@ run_start_case() {
     record_result "$case_no" "$config" "$cause" "$expected" "$actual" "$status"
 }
 
+run_hostloopback_block_case() {
+    local case_no="$1"
+    local clause="$2"
+    local cause='ingress.hostLoopback=deny with egress default allow, then reach the host'
+    local expected='the container cannot reach the host across the bridge'
+    local out rc actual status probe_cmd extra
+
+    start_fresh_sandbox "case $case_no"
+    make_request_from_config "$CONFIG_HOSTLOOPBACK_DENY" "$WORK_DIR/case_${case_no}.json"
+
+    echo "=== case $case_no start: $cause ==="
+    out="$($LXC_EXEC "$WORK_DIR/case_${case_no}.json" 2>&1)"
+    rc=$?
+    echo "$out"
+    if [ "$rc" -ne 0 ]; then
+        check "case $case_no start succeeds for input $CONFIG_HOSTLOOPBACK_DENY -- $clause" 1
+        actual="start exited $rc: $(echo "$out" | tr '\n' ' ' | sed 's/|/ /g')"
+        finish_current_sandbox "case $case_no" "$CONFIG_HOSTLOOPBACK_DENY"
+        record_result "$case_no" "$CONFIG_HOSTLOOPBACK_DENY" "$cause" "$expected" "$actual" "FAIL"
+        return
+    fi
+    check "case $case_no start succeeds for input $CONFIG_HOSTLOOPBACK_DENY -- $clause" 0
+    SANDBOX_STARTED=1
+
+    # The probe waits for its own default route before testing anything: LXC
+    # reports a container RUNNING before the guest holds an address, and a probe
+    # that ran first would find the host unreachable for the wrong reason.
+    # It then pings its own address, which no policy governs, so a container
+    # that cannot ping at all is reported as inconclusive instead of as blocked.
+    probe_cmd="sh -c 'i=0; gw=; while [ \$i -lt 30 ]; do set -- \$(ip route 2>/dev/null | grep -m1 ^default); gw=\$3; if [ x\$gw != x ]; then break; fi; i=\$((i+1)); sleep 1; done; if [ x\$gw = x ]; then echo MXC_HOST_NOGW; exit 0; fi; set -- \$(ip -o -4 addr show scope global 2>/dev/null | head -1); self=\$4; self=\${self%%/*}; if ping -c 1 -W 2 \$self >/dev/null 2>&1; then echo MXC_PING_OK; else echo MXC_PING_DEAD; fi; if ping -c 1 -W 2 \$gw >/dev/null 2>&1; then echo MXC_HOST_REACHABLE; else echo MXC_HOST_BLOCKED; fi'"
+    extra="\"process\": { \"commandLine\": \"$probe_cmd\" }"
+
+    echo "=== case $case_no probe: reach the host from inside the container ==="
+    out="$(run_phase exec "$SANDBOX_ID" "$extra" 2>&1)"
+    rc=$?
+    echo "$out"
+
+    if echo "$out" | grep -Fq "MXC_HOST_NOGW"; then
+        check "case $case_no probe obtained a default route -- $clause" 1
+        actual="the container never obtained a default route, so the host path was never exercised"
+        status="FAIL"
+    elif ! echo "$out" | grep -Fq "MXC_PING_OK"; then
+        check "case $case_no probe can ping at all -- $clause" 1
+        actual="the container could not ping its own address, so a blocked verdict would prove nothing"
+        status="FAIL"
+    elif echo "$out" | grep -Fq "MXC_HOST_BLOCKED"; then
+        check "case $case_no blocks container-to-host loopback -- $clause" 0
+        actual="the container pinged itself and still could not reach the host"
+        status="PASS"
+    elif echo "$out" | grep -Fq "MXC_HOST_REACHABLE"; then
+        check "case $case_no blocks container-to-host loopback -- $clause" 1
+        actual="the container reached the host across the bridge"
+        status="FAIL"
+    else
+        check "case $case_no probe produced a verdict -- $clause" 1
+        actual="probe rc=$rc produced no verdict: $(echo "$out" | tr '\n' ' ' | sed 's/|/ /g')"
+        status="FAIL"
+    fi
+
+    finish_current_sandbox "case $case_no" "$CONFIG_HOSTLOOPBACK_DENY"
+    record_result "$case_no" "$CONFIG_HOSTLOOPBACK_DENY" "$cause" "$expected" "$actual" "$status"
+}
+
 run_provision_rejection_case() {
     local case_no="$1"
     local config="$2"
@@ -863,6 +934,36 @@ run_proxy_start_case "15" \
 run_filesystem_start_case "16" "$CONFIG_FILESYSTEM_PATHS" \
     'readonlyPaths and deniedPaths sent at start' \
     'the start phase applies the filesystem lists it refuses at provision'
+
+# Clause: networking.md:112-113 -- "A backend that cannot enforce both
+# directions must reject `hostLoopback: "allow"` rather than accept it with
+# partial enforcement." Case 14 pins the 0.7 spelling of permissive inbound;
+# this pins the 0.8 spelling, which reaches the same refusal through a
+# different field.
+run_start_case "17" "$CONFIG_HOSTLOOPBACK_ALLOW" \
+    'ingress.hostLoopback=allow at start' \
+    'start fails with policy_validation' \
+    "0" "0" \
+    'hostLoopback allow is refused rather than accepted with partial enforcement'
+
+# Clause: networking.md:109 -- the specific `hostLoopback` value overrides
+# `default` for the host-loopback path. Case 17 pins the value LXC refuses;
+# without this, no state-aware case shows the field being accepted at all.
+run_start_case "18" "$CONFIG_HOSTLOOPBACK_DENY" \
+    'ingress.hostLoopback=deny at start' \
+    'start succeeds and exec proves the container runs' \
+    "1" "1" \
+    'the enforceable hostLoopback value is accepted'
+
+# Clause: networking.md:274 -- ingress.hostLoopback deny blocks both
+# host-loopback directions -- read with networking.md:462, which names what
+# this backend owes: "routing and output policy enforce its container-to-host
+# half." Case 18 pins only that the value is accepted. The fixture pairs the
+# deny with egress default allow, the one combination where the egress chain
+# cannot block the host path incidentally, so without this case nothing shows
+# the container-to-host half enforced anywhere.
+run_hostloopback_block_case "19" \
+    'the container-to-host half of hostLoopback deny is enforced'
 
 echo "================================"
 echo "Results: $PASSED passed, $FAILED failed, $QUARANTINED quarantined"
