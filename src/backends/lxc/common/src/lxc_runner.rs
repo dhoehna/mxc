@@ -29,11 +29,6 @@ const HOSTS_PIN_MARKER: &str = "#mxc-proxy-pin";
 /// builtins and must never inherit the script's own timeout budget.
 const HOSTS_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Ceiling for the guest to acquire an address. The guest's own DHCP client
-/// owns acquisition, and LXC reports a container running before that client
-/// has finished.
-const NETWORK_READY_TIMEOUT: Duration = Duration::from_secs(20);
-
 /// Script runner that executes commands inside an LXC container.
 pub struct LxcScriptRunner {
     config: LxcConfig,
@@ -352,7 +347,7 @@ impl LxcScriptRunner {
         }
 
         if needs_network(&request.policy, uses_directional_schema) {
-            Self::wait_for_network(&container_name, NETWORK_READY_TIMEOUT, logger);
+            Self::wait_for_network(&container_name, Duration::from_secs(10), logger);
         }
 
         // Shapes the pre-start path could not pin: an already running
