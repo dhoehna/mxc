@@ -126,6 +126,34 @@ impl LxcScriptRunner {
         false
     }
 
+    fn enforce_network_readiness<P, D>(
+        &self,
+        container_name: &str,
+        container_created: bool,
+        timeout: Duration,
+        logger: &mut Logger,
+        readiness_probe: P,
+        mut destroy_container: D,
+    ) -> Option<ScriptResponse>
+    where
+        P: FnOnce(&str, Duration, &mut Logger) -> bool,
+        D: FnMut(),
+    {
+        if readiness_probe(container_name, timeout, logger) {
+            return None;
+        }
+
+        if self.destroy_on_exit || container_created {
+            destroy_container();
+        }
+
+        Some(ScriptResponse::error(&format!(
+            "Container network did not initialize within {:.0}s; \
+             check that lxc-net/dnsmasq is running and able to assign an IP.",
+            timeout.as_secs_f64()
+        )))
+    }
+
     /// Core execution logic.
     fn run_internal(&self, request: &ExecutionRequest, logger: &mut Logger) -> ScriptResponse {
         // tighten aliases of the same host object to the strictest intent (deny > ro > rw)
@@ -347,7 +375,21 @@ impl LxcScriptRunner {
         }
 
         if needs_network(&request.policy, uses_directional_schema) {
-            Self::wait_for_network(&container_name, Duration::from_secs(10), logger);
+            // Fail closed: proceeding without an IP silently breaks DNS and produces
+            // flaky failures. Alpine DHCP leases can arrive at ~9s, so allow 30s.
+            let timeout = Duration::from_secs(30);
+            if let Some(response) = self.enforce_network_readiness(
+                &container_name,
+                container_created,
+                timeout,
+                logger,
+                Self::wait_for_network,
+                || {
+                    let _ = container.destroy();
+                },
+            ) {
+                return response;
+            }
         }
 
         // Shapes the pre-start path could not pin: an already running
@@ -822,6 +864,7 @@ fn uuid_simple() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wxc_common::logger::Mode;
 
     #[test]
     fn a_single_veth_can_be_pinned_before_start() {
@@ -1110,6 +1153,37 @@ mod tests {
         LxcScriptRunner::new(&config, "mxc-guard-test", &LifecycleConfig::default())
     }
 
+    fn runner_for_network_readiness_tests(destroy_on_exit: bool) -> LxcScriptRunner {
+        let config = LxcConfig {
+            distribution: "alpine".to_string(),
+            release: "3.23".to_string(),
+        };
+        let lifecycle = LifecycleConfig {
+            destroy_on_exit,
+            ..LifecycleConfig::default()
+        };
+        LxcScriptRunner::new(&config, "mxc-network-test", &lifecycle)
+    }
+
+    fn fail_network_readiness(
+        runner: &LxcScriptRunner,
+        container_created: bool,
+    ) -> (ScriptResponse, bool) {
+        let mut logger = Logger::new(Mode::Buffer);
+        let mut destroyed = false;
+        let response = runner
+            .enforce_network_readiness(
+                "mxc-network-test",
+                container_created,
+                Duration::from_secs(1),
+                &mut logger,
+                |_name, _timeout, _logger| false,
+                || destroyed = true,
+            )
+            .expect("a failing readiness probe should return an error response");
+        (response, destroyed)
+    }
+
     /// What the 0.8 parser produces for a config stating only `network.egress`:
     /// the egress section as written, plus an ingress section filled in from
     /// its defaults.
@@ -1235,6 +1309,58 @@ mod tests {
         assert!(
             !log.contains("Creating LXC container"),
             "the guard must return before container creation, log was: {log}"
+        );
+    }
+
+    #[test]
+    fn network_readiness_timeout_returns_the_fail_closed_error_response() {
+        let runner = runner_for_network_readiness_tests(false);
+        let (response, _) = fail_network_readiness(&runner, false);
+
+        assert!(
+            response
+                .error_message
+                .contains("Container network did not initialize within 1s"),
+            "the fail-closed readiness timeout message changed unexpectedly: {}",
+            response.error_message
+        );
+        assert_eq!(
+            response.standard_err, response.error_message,
+            "error responses should carry the message in stderr as well"
+        );
+    }
+
+    #[test]
+    fn network_readiness_timeout_preserves_a_reused_container_when_destroy_on_exit_is_false() {
+        let runner = runner_for_network_readiness_tests(false);
+        let (_, destroyed) = fail_network_readiness(&runner, false);
+
+        assert!(
+            !destroyed,
+            "a reused container should be preserved on readiness timeout when destroyOnExit=false"
+        );
+    }
+
+    #[test]
+    fn network_readiness_timeout_destroys_newly_created_container_even_when_destroy_on_exit_is_false(
+    ) {
+        let runner = runner_for_network_readiness_tests(false);
+        let (_, destroyed) = fail_network_readiness(&runner, true);
+
+        assert!(
+            destroyed,
+            "a newly created container must be destroyed on readiness timeout even when destroyOnExit=false"
+        );
+    }
+
+    #[test]
+    fn network_readiness_timeout_destroys_a_reused_container_when_destroy_on_exit_is_true() {
+        let runner = runner_for_network_readiness_tests(true);
+        let (_, destroyed) = fail_network_readiness(&runner, false);
+
+        assert!(
+            destroyed,
+            "a reused container must be destroyed on readiness timeout when destroyOnExit=true"
         );
     }
 }
