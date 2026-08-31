@@ -30,11 +30,24 @@ use crate::network_iptables::{installs_firewall, CreatedResources, NetworkIptabl
 use crate::signal_cleanup;
 
 /// Stateless state-aware LXC runner.
-pub struct LxcStateAwareRunner;
+pub struct LxcStateAwareRunner {
+    tooling_probe: fn() -> Result<(), MxcError>,
+}
 
 impl LxcStateAwareRunner {
     pub fn new() -> Self {
-        Self
+        Self {
+            tooling_probe: reject_if_lxc_tooling_missing,
+        }
+    }
+
+    /// A runner whose host is treated as already having the LXC tools, for
+    /// tests that assert on request validation rather than on the host.
+    #[cfg(test)]
+    fn with_lxc_installed() -> Self {
+        Self {
+            tooling_probe: || Ok(()),
+        }
     }
 }
 
@@ -1224,7 +1237,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         validate_lxc_config(config)?;
         resolve_container_name(request)?;
         reject_start_policy_on_other_phase("provision", &request.policy)?;
-        reject_if_lxc_tooling_missing()
+        (self.tooling_probe)()
     }
 
     fn validate_start(
@@ -1235,7 +1248,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
     ) -> Result<(), MxcError> {
         extract_container_name(sandbox_id)?;
         validate_start_policy(request)?;
-        reject_if_lxc_tooling_missing()
+        (self.tooling_probe)()
     }
 
     fn validate_exec(
@@ -1246,7 +1259,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
     ) -> Result<(), MxcError> {
         extract_container_name(sandbox_id)?;
         reject_start_policy_on_other_phase("exec", &request.policy)?;
-        reject_if_lxc_tooling_missing()
+        (self.tooling_probe)()
     }
 
     fn validate_stop(
@@ -1257,7 +1270,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
     ) -> Result<(), MxcError> {
         extract_container_name(sandbox_id)?;
         reject_start_policy_on_other_phase("stop", &request.policy)?;
-        reject_if_lxc_tooling_missing()
+        (self.tooling_probe)()
     }
 
     fn validate_deprovision(
@@ -1268,7 +1281,7 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
     ) -> Result<(), MxcError> {
         extract_container_name(sandbox_id)?;
         reject_start_policy_on_other_phase("deprovision", &request.policy)?;
-        reject_if_lxc_tooling_missing()
+        (self.tooling_probe)()
     }
 }
 
@@ -1466,7 +1479,7 @@ mod tests {
     /// check came too late.
     #[test]
     fn a_library_exec_is_refused_before_the_workload_runs() {
-        let mut runner = LxcStateAwareRunner;
+        let mut runner = LxcStateAwareRunner::with_lxc_installed();
         let err = runner
             .exec(
                 "not-a-valid-sandbox-id",
@@ -1835,7 +1848,7 @@ mod tests {
 
     #[test]
     fn validate_provision_accepts_config_and_generated_id() {
-        let runner = LxcStateAwareRunner::new();
+        let runner = LxcStateAwareRunner::with_lxc_installed();
         runner
             .validate_provision(&ExecutionRequest::default(), Some(&provision_config()))
             .unwrap();
@@ -1843,7 +1856,7 @@ mod tests {
 
     #[test]
     fn validate_provision_rejects_invalid_container_id() {
-        let runner = LxcStateAwareRunner::new();
+        let runner = LxcStateAwareRunner::with_lxc_installed();
         let req = ExecutionRequest {
             container_id: "bad/name".to_string(),
             ..Default::default()
@@ -1887,7 +1900,7 @@ mod tests {
 
     #[test]
     fn validate_start_accepts_policy_and_lxc_id() {
-        let runner = LxcStateAwareRunner::new();
+        let runner = LxcStateAwareRunner::with_lxc_installed();
         let req = ExecutionRequest {
             policy: ContainerPolicy {
                 readonly_paths: vec!["/workspace".to_string()],
@@ -1960,7 +1973,7 @@ mod tests {
         // `enforcementMode` is now enforceable through iptables, so validation
         // accepts it instead of refusing it as unenforceable. Without this,
         // "reject everything" would pass.
-        let runner = LxcStateAwareRunner::new();
+        let runner = LxcStateAwareRunner::with_lxc_installed();
         let req = ExecutionRequest {
             policy: restrictive_policy(),
             ..Default::default()
@@ -1972,7 +1985,7 @@ mod tests {
 
     #[test]
     fn validate_exec_rejects_policy() {
-        let runner = LxcStateAwareRunner::new();
+        let runner = LxcStateAwareRunner::with_lxc_installed();
         let req = ExecutionRequest {
             policy: ContainerPolicy {
                 blocked_hosts: vec!["example.com".to_string()],
@@ -2016,7 +2029,7 @@ mod tests {
     fn a_phase_hook_does_not_carry_the_version_gate() {
         // The gate is `lxc-exec`'s, applied once ahead of the lifecycle. A hook
         // that refused a below-floor request here would be a second copy.
-        let runner = LxcStateAwareRunner::new();
+        let runner = LxcStateAwareRunner::with_lxc_installed();
         let req = ExecutionRequest {
             schema_version: "0.7.0-alpha".to_string(),
             ..Default::default()
