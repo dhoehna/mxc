@@ -1129,30 +1129,6 @@ fn convert_wire_config(
             return Err(WxcError::ConfigParse(msg.to_string()));
         }
 
-        // LXC is the inverse of the guard above: it *does* have a
-        // privileged packet-filter layer, and that layer is the only thing that
-        // makes the proxy an exception rather than a suggestion. Under the
-        // default `Capabilities` mode `apply_firewall_rules` installs nothing,
-        // so the runner would inject HTTP(S)_PROXY while leaving direct egress
-        // wide open -- a config that reads as deny-all-except-proxy and
-        // enforces neither half. Reject it rather than auto-promoting, so the
-        // user's stated enforcement is never silently rewritten.
-        if containment == ContainmentBackend::Lxc
-            && policy.network_proxy.is_enabled()
-            && !matches!(
-                policy.network_enforcement_mode,
-                NetworkEnforcementMode::Firewall | NetworkEnforcementMode::Both
-            )
-        {
-            let msg = "LXC: network.proxy requires network.enforcementMode='firewall' \
-                       or 'both'. Under the default 'capabilities' mode no iptables \
-                       rules are installed, so the proxy environment variables would be \
-                       injected while direct egress stayed unrestricted -- any client \
-                       that ignores HTTP_PROXY would bypass the proxy entirely.";
-            logger.log_line(msg);
-            return Err(WxcError::ConfigParse(msg.to_string()));
-        }
-
         // A proxy URL may carry `user:pass@` userinfo, and neither LXC nor
         // Bubblewrap keeps that value out of process argv: LXC turns each env
         // entry into an `lxc-attach --set-var=KEY=VALUE` argument, and

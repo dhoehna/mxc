@@ -5602,12 +5602,11 @@ mod tests {
         assert!(needs_network(&policy, false));
     }
 
-    // The JSON parser rejects proxy-under-capabilities, but it is not the only
-    // way in: `LxcScriptRunner::execute` and `mxc_engine::run` take an
-    // already-built `ExecutionRequest`. Skipping here would report success for
-    // an enforcement that never happened, while the runner still injects the
-    // proxy environment -- a container that advertises a proxy and restricts
-    // nothing.
+    // Nothing upstream refuses this any more: `LxcScriptRunner::execute` and
+    // `mxc_engine::run` take an already-built `ExecutionRequest`. Skipping here
+    // would report success for an enforcement that never happened, while the
+    // runner still injects the proxy environment -- a container that advertises
+    // a proxy and restricts nothing.
     #[test]
     fn a_proxy_under_a_non_firewall_mode_is_refused_rather_than_skipped() {
         // `Capabilities` is the only mode the firewall gate rejects, and it is
