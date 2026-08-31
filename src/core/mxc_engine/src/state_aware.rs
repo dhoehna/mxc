@@ -445,6 +445,22 @@ mod tests {
     }
 
     #[test]
+    fn lxc_state_aware_runs_without_the_experimental_optin() {
+        let parsed = ParsedStateAwareRequest {
+            request: ExecutionRequest::default(),
+            phase: Phase::Provision,
+            containment: Some(ContainmentBackend::Lxc),
+            sandbox_id: None,
+            correlation_vector: None,
+            experimental_raw: None,
+            source_text: None,
+        };
+
+        require_experimental_optin(&ContainmentBackend::Lxc, &parsed)
+            .expect("LXC state-aware participation is stable, so the opt-in must not be required");
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn exec_error_distinguishes_missing_streaming_from_missing_lifecycle() {
         // LXC dispatches the lifecycle but has no streaming SandboxProcess. The
