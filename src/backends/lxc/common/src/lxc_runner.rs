@@ -456,12 +456,10 @@ impl LxcScriptRunner {
             Some(pid) => {
                 let _ = writeln!(logger, "Container init PID: {}", pid);
                 let mut mgr = IngressManager::new(&container_name, pid, uses_directional_schema);
-                let pinned_veth =
-                    NetworkIptablesManager::deterministic_veth_name(container.name());
+                let pinned_veth = NetworkIptablesManager::deterministic_veth_name(container.name());
                 // A container that cannot be asked answers no, which sends the
                 // lookup to the name liblxc recorded rather than to the pinned one.
-                let pin_hook_present =
-                    container.has_veth_pin_hook(&pinned_veth).unwrap_or(false);
+                let pin_hook_present = container.has_veth_pin_hook(&pinned_veth).unwrap_or(false);
                 if let Some(gateway) =
                     NetworkIptablesManager::live_veth_interface(container.name(), pin_hook_present)
                         .as_deref()
