@@ -78,6 +78,7 @@ impl LxcScriptRunner {
         container: &LxcContainer,
         container_created: bool,
         fw_manager: &mut NetworkIptablesManager,
+        ingress: Option<&mut IngressManager>,
     ) {
         let halted = if self.destroy_on_exit || container_created {
             container.destroy()
@@ -86,6 +87,9 @@ impl LxcScriptRunner {
         };
         if halted.is_err() {
             fw_manager.set_preserve_policy(true);
+            if let Some(ingress) = ingress {
+                ingress.set_preserve_policy(true);
+            }
         }
     }
 
@@ -424,7 +428,7 @@ impl LxcScriptRunner {
                     // nothing. Report it and resolve nothing rather than scope the
                     // rules to a name that may already be stale.
                     let _ = writeln!(logger, "Could not read the veth pin hook: {}", e);
-                    self.halt_after_failed_start(&container, container_created, &mut fw_manager);
+                    self.halt_after_failed_start(&container, container_created, &mut fw_manager, None);
                     return ScriptResponse::error(
                         "Failed to resolve the container's network interface.",
                     );
@@ -445,11 +449,11 @@ impl LxcScriptRunner {
             match fw_manager.apply_firewall_rules(&request.policy, logger) {
                 Ok(true) => {}
                 Ok(false) => {
-                    self.halt_after_failed_start(&container, container_created, &mut fw_manager);
+                    self.halt_after_failed_start(&container, container_created, &mut fw_manager, None);
                     return ScriptResponse::error("Failed to apply network firewall rules.");
                 }
                 Err(e) => {
-                    self.halt_after_failed_start(&container, container_created, &mut fw_manager);
+                    self.halt_after_failed_start(&container, container_created, &mut fw_manager, None);
                     return ScriptResponse::error(&format!("Network policy error: {}", e));
                 }
             }
@@ -491,6 +495,7 @@ impl LxcScriptRunner {
                             &container,
                             container_created,
                             &mut fw_manager,
+                            None,
                         );
                         return ScriptResponse::error(
                             "Failed to apply inbound network firewall rules.",
@@ -501,6 +506,7 @@ impl LxcScriptRunner {
                             &container,
                             container_created,
                             &mut fw_manager,
+                            None,
                         );
                         return ScriptResponse::error(&format!(
                             "Inbound network policy error: {}",
@@ -523,7 +529,7 @@ impl LxcScriptRunner {
                 // ingress path, which addresses its namespace by init PID;
                 // other backends reach their firewall handling through their
                 // own runners and never construct an `IngressManager`.
-                self.halt_after_failed_start(&container, container_created, &mut fw_manager);
+                self.halt_after_failed_start(&container, container_created, &mut fw_manager, None);
                 return ScriptResponse::error(
                     "Failed to discover the container init PID; cannot enter the container \
                      network namespace to enforce the inbound firewall. Aborting rather than \
@@ -559,13 +565,12 @@ impl LxcScriptRunner {
                 Err(e) => Some(e.to_string()),
             };
             if let Some(reason) = pin_error {
-                if self.destroy_on_exit || container_created {
-                    let _ = container.destroy();
-                } else {
-                    // A reused container this run will not destroy would
-                    // otherwise be left running with a policy it cannot use.
-                    let _ = container.stop();
-                }
+                self.halt_after_failed_start(
+                    &container,
+                    container_created,
+                    &mut fw_manager,
+                    ingress_manager.as_mut(),
+                );
                 return ScriptResponse::error(&format!(
                     "Failed to pin the network proxy host inside the container: {}. \
                      The proxy would be unreachable, so the script was not run.",

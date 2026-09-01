@@ -136,9 +136,9 @@ pub fn mint_exec_marker() -> String {
 /// sleep outlives the `SIGKILL` that was sent to it.  It reads the marker
 /// rather than the kill's own result: `kill` reports failure when the process
 /// is already gone, which is the case where the reap worked.  A process torn
-/// down but not yet reaped by its parent reads an empty `environ` and matches
-/// nothing, so it is not counted as a survivor.  The scan repeats a bounded
-/// number of times to let a kill that is still in flight land.
+/// down but not yet reaped by its parent has no address space left, so its
+/// `environ` cannot be opened and it matches nothing.  The scan repeats a
+/// bounded number of times to let a kill that is still in flight land.
 #[cfg(any(target_os = "linux", test))]
 fn build_reap_args(marker: &str) -> Vec<String> {
     vec![
@@ -162,7 +162,7 @@ fn build_reap_args(marker: &str) -> Vec<String> {
            i=$((i + 1)); \
          done; \
          for p in $seen; do kill -KILL \"$p\" 2>/dev/null; done; \
-         rc=1; j=0; \
+         j=0; \
          while [ \"$j\" -lt 4 ]; do \
            rc=0; \
            for d in /proc/[0-9]*; do \
@@ -2297,15 +2297,20 @@ mod tests {
         // reap and reported to the caller as possibly-still-running work.
         let args = build_reap_args("tok123");
         let script = args.iter().find(|a| a.contains("/proc/")).unwrap();
-        let scan_start = script
-            .rfind("rc=0")
-            .expect("the survivor scan must open each pass clean");
-        let exit = script
-            .rfind("exit $rc")
-            .expect("the exit status must come from the scan");
         assert!(
-            scan_start < exit,
-            "a scan that matches nothing has to leave success behind it, got {:?}",
+            script.contains("do rc=0;"),
+            "each pass must open clean, got {:?}",
+            script
+        );
+        assert_eq!(
+            script.matches("rc=1").count(),
+            1,
+            "only a marker match may raise the failure status, got {:?}",
+            script
+        );
+        assert!(
+            script.contains("*\"$1\"*) rc=1"),
+            "the one thing that raises it must be the marker match, got {:?}",
             script
         );
     }
@@ -2368,15 +2373,15 @@ mod tests {
             .find(|a| a.contains("/proc/"))
             .expect("reap script should be present");
         assert!(
-            !script.contains("exit 0"),
-            "the reap must not report success unconditionally, got {script:?}"
+            script.trim_end().ends_with("exit $rc"),
+            "the exit status must be the scan's, got {script:?}"
         );
         let kill = script.rfind("kill -KILL").expect("must kill what it stopped");
-        let recheck = script
-            .rfind("environ")
-            .expect("must read the marker again after killing");
+        let raise = script
+            .rfind("*\"$1\"*) rc=1")
+            .expect("a surviving marked process must raise the status");
         assert!(
-            kill < recheck,
+            kill < raise,
             "the survivor scan has to run after the kill, got {script:?}"
         );
     }
