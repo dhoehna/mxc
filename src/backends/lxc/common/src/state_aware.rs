@@ -459,6 +459,10 @@ fn apply_network_policy(
             MxcError::backend_error(format!("Failed to install veth pin hook: {e}"))
         })?;
         fw_manager.set_veth_interface(&veth);
+        // The watchdog removes the chain by name, but the return-path rules in
+        // FORWARD carry the interface instead. Registering the veth is what
+        // lets a signal here delete those two rules rather than strand them.
+        signal_cleanup::set_active_veth(&veth);
     }
 
     match fw_manager.apply_firewall_rules(&policy, logger) {
