@@ -162,6 +162,20 @@ impl LxcScriptRunner {
             );
         }
 
+        // Refuse an environment entry that cannot become a variable. The exec
+        // path drops such an entry and runs the script anyway, so without this
+        // the caller gets a container whose environment silently differs from
+        // the one they configured. Placed with the guards above so a rejected
+        // request never creates a container.
+        if let Some(entry) = crate::lxc_bindings::malformed_env_entry(&request.env) {
+            return ScriptResponse::error(&format!(
+                "LXC: env entry '{}' is not a valid environment entry; each one must be \
+                 KEY=VALUE with a non-empty KEY. Refusing rather than dropping it and \
+                 running the script in an environment that was not configured.",
+                entry
+            ));
+        }
+
         let container_name = self.resolve_container_name();
         // Refuse a credential-bearing proxy URL here as well as at parse time.
         // The parser guard only covers requests it built; `ExecutionRequest`
@@ -1118,6 +1132,87 @@ mod tests {
             !log.contains("Container name:"),
             "the guard must return before the runner starts container work, log was: {log}"
         );
+        assert!(
+            !log.contains("Creating LXC container"),
+            "the guard must return before container creation, log was: {log}"
+        );
+    }
+
+    // An environment entry the runner cannot turn into a variable is a typo in
+    // the configuration file.  Dropping it runs the script in an environment
+    // the caller did not ask for, and nothing in the output says so.
+    fn request_with_env(entries: &[&str]) -> ExecutionRequest {
+        ExecutionRequest {
+            env: entries.iter().map(|entry| entry.to_string()).collect(),
+            ..ExecutionRequest::default()
+        }
+    }
+
+    fn env_refusal_for(entries: &[&str]) -> String {
+        let runner = runner_for_guard_tests();
+        let request = request_with_env(entries);
+        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+
+        runner.run_internal(&request, &mut logger).error_message
+    }
+
+    #[test]
+    fn an_env_entry_without_an_equals_sign_is_refused() {
+        let message = env_refusal_for(&["BADENTRY"]);
+
+        assert!(
+            message.contains("BADENTRY"),
+            "an entry that is not KEY=VALUE cannot become a variable and must be refused \
+             by name, got: {message}"
+        );
+    }
+
+    #[test]
+    fn an_env_entry_with_an_empty_key_is_refused() {
+        let message = env_refusal_for(&["=orphaned"]);
+
+        assert!(
+            message.contains("env"),
+            "an entry with no name on the left of '=' names no variable and must be \
+             refused, got: {message}"
+        );
+    }
+
+    #[test]
+    fn one_malformed_env_entry_among_good_ones_refuses_the_exec() {
+        let message = env_refusal_for(&["GOOD=1", "BADENTRY", "ALSO_GOOD=2"]);
+
+        assert!(
+            message.contains("BADENTRY"),
+            "setting the two well-formed variables and dropping the third would run the \
+             script in an environment nobody configured, got: {message}"
+        );
+    }
+
+    // Anti-vacuity: without this, a guard that refused every environment would
+    // pass the tests above while breaking every legitimate request.  The run
+    // cannot succeed here (there is no live container), so the assertion is
+    // that it does not fail *for this reason*.
+    #[test]
+    fn a_well_formed_env_entry_is_not_refused_by_the_env_guard() {
+        let message = env_refusal_for(&["PATH=/usr/bin", "EMPTY=", "HAS_EQUALS=a=b"]);
+
+        assert!(
+            !message.contains("is not a valid environment entry"),
+            "KEY=VALUE, an empty value, and an embedded '=' are all well formed and must \
+             clear the guard, got: {message}"
+        );
+    }
+
+    #[test]
+    fn the_env_refusal_happens_before_any_container_work() {
+        let runner = runner_for_guard_tests();
+        let request = request_with_env(&["BADENTRY"]);
+        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+
+        let _ = runner.run_internal(&request, &mut logger);
+
+        let log = logger.get_buffer();
         assert!(
             !log.contains("Creating LXC container"),
             "the guard must return before container creation, log was: {log}"

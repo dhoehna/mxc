@@ -77,6 +77,19 @@ fn build_attach_args(env: &[String], working_directory: &str, command: &str) -> 
     build_attach_args_with_env_control(env, working_directory, command, false)
 }
 
+/// The first environment entry that cannot become a variable.
+///
+/// `lxc-attach` receives each entry as `--set-var=KEY=VALUE`. An entry with no
+/// `=` names nothing, and one whose key is empty names a variable with no name.
+/// An empty VALUE is well formed, and an `=` inside VALUE is fine because the
+/// split stops at the first one.
+pub(crate) fn malformed_env_entry(env: &[String]) -> Option<&String> {
+    env.iter().find(|entry| match entry.split_once('=') {
+        Some((key, _)) => key.is_empty(),
+        None => true,
+    })
+}
+
 /// Build the post-binary argv for `lxc-attach` (the args that follow the
 /// `-n NAME -P lxcpath` flags already appended by `lxc_command`).
 ///
@@ -109,9 +122,10 @@ fn build_attach_args_with_env_control(
     if force_clear_env || !env.is_empty() {
         args.push("--clear-env".to_string());
         for kv in env {
-            // Well-formed = "KEY=VAL" with a non-empty KEY. `"=foo"` and
-            // `"BADENTRY"` are both silently skipped; embedded `=` in
-            // VAL is fine because split_once stops at the first one.
+            // Well-formed = "KEY=VAL" with a non-empty KEY. The runner refuses
+            // a malformed entry before any container is created, so this skip
+            // only catches a caller that bypassed it; emitting the entry
+            // anyway would hand lxc-attach an argument it cannot parse.
             if let Some((key, _)) = kv.split_once('=') {
                 if !key.is_empty() {
                     args.push(format!("--set-var={}", kv));
