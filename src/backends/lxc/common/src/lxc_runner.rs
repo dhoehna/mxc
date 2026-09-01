@@ -71,7 +71,7 @@ impl LxcScriptRunner {
     /// one it did not create -- otherwise returns while the container keeps
     /// running, and the managers then drop their rules on the way out. The
     /// result is a live container with its egress filtering removed, reported
-    /// to the caller as a failure. Preserving the policy when the stop fails
+    /// to the caller as a failure. Preserving the policy when the halt fails
     /// keeps the rules in place for whatever is still transmitting.
     fn halt_after_failed_start(
         &self,
@@ -79,9 +79,12 @@ impl LxcScriptRunner {
         container_created: bool,
         fw_manager: &mut NetworkIptablesManager,
     ) {
-        if self.destroy_on_exit || container_created {
-            let _ = container.destroy();
-        } else if container.stop().is_err() {
+        let halted = if self.destroy_on_exit || container_created {
+            container.destroy()
+        } else {
+            container.stop()
+        };
+        if halted.is_err() {
             fw_manager.set_preserve_policy(true);
         }
     }
