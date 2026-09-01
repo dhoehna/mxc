@@ -2376,7 +2376,9 @@ mod tests {
             script.trim_end().ends_with("exit $rc"),
             "the exit status must be the scan's, got {script:?}"
         );
-        let kill = script.rfind("kill -KILL").expect("must kill what it stopped");
+        let kill = script
+            .rfind("kill -KILL")
+            .expect("must kill what it stopped");
         let raise = script
             .rfind("*\"$1\"*) rc=1")
             .expect("a surviving marked process must raise the status");

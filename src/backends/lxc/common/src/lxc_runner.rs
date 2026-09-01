@@ -428,7 +428,12 @@ impl LxcScriptRunner {
                     // nothing. Report it and resolve nothing rather than scope the
                     // rules to a name that may already be stale.
                     let _ = writeln!(logger, "Could not read the veth pin hook: {}", e);
-                    self.halt_after_failed_start(&container, container_created, &mut fw_manager, None);
+                    self.halt_after_failed_start(
+                        &container,
+                        container_created,
+                        &mut fw_manager,
+                        None,
+                    );
                     return ScriptResponse::error(
                         "Failed to resolve the container's network interface.",
                     );
@@ -449,11 +454,21 @@ impl LxcScriptRunner {
             match fw_manager.apply_firewall_rules(&request.policy, logger) {
                 Ok(true) => {}
                 Ok(false) => {
-                    self.halt_after_failed_start(&container, container_created, &mut fw_manager, None);
+                    self.halt_after_failed_start(
+                        &container,
+                        container_created,
+                        &mut fw_manager,
+                        None,
+                    );
                     return ScriptResponse::error("Failed to apply network firewall rules.");
                 }
                 Err(e) => {
-                    self.halt_after_failed_start(&container, container_created, &mut fw_manager, None);
+                    self.halt_after_failed_start(
+                        &container,
+                        container_created,
+                        &mut fw_manager,
+                        None,
+                    );
                     return ScriptResponse::error(&format!("Network policy error: {}", e));
                 }
             }
