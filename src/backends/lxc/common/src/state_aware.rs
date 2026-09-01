@@ -325,6 +325,25 @@ fn reject_unenforceable_network_policy(
     Ok(())
 }
 
+/// The lowest schema version LXC's state-aware lifecycle accepts.
+pub const STATE_AWARE_MIN_SCHEMA_VERSION: &str = "0.8.0";
+
+/// Refuse a state-aware request declaring a schema version below the floor.
+pub fn enforce_schema_version_floor(declared: &str) -> Result<(), MxcError> {
+    if schema_version_is_at_least(declared, STATE_AWARE_MIN_SCHEMA_VERSION) {
+        return Ok(());
+    }
+    let declared = if declared.trim().is_empty() {
+        "no schema version".to_string()
+    } else {
+        format!("schema version '{}'", declared)
+    };
+    Err(MxcError::malformed_request(format!(
+        "the LXC state-aware lifecycle requires schema version \
+         {STATE_AWARE_MIN_SCHEMA_VERSION} or later; this request declares {declared}"
+    )))
+}
+
 pub fn schema_version_is_at_least(declared: &str, minimum: &str) -> bool {
     let minimum = Version::parse(minimum).expect("the minimum is a literal semver version");
     let minimum = Version::new(minimum.major, minimum.minor, minimum.patch);
@@ -2023,6 +2042,34 @@ mod tests {
     #[test]
     fn a_higher_version_is_at_or_above_the_minimum() {
         assert!(schema_version_is_at_least("0.9.0-alpha", "0.8.0"));
+    }
+
+    #[test]
+    fn the_floor_refusal_names_the_minimum_and_the_declared_version() {
+        let err = enforce_schema_version_floor("0.7.0-alpha").unwrap_err();
+        assert_eq!(err.code, MxcErrorCode::MalformedRequest);
+        assert!(err.message.contains("0.8.0"), "message: {}", err.message);
+        assert!(
+            err.message.contains("schema version '0.7.0-alpha'"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn the_floor_refusal_names_an_absent_version_as_absent() {
+        let err = enforce_schema_version_floor("").unwrap_err();
+        assert_eq!(err.code, MxcErrorCode::MalformedRequest);
+        assert!(
+            err.message.contains("no schema version"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn the_floor_admits_the_minimum_version() {
+        assert!(enforce_schema_version_floor("0.8.0-alpha").is_ok());
     }
 
     #[test]

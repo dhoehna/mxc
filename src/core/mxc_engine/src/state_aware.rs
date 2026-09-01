@@ -96,6 +96,9 @@ pub fn run_state_aware(
         }
         #[cfg(target_os = "linux")]
         wxc_common::models::ContainmentBackend::Lxc => {
+            lxc_common::state_aware::enforce_schema_version_floor(
+                parsed.request.schema_version.as_str(),
+            )?;
             let mut runner = lxc_common::state_aware::LxcStateAwareRunner::new();
             wxc_common::state_aware_dispatch::dispatch_state_aware(&mut runner, parsed, dry_run)
         }
