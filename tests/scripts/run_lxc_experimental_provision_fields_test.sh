@@ -107,11 +107,14 @@ JSON
 # removal on every exit path rather than leaving it for the runner or the next
 # test to trip over.
 CONTROL_CONTAINER=""
+# Nothing in here may fail. set -e is still in force inside the trap, and
+# destroying a container that was never created would abort the function before
+# its return and hand that status to the whole script.
 cleanup() {
     if [ -n "$CONTROL_CONTAINER" ]; then
-        lxc-destroy -n "$CONTROL_CONTAINER" -f >/dev/null 2>&1
+        lxc-destroy -n "$CONTROL_CONTAINER" -f >/dev/null 2>&1 || true
     fi
-    lxc-destroy -n "$BAD_RELEASE_CONTAINER" -f >/dev/null 2>&1
+    lxc-destroy -n "$BAD_RELEASE_CONTAINER" -f >/dev/null 2>&1 || true
     rm -f "$INVALID_TYPE_CONFIG" "$BAD_RELEASE_CONFIG"
     return 0
 }
