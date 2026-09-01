@@ -84,7 +84,10 @@ JSON
 # Naming the container means the failed create can be cleaned up by name. Left
 # to mint its own, the only way to find it afterwards is to diff `lxc-ls`, which
 # on a shared host also catches containers other runs created.
-BAD_RELEASE_CONTAINER="CLI-LXC-Experimental-Bad-Release"
+# The name must fit the backend's 20-character containerId bound. Over it, the
+# request is refused as malformed and never reaches container creation, which
+# is the failure this control exists to produce.
+BAD_RELEASE_CONTAINER="mxc-e2e-bad-release"
 BAD_RELEASE_CONFIG="$(mktemp)"
 cat > "$BAD_RELEASE_CONFIG" <<JSON
 {
