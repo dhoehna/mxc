@@ -203,6 +203,22 @@ impl LxcScriptRunner {
                 ));
             }
         }
+        let uses_directional_schema =
+            wxc_common::supports_directional_network(&request.schema_version);
+        // Under 'capabilities' no iptables rules are installed and nothing
+        // redirects traffic into the proxy.
+        if request.policy.network_proxy.is_enabled()
+            && !installs_firewall(&request.policy, uses_directional_schema)
+        {
+            return ScriptResponse::error(
+                "LXC: network.proxy requires network.enforcementMode='firewall' or 'both'. \
+                 This policy enables a proxy under 'capabilities', where no iptables \
+                 rules are installed, so the proxy environment would be injected while \
+                 direct egress stayed unrestricted -- any client that ignores HTTP_PROXY \
+                 would bypass the proxy entirely. Refusing to apply rather than reporting \
+                 success for an enforcement that did not happen.",
+            );
+        }
         if self.destroy_on_exit {
             signal_cleanup::set_active(&container_name);
         }
@@ -276,8 +292,6 @@ impl LxcScriptRunner {
                 ));
             }
         };
-        let uses_directional_schema =
-            wxc_common::supports_directional_network(&request.schema_version);
         let mut fw_manager = NetworkIptablesManager::new(&container_name);
         fw_manager.set_directional_schema(uses_directional_schema);
 
@@ -1307,6 +1321,31 @@ mod tests {
         assert!(
             !log.contains("Creating LXC container"),
             "the guard must return before container creation, log was: {log}"
+        );
+    }
+
+    // The 0.7 schema lets a policy ask for a proxy under 'capabilities', where
+    // no firewall is installed and nothing redirects traffic into the proxy.
+    #[test]
+    fn a_proxy_under_capabilities_is_refused_before_any_container_work() {
+        let runner = runner_for_guard_tests();
+        let mut request = request_with_proxy_url("http://proxy.example.com:8080");
+        request.schema_version = "0.7.0".to_string();
+        request.policy.network_enforcement_mode =
+            wxc_common::models::NetworkEnforcementMode::Capabilities;
+        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+
+        let response = runner.run_internal(&request, &mut logger);
+
+        assert!(
+            response.error_message.contains("enforcementMode"),
+            "a proxy under 'capabilities' must be refused, got: {}",
+            response.error_message
+        );
+        let log = logger.get_buffer();
+        assert!(
+            !log.contains("Container name:"),
+            "the refusal must land before the runner starts container work, log was: {log}"
         );
     }
 
