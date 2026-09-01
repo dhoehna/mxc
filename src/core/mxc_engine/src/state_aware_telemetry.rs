@@ -184,6 +184,7 @@ pub fn run_state_aware_with_telemetry(
         telemetry_active,
         telemetry::TelemetryContext {
             backend,
+            sandbox_kind: backend,
             phase,
             correlation_vector: &correlation,
         },
