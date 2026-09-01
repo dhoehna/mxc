@@ -263,6 +263,20 @@ describe('LxcStartConfig', () => {
     assert.ok(cfg);
   });
 
+  it('rejects filesystem.clearPolicyOnExit, which Rust would reject as an unknown field', () => {
+    // `wire::Filesystem` is `deny_unknown_fields` and has no
+    // `clearPolicyOnExit`, so emitting it inside the top-level `filesystem`
+    // object fails the request.
+    const cfg: StartConfigFor<'lxc'> = {
+      filesystem: {
+        readwritePaths: ['/tmp/work'],
+        // @ts-expect-error — SDK-only field; not part of the LXC wire surface.
+        clearPolicyOnExit: false,
+      },
+    };
+    assert.ok(cfg);
+  });
+
   it('rejects allowLocalNetwork, which the LXC backend never enforces', () => {
     const cfg: StartConfigFor<'lxc'> = {
       network: {

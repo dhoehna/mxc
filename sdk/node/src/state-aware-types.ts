@@ -134,11 +134,24 @@ export interface LxcNetworkConfig {
   blockedHosts?: NetworkConfig['blockedHosts'];
 }
 
+/**
+ * Filesystem policy an LXC start accepts.
+ *
+ * Narrowed from `FilesystemConfig`: `clearPolicyOnExit` is an SDK-only field.
+ * Rust's `wire::Filesystem` is `deny_unknown_fields`, so sending it fails the
+ * whole request with `malformed_request`.
+ */
+export interface LxcFilesystemConfig {
+  readwritePaths?: string[];
+  readonlyPaths?: string[];
+  deniedPaths?: string[];
+}
+
 export interface LxcStartConfig {
   /** Schema version (semver). */
   version?: string;
   /** Filesystem mounts to apply before starting the container. */
-  filesystem?: FilesystemConfig;
+  filesystem?: LxcFilesystemConfig;
   /** iptables policy to install before the container starts. `proxy` is not supported by this backend. */
   network?: LxcNetworkConfig;
 }
