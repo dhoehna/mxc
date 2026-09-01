@@ -29,8 +29,9 @@
 # is deliberately empty.
 #
 # Every assertion lands during config parsing or at the lifecycle entry point.
-# The script needs no root, no LXC runtime and no iptables, and it runs each
-# request under --dry-run to keep it that way. run_lxc_all_tests.sh still
+# The script needs no root, no LXC runtime and no iptables. --dry-run keeps it
+# from creating anything, and an admitted request is allowed to come back
+# reporting the runtime is missing. run_lxc_all_tests.sh still
 # requires root before it dispatches anything, which makes that property matter
 # only when this script is invoked directly.
 set -euo pipefail
@@ -44,6 +45,9 @@ CONFIG_DIR="$REPO_DIR/tests/configs"
 # rather than passing against a stale expectation.
 EXPECTED_FLOOR='0.8.0'
 REFUSAL_CODE='"code":"malformed_request"'
+# What a host with no LXC tooling answers once a request has cleared the floor.
+# Quoted as the binary emits it, like the refusal code above.
+RUNTIME_ABSENT_CODE='"code":"backend_unavailable"'
 
 # An admitted lifecycle request under --dry-run, and a fixture that already
 # declares the floor version.
@@ -161,17 +165,24 @@ assert_refused() {
     esac
 }
 
+# Admission means the request cleared the version floor. On a host with no LXC
+# tooling a cleared request comes back backend_unavailable rather than a result,
+# and reaching the backend at all is proof the floor let it through.
 assert_admitted() {
     local label="$1"
-    if [ "$LAST_STATUS" -ne 0 ]; then
-        fail "$label: expected admission, got exit $LAST_STATUS and: $LAST_STDOUT"
-        return
-    fi
     case "$LAST_STDOUT" in
         *"$EXPECTED_FLOOR or later"*)
             fail "$label: refused over its schema version: $LAST_STDOUT"
+            return
             ;;
-        *) pass "$label" ;;
+    esac
+    if [ "$LAST_STATUS" -eq 0 ]; then
+        pass "$label"
+        return
+    fi
+    case "$LAST_STDOUT" in
+        *"$RUNTIME_ABSENT_CODE"*) pass "$label" ;;
+        *) fail "$label: expected admission, got exit $LAST_STATUS and: $LAST_STDOUT" ;;
     esac
 }
 
