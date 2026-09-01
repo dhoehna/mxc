@@ -1087,6 +1087,44 @@ impl NetworkIptablesManager {
         }
     }
 
+    /// The first destination entry that names no destination at all, as the
+    /// configuration field it came from and the entry itself.
+    ///
+    /// Only syntax is judged. `10.0.0.0/33` matches nothing on any host at any
+    /// moment, which makes it a typo in the configuration file. Whether a
+    /// well-formed hostname currently resolves is a question about this
+    /// moment's DNS, and it stays with `resolve_host` and the unresolved-host
+    /// warning.
+    fn malformed_destination(policy: &ContainerPolicy) -> Option<(&'static str, String)> {
+        let lists = [
+            ("network.allowedHosts", &policy.allowed_hosts),
+            ("network.blockedHosts", &policy.blocked_hosts),
+        ];
+        for (field, hosts) in lists {
+            for host in hosts {
+                if Self::is_malformed_destination(host) {
+                    return Some((field, host.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether `host` can never name a destination, whatever the network does.
+    fn is_malformed_destination(host: &str) -> bool {
+        if host.trim().is_empty() {
+            return true;
+        }
+
+        let rewritten = Self::ipv4_mapped_destination(host);
+        let host = rewritten.as_deref().unwrap_or(host);
+
+        // A slash means the entry was written as a CIDR, so it either parses
+        // as one or it is a typo. Without a slash the entry is a hostname, and
+        // whether it names anything is a DNS question rather than a syntax one.
+        host.contains('/') && Self::destination_family(host).is_none()
+    }
+
     fn rule_action_arg(action: &RuleAction) -> &'static str {
         match action {
             RuleAction::Allow => "ACCEPT",
@@ -2620,6 +2658,21 @@ impl NetworkIptablesManager {
             self.chain_name
         ));
 
+        // A destination that does not parse is a typo in the configuration
+        // file, not a lookup that failed: it matches nothing on any host at any
+        // moment. Refusing here, ahead of the ip6tables probe and the first
+        // chain, means a mistyped entry never programs a partial policy and
+        // leaves nothing to roll back. This also covers proxy mode below, which
+        // never resolves the allow list and so cannot warn about it.
+        if let Some((field, entry)) = Self::malformed_destination(policy) {
+            return Err(format!(
+                "{} entry '{}' is not a valid destination, so no rule can be programmed for \
+                 it; refusing to apply a policy that would silently omit it. Use an IP \
+                 address, a CIDR block such as 10.0.0.0/24, or a hostname.",
+                field, entry
+            ));
+        }
+
         // A blocked destination stays reachable through the proxy, which MXC
         // does not configure, so programming the rest would report success for
         // a control that is not in effect.
@@ -3454,6 +3507,12 @@ mod proxy_spec;
 #[cfg(test)]
 #[path = "network_iptables_ga_egress_spec.rs"]
 mod ga_egress_spec;
+
+/// Black-box specification for the refusal of a malformed egress destination,
+/// kept in its own file for the same reason as `veth_spec`.
+#[cfg(test)]
+#[path = "network_iptables_malformed_destination_spec.rs"]
+mod malformed_destination_spec;
 
 #[cfg(test)]
 mod test_firewall {
