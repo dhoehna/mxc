@@ -81,12 +81,17 @@ JSON
 # A well-formed request naming a release that does not exist passes validation
 # and fails inside container creation, which is the cheapest normal-use route
 # to a backend_error.
+# Naming the container means the failed create can be cleaned up by name. Left
+# to mint its own, the only way to find it afterwards is to diff `lxc-ls`, which
+# on a shared host also catches containers other runs created.
+BAD_RELEASE_CONTAINER="CLI-LXC-Experimental-Bad-Release"
 BAD_RELEASE_CONFIG="$(mktemp)"
-cat > "$BAD_RELEASE_CONFIG" <<'JSON'
+cat > "$BAD_RELEASE_CONFIG" <<JSON
 {
   "version": "0.8.0-alpha",
   "phase": "provision",
   "containment": "lxc",
+  "containerId": "$BAD_RELEASE_CONTAINER",
   "experimental": {
     "lxc": {
       "provision": { "distribution": "alpine", "release": "0.0-no-such-release" }
@@ -103,6 +108,7 @@ cleanup() {
     if [ -n "$CONTROL_CONTAINER" ]; then
         lxc-destroy -n "$CONTROL_CONTAINER" -f >/dev/null 2>&1
     fi
+    lxc-destroy -n "$BAD_RELEASE_CONTAINER" -f >/dev/null 2>&1
     rm -f "$INVALID_TYPE_CONFIG" "$BAD_RELEASE_CONFIG"
     return 0
 }
@@ -179,22 +185,11 @@ fi
 # satisfy every assertion above while verifying nothing. This asserts only the
 # absence of the two field diagnostics: the run is expected to fail later on a
 # host with no LXC runtime, and that failure is not what is under test.
-# The container name is minted before creation is attempted, so a failed create
-# can leave one behind. Whatever appeared during this case is removed here
-# rather than trusting the failure path to be clean.
+# A failed create can leave the container behind, and the trap removes it by
+# the name the request gave it.
 echo "=== provision naming a release that does not exist ==="
-BEFORE_CONTAINERS="$(lxc-ls -1 2>/dev/null | sort)"
 run_config "$BAD_RELEASE_CONFIG"
 echo "$OUT"
-for name in $(lxc-ls -1 2>/dev/null | sort); do
-    case " $BEFORE_CONTAINERS " in
-        *" $name "*) ;;
-        *)
-            echo "--- removing the container left by the failed create: $name ---"
-            lxc-destroy -n "$name" -f >/dev/null 2>&1
-            ;;
-    esac
-done
 if [ "$RUN_RC" -eq 0 ]; then
     fail "a provision naming a nonexistent release was accepted (exit 0); the request should fail."
 elif echo "$OUT" | grep -Fq 'backend_error'; then
