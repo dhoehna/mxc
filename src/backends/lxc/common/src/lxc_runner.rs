@@ -226,20 +226,6 @@ impl LxcScriptRunner {
         }
         let uses_directional_schema =
             wxc_common::supports_directional_network(&request.schema_version);
-        // Under 'capabilities' no iptables rules are installed and nothing
-        // redirects traffic into the proxy.
-        if request.policy.network_proxy.is_enabled()
-            && !installs_firewall(&request.policy, uses_directional_schema)
-        {
-            return ScriptResponse::error(
-                "LXC: network.proxy requires network.enforcementMode='firewall' or 'both'. \
-                 This policy enables a proxy under 'capabilities', where no iptables \
-                 rules are installed, so the proxy environment would be injected while \
-                 direct egress stayed unrestricted -- any client that ignores HTTP_PROXY \
-                 would bypass the proxy entirely. Refusing to apply rather than reporting \
-                 success for an enforcement that did not happen.",
-            );
-        }
         if self.destroy_on_exit {
             signal_cleanup::set_active(&container_name);
         }
@@ -886,6 +872,23 @@ fn lxc_network_policy_support() -> NetworkPolicySupport {
 impl ScriptRunner for LxcScriptRunner {
     fn validate_runner(&self, request: &ExecutionRequest) -> Result<(), ScriptResponse> {
         validate_network_policy_support(request, lxc_network_policy_support())?;
+        // Under 'capabilities' no iptables rules are installed and nothing
+        // redirects traffic into the proxy.
+        if request.policy.network_proxy.is_enabled()
+            && !installs_firewall(
+                &request.policy,
+                wxc_common::supports_directional_network(&request.schema_version),
+            )
+        {
+            return Err(ScriptResponse::error(
+                "LXC: network.proxy requires network.enforcementMode='firewall' or 'both'. \
+                 This policy enables a proxy under 'capabilities', where no iptables \
+                 rules are installed, so the proxy environment would be injected while \
+                 direct egress stayed unrestricted -- any client that ignores HTTP_PROXY \
+                 would bypass the proxy entirely. Refusing to apply rather than reporting \
+                 success for an enforcement that did not happen.",
+            ));
+        }
         Ok(())
     }
 
@@ -1365,14 +1368,15 @@ mod tests {
     // no firewall is installed and nothing redirects traffic into the proxy.
     #[test]
     fn a_proxy_under_capabilities_is_refused_before_any_container_work() {
-        let runner = runner_for_guard_tests();
+        let mut runner = runner_for_guard_tests();
         let mut request = request_with_proxy_url("http://proxy.example.com:8080");
+        request.script_code = "echo hello".to_string();
         request.schema_version = "0.7.0".to_string();
         request.policy.network_enforcement_mode =
             wxc_common::models::NetworkEnforcementMode::Capabilities;
         let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
 
-        let response = runner.run_internal(&request, &mut logger);
+        let response = ScriptRunner::run(&mut runner, &request, &mut logger);
 
         assert!(
             response.error_message.contains("enforcementMode"),
@@ -1383,6 +1387,34 @@ mod tests {
         assert!(
             !log.contains("Container name:"),
             "the refusal must land before the runner starts container work, log was: {log}"
+        );
+    }
+
+    // A dry run answers "would this configuration be accepted?", and the caller
+    // acts on that answer without ever starting a container.  Answering yes for
+    // a policy the real run refuses sends the caller away believing a proxy
+    // will be enforced.
+    #[test]
+    fn a_proxy_under_capabilities_is_refused_on_a_dry_run() {
+        let mut runner = runner_for_guard_tests();
+        let mut request = request_with_proxy_url("http://proxy.example.com:8080");
+        request.script_code = "echo hello".to_string();
+        request.schema_version = "0.7.0".to_string();
+        request.policy.network_enforcement_mode =
+            wxc_common::models::NetworkEnforcementMode::Capabilities;
+        request.dry_run = true;
+        let mut logger = Logger::new(wxc_common::logger::Mode::Buffer);
+
+        let response = ScriptRunner::run(&mut runner, &request, &mut logger);
+
+        assert_ne!(
+            response.exit_code, 0,
+            "a dry run must not report success for a policy the real run refuses"
+        );
+        assert!(
+            response.error_message.contains("enforcementMode"),
+            "a dry run must give the same refusal as the real run, got: {}",
+            response.error_message
         );
     }
 
