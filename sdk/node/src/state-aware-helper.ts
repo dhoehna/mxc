@@ -17,9 +17,7 @@ export const STATE_AWARE_VERSION = '0.6.0-alpha';
 // See `DEFAULT_STATE_AWARE_VERSION`.
 export const WSLC_STATE_AWARE_VERSION = '0.8.0-alpha';
 
-// LXC's network surface is the directional field set, which a pre-0.8 schema
-// does not enforce.  On the shared default a policy would be accepted and no
-// firewall installed.
+// LXC refuses any state-aware request below 0.8.
 export const LXC_STATE_AWARE_VERSION = '0.8.0-alpha';
 
 // Wire-format cross-cutting fields that live at the envelope's top level.

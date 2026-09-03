@@ -99,7 +99,7 @@ echo "Running LXC conflicting containment backends test..."
 # captured on its own -- asserting against a merged stream would let a stderr
 # diagnostic satisfy an assertion about the envelope.
 set +e
-OUTPUT="$("$LXC_EXEC" "$CONFIG" 2>/dev/null)"
+OUTPUT="$("$LXC_EXEC" --experimental "$CONFIG" 2>/dev/null)"
 RC=$?
 set -e
 echo "$OUTPUT"
@@ -121,7 +121,7 @@ echo "$OUTPUT" | grep -Fq "$EXPECTED_REMEDY" \
 # is allowed to fail for an environmental reason -- no LXC runtime on the host
 # -- which is not what is under test; it must not fail as a malformed request.
 set +e
-CONTROL_OUTPUT="$("$LXC_EXEC" "$VALID_CONFIG" 2>/dev/null)"
+CONTROL_OUTPUT="$("$LXC_EXEC" --experimental "$VALID_CONFIG" 2>/dev/null)"
 CONTROL_RC=$?
 set -e
 echo "$CONTROL_OUTPUT"

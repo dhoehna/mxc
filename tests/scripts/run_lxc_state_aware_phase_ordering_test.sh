@@ -76,7 +76,7 @@ run_phase() {
         printf '\n}\n'
     } > "$req"
 
-    "$LXC_EXEC" "$req"
+    "$LXC_EXEC" --experimental "$req"
 }
 
 extract_sandbox_id() {
@@ -123,7 +123,7 @@ expect_error_code() {
 echo "Running LXC state-aware phase-ordering test..."
 
 echo "=== provision ==="
-PROVISION_OUT="$("$LXC_EXEC" "$CONFIG_DIR/lxc_state_aware_provision.json")"
+PROVISION_OUT="$("$LXC_EXEC" --experimental "$CONFIG_DIR/lxc_state_aware_provision.json")"
 if [ $? -ne 0 ]; then
     echo "Cannot continue: provision failed."
     echo "$PROVISION_OUT"

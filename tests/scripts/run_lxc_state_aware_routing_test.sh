@@ -104,21 +104,21 @@ expect_error_code "an id with no prefix separator is refused as $MALFORMED_ID" \
 expect_error_code "an id with an empty prefix is refused as $MALFORMED_ID" \
     "$MALFORMED_ID" ':orphan'
 expect_error_code "an id with an empty container name is refused as $MALFORMED_ID" \
-    "$MALFORMED_ID" 'lxc:'
+    "$MALFORMED_ID" 'lxc:' --experimental
 expect_error_code "an id with a space in the container name is refused as $MALFORMED_ID" \
-    "$MALFORMED_ID" 'lxc:bad name'
+    "$MALFORMED_ID" 'lxc:bad name' --experimental
 expect_error_code "an id with a punctuation character is refused as $MALFORMED_ID" \
-    "$MALFORMED_ID" 'lxc:bad!name'
+    "$MALFORMED_ID" 'lxc:bad!name' --experimental
 
 # The contract caps the container name at 20 characters. Asserting only the
 # rejection would also pass if every name were rejected, which would make the
 # five cases above meaningless.
 echo "=== container-name length boundary ==="
 expect_error_code "a 21-character container name is refused as $MALFORMED_ID" \
-    "$MALFORMED_ID" 'lxc:aaaaaaaaaaaaaaaaaaaaa'
+    "$MALFORMED_ID" 'lxc:aaaaaaaaaaaaaaaaaaaaa' --experimental
 
 write_request 'lxc:aaaaaaaaaaaaaaaaaaaa'
-LEN20_OUT="$("$LXC_EXEC" "$WORK_DIR/request.json" 2>/dev/null)"
+LEN20_OUT="$("$LXC_EXEC" --experimental "$WORK_DIR/request.json" 2>/dev/null)"
 if printf '%s' "$LEN20_OUT" | grep -Eq "\"code\"[[:space:]]*:[[:space:]]*\"$MALFORMED_ID\""; then
     check "a 20-character container name is not refused as $MALFORMED_ID" 1
     echo "    got: $LEN20_OUT"
@@ -142,6 +142,8 @@ expect_error_code "an ephemeral-only backend is refused as $UNSUPPORTED_PHASE" \
     "$UNSUPPORTED_PHASE" 'wsb:0a1b2c3d' --experimental
 expect_error_code "a backend absent from this build is refused as $BACKEND_UNAVAILABLE" \
     "$BACKEND_UNAVAILABLE" 'wslc:0a1b2c3d' --experimental
+expect_error_code "an lxc lifecycle call without the opt-in is refused as $BACKEND_UNAVAILABLE" \
+    "$BACKEND_UNAVAILABLE" 'lxc:mxc-routingtest'
 
 echo "=== the runtime dependency is missing ==="
 # §11.7 requires a feature-unavailable test: on a host without the LXC runtime,
@@ -168,7 +170,7 @@ if PATH="$STRIPPED_BIN" command -v lxc-info >/dev/null 2>&1; then
 else
     check "the stripped PATH hides the LXC tools" 0
 
-    UNAVAIL_OUT="$(PATH="$STRIPPED_BIN" "$LXC_EXEC" "$WORK_DIR/provision.json" 2>/dev/null)"
+    UNAVAIL_OUT="$(PATH="$STRIPPED_BIN" "$LXC_EXEC" --experimental "$WORK_DIR/provision.json" 2>/dev/null)"
     UNAVAIL_RC=$?
     if [ "$UNAVAIL_RC" -eq 0 ]; then
         check "provision without the LXC runtime is refused as $BACKEND_UNAVAILABLE (exited 0)" 1
@@ -186,7 +188,7 @@ echo "=== stdout carries the envelope and nothing else ==="
 # diagnostics on stderr, so anything printed alongside the envelope -- a
 # warning, a progress line -- breaks a consumer rather than this test.
 write_request 'lxc:bad name'
-ENVELOPE_OUT="$("$LXC_EXEC" "$WORK_DIR/request.json" 2>/dev/null)"
+ENVELOPE_OUT="$("$LXC_EXEC" --experimental "$WORK_DIR/request.json" 2>/dev/null)"
 if [ "$(printf '%s' "$ENVELOPE_OUT" | wc -l)" -eq 0 ] &&
     printf '%s' "$ENVELOPE_OUT" | grep -Eq '^\{.*"error".*\}$'; then
     check "a refusal writes one envelope and nothing else to stdout" 0

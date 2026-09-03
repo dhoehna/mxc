@@ -62,6 +62,7 @@ fn require_experimental_optin(
         wxc_common::models::ContainmentBackend::WindowsSandbox
             | wxc_common::models::ContainmentBackend::IsolationSession
             | wxc_common::models::ContainmentBackend::Wslc
+            | wxc_common::models::ContainmentBackend::Lxc
     ) && !parsed.request.experimental_enabled
     {
         return Err(MxcError::backend_unavailable(format!(
@@ -373,7 +374,7 @@ fn exec_state_aware_attached_with(
 /// or [`exec_state_aware_json`] to drive the pipes yourself.
 ///
 /// `experimental` opts in to the experimental backends (WindowsSandbox,
-/// IsolationSession, WSLc); without it they are refused with
+/// IsolationSession, WSLc, Lxc); without it they are refused with
 /// `backend_unavailable` before any work is done.
 pub fn run_state_aware_json(
     request_json: &str,
@@ -448,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn lxc_state_aware_runs_without_the_experimental_optin() {
+    fn lxc_state_aware_requires_experimental_optin() {
         let parsed = ParsedStateAwareRequest {
             request: ExecutionRequest::default(),
             phase: Phase::Provision,
@@ -459,8 +460,10 @@ mod tests {
             source_text: None,
         };
 
-        require_experimental_optin(&ContainmentBackend::Lxc, &parsed)
-            .expect("LXC state-aware participation is stable, so the opt-in must not be required");
+        let error = run_state_aware(parsed, false).unwrap_err();
+
+        assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+        assert!(error.message.contains("experimental"));
     }
 
     #[test]
@@ -507,6 +510,29 @@ mod tests {
         let error = match exec_state_aware(parsed) {
             Ok(_) => {
                 panic!("expected the experimental gate to reject a wslc exec without the opt-in")
+            }
+            Err(e) => e,
+        };
+
+        assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+        assert!(error.message.contains("experimental"));
+    }
+
+    #[test]
+    fn exec_lxc_experimental_backend_requires_optin() {
+        let parsed = ParsedStateAwareRequest {
+            request: ExecutionRequest::default(),
+            phase: Phase::Exec,
+            containment: Some(ContainmentBackend::Lxc),
+            sandbox_id: Some("lxc:00000000000000000000000000000000".to_string()),
+            correlation_vector: None,
+            experimental_raw: None,
+            source_text: None,
+        };
+
+        let error = match exec_state_aware(parsed) {
+            Ok(_) => {
+                panic!("expected the experimental gate to reject an lxc exec without the opt-in")
             }
             Err(e) => e,
         };

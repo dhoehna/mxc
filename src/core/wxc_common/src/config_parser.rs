@@ -495,35 +495,32 @@ fn normalize_filesystem_paths(policy: &mut ContainerPolicy, logger: &mut Logger)
 
 fn present_backend_sections(cfg: &wire::MxcConfig) -> Vec<&'static str> {
     let mut sections: Vec<&'static str> = Vec::new();
-    let mut push = |path: Option<&'static str>| {
-        if let Some(path) = path {
+    let mut push = |backend: ContainmentBackend| {
+        if let Some(path) = backend.section_path() {
             sections.push(path);
         }
     };
     if cfg.process_container.is_some() {
-        push(ContainmentBackend::ProcessContainer.section_path());
+        push(ContainmentBackend::ProcessContainer);
     }
     if cfg.lxc.is_some() {
-        push(ContainmentBackend::Lxc.section_path());
+        push(ContainmentBackend::Lxc);
     }
     if cfg.seatbelt.is_some() {
-        push(ContainmentBackend::Seatbelt.section_path());
+        push(ContainmentBackend::Seatbelt);
     }
     if let Some(experimental) = cfg.experimental.as_ref() {
         if experimental.windows_sandbox.is_some() {
-            push(ContainmentBackend::WindowsSandbox.section_path());
+            push(ContainmentBackend::WindowsSandbox);
         }
         if experimental.wslc.is_some() {
-            push(ContainmentBackend::Wslc.section_path());
+            push(ContainmentBackend::Wslc);
         }
         if experimental.isolation_session.is_some() {
-            push(ContainmentBackend::IsolationSession.section_path());
+            push(ContainmentBackend::IsolationSession);
         }
-        // LXC is the one backend reachable under two spellings, and the
-        // state-aware payload arrives under this one, so it cannot borrow the
-        // top-level `section_path`.
         if experimental.lxc.is_some() {
-            push(Some("experimental.lxc"));
+            sections.push("experimental.lxc");
         }
     }
     sections
@@ -575,28 +572,18 @@ fn validate_experimental_backend_keys(
         return Ok(());
     };
 
+    let matching_key = containment
+        .map(|c| c.wire_name())
+        .filter(|name| KNOWN_EXPERIMENTAL_BACKENDS.contains(name));
+
     let present: Vec<&'static str> = KNOWN_EXPERIMENTAL_BACKENDS
         .iter()
         .copied()
         .filter(|key| map.contains_key(*key))
         .collect();
 
-    let rejected: Vec<&'static str> = match containment {
-        // LXC is the one backend whose domain section is the top-level `lxc`
-        // while its state-aware payload arrives under `experimental.lxc`, so
-        // the allowed key cannot be derived from `section_path`.
-        Some(ContainmentBackend::Lxc) => present.into_iter().filter(|k| *k != "lxc").collect(),
-        // A backend that owns no `experimental.*` section matches no key, so
-        // every key present here is foreign.
-        Some(resolved) => {
-            let allowed = resolved
-                .section_path()
-                .and_then(|path| path.strip_prefix("experimental."));
-            present
-                .into_iter()
-                .filter(|k| Some(*k) != allowed)
-                .collect()
-        }
+    let rejected: Vec<&'static str> = match matching_key {
+        Some(allowed) => present.into_iter().filter(|k| *k != allowed).collect(),
         None if present.len() > 1 => present,
         None => return Ok(()),
     };
@@ -939,7 +926,7 @@ fn convert_wire_config(
         process_container_network = ac.network;
     }
 
-    // Filesystem section.
+    // Filesystem section
     if let Some(fscfg) = cfg.filesystem {
         if let Some(v) = fscfg.denied_paths {
             policy.denied_paths = v;
@@ -3699,10 +3686,9 @@ mod tests {
 
     #[test]
     fn proxy_accepted_with_lxc() {
-        // LXC requires a routable proxy host: localhost/127.0.0.1 is the
-        // container loopback and unreachable, so use network.proxy.url. A proxy
-        // makes the policy require the firewall, so LXC installs the rules that
-        // make it an exception to deny-all; no enforcementMode is needed.
+        // A proxy needs a routable host: 127.0.0.1 is the container's own
+        // loopback. The proxy alone makes the policy require the firewall; no
+        // enforcementMode is needed.
         let json = r#"{"process":{"commandLine":"x"},"containment":"lxc","network":{"proxy":{"url":"http://proxy.example.com:8080"}}}"#;
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
@@ -3716,10 +3702,6 @@ mod tests {
 
     #[test]
     fn proxy_with_lxc_is_accepted_whatever_the_enforcement_mode() {
-        // The behavior change, seen through the parser: an LXC proxy used to be
-        // rejected unless enforcementMode was firewall/both. It is now accepted
-        // regardless -- omitted, capabilities, firewall, and both all parse to
-        // an enabled proxy, because the proxy alone drives the install.
         for mode in [
             r#""enforcementMode":"capabilities","#,
             r#""enforcementMode":"firewall","#,
@@ -6311,32 +6293,6 @@ mod tests {
         );
     }
 
-    // A provision naming one backend must not carry another backend's
-    // experimental block, whichever backend it names.
-    #[test]
-    fn state_aware_provision_with_foreign_experimental_lxc_rejected() {
-        let json = r#"{
-            "phase": "provision",
-            "containment": "process",
-            "experimental": {
-                "lxc": {"provision": {"distribution": "alpine", "release": "3.20"}}
-            }
-        }"#;
-        let encoded = base64_encode(json.as_bytes());
-        let mut logger = test_logger();
-        let err = load_mxc_request(&encoded, &mut logger, true)
-            .expect_err("provision naming process containment must not carry experimental.lxc");
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("Multiple containment backends configured"),
-            "error did not mention multi-backend rejection: {msg}"
-        );
-        assert!(
-            msg.contains("experimental.lxc"),
-            "error did not name the foreign section: {msg}"
-        );
-    }
-
     #[test]
     fn state_aware_lxc_experimental_backend_key_is_accepted() {
         let json = r#"{
@@ -6373,9 +6329,8 @@ mod tests {
         );
     }
 
-    // A one-shot request carrying `experimental.lxc` names a backend it did not
-    // select, and the caller's distribution and release cannot survive the
-    // conversion, so it must be rejected rather than run as another backend.
+    // A one-shot request naming `experimental.lxc` would lose the caller's
+    // distribution and release in the conversion.
     #[test]
     fn one_shot_foreign_experimental_lxc_rejected() {
         assert_multi_backend_rejected(

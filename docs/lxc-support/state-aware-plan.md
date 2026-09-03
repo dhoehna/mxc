@@ -29,6 +29,10 @@ One-shot execution has no such floor and continues to accept `0.7.0`.
 
 The floor exists because LXC's state-aware support missed the 0.7.0 cutoff.
 
+## Experimental opt-in
+
+The LXC state-aware lifecycle is experimental.  Every call to a lifecycle phase must pass `--experimental` to `lxc-exec`.  Without it every phase is refused with `backend_unavailable` before any container is touched.  One-shot execution has no such requirement.
+
 ## Per-phase config and metadata shapes
 
 ### Provision
@@ -176,6 +180,7 @@ LXC emits nine of the twelve codes in the specification's closed union.
 
 | Observable condition | Wire `error.code` | Trigger |
 |---|---|---|
+| Caller did not pass `--experimental` | `backend_unavailable` | The state-aware lifecycle is experimental.  Reported by all five phases before any container is touched. |
 | Provision config missing or incomplete | `malformed_request` | No `experimental.lxc.provision` block, or an empty `distribution` or `release`. |
 | The `sandboxId` does not parse | `malformed_id` | Missing or foreign prefix, empty name, a name over 20 characters, or a character outside ASCII alphanumerics, `-`, and `_`.  Detected before any container is touched. |
 | The id parses, the container does not exist | `stale_id` | The sandbox was deprovisioned, or the container was destroyed out of band.  Reported by start, exec, and stop. |

@@ -82,7 +82,7 @@ run_phase() {
         printf '\n}\n'
     } > "$req"
 
-    "$LXC_EXEC" "$req"
+    "$LXC_EXEC" --experimental "$req"
 }
 
 extract_sandbox_id() {
@@ -287,7 +287,7 @@ start_fresh_sandbox() {
     local label="$1"
     local out rc
     echo "=== provision for $label ==="
-    out="$($LXC_EXEC "$CONFIG_DIR/lxc_state_aware_provision.json")"
+    out="$($LXC_EXEC --experimental "$CONFIG_DIR/lxc_state_aware_provision.json")"
     rc=$?
     echo "$out"
     if [ "$rc" -ne 0 ]; then
@@ -408,7 +408,7 @@ run_start_case() {
     QUARANTINE_ACTIVE="$quarantine"
 
     echo "=== case $case_no start: $cause ==="
-    out="$($LXC_EXEC "$req" 2>&1)"
+    out="$($LXC_EXEC --experimental "$req" 2>&1)"
     rc=$?
     echo "$out"
 
@@ -536,7 +536,7 @@ run_hostloopback_block_case() {
     make_request_from_config "$CONFIG_HOSTLOOPBACK_DENY" "$WORK_DIR/case_${case_no}.json"
 
     echo "=== case $case_no start: $cause ==="
-    out="$($LXC_EXEC "$WORK_DIR/case_${case_no}.json" 2>&1)"
+    out="$($LXC_EXEC --experimental "$WORK_DIR/case_${case_no}.json" 2>&1)"
     rc=$?
     echo "$out"
     if [ "$rc" -ne 0 ]; then
@@ -597,7 +597,7 @@ run_provision_rejection_case() {
     local out rc actual status
 
     echo "=== case $case_no provision rejection: $cause ==="
-    out="$($LXC_EXEC "$config" 2>&1)"
+    out="$($LXC_EXEC --experimental "$config" 2>&1)"
     rc=$?
     echo "$out"
 
@@ -656,7 +656,7 @@ run_filesystem_start_case() {
     make_request_from_config "$config" "$req"
 
     echo "=== case $case_no start: $cause ==="
-    out="$($LXC_EXEC "$req" 2>&1)"
+    out="$($LXC_EXEC --experimental "$req" 2>&1)"
     rc=$?
     echo "$out"
 
@@ -743,7 +743,7 @@ run_proxy_start_case() {
     make_request_from_config "$CONFIG_PROXY" "$req"
 
     echo "=== case $case_no start: $cause ==="
-    out="$($LXC_EXEC --allow-testing-features "$req" 2>&1)"
+    out="$($LXC_EXEC --experimental --allow-testing-features "$req" 2>&1)"
     rc=$?
     echo "$out"
 
@@ -764,7 +764,7 @@ run_proxy_start_case() {
     if [ "$rc" -ne 0 ]; then
         make_request_from_config "$CONFIG_PROXY_EXTERNAL" "$req"
         echo "=== case $case_no start: external proxy url ==="
-        out="$($LXC_EXEC "$req" 2>&1)"
+        out="$($LXC_EXEC --experimental "$req" 2>&1)"
         rc=$?
         echo "$out"
         if [ "$rc" -ne 0 ]; then

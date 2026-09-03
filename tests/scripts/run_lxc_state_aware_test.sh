@@ -90,7 +90,7 @@ run_phase() {
         printf '\n}\n'
     } > "$req"
 
-    "$LXC_EXEC" "$req"
+    "$LXC_EXEC" --experimental "$req"
 }
 
 # Pull sandboxId out of a result envelope without depending on jq or python,
@@ -116,7 +116,7 @@ echo "Running LXC state-aware lifecycle test..."
 # --- provision -------------------------------------------------------------
 # Uses the checked-in config so the distribution/release stay in one place.
 echo "=== provision ==="
-PROVISION_OUT="$("$LXC_EXEC" "$CONFIG_DIR/lxc_state_aware_provision.json")"
+PROVISION_OUT="$("$LXC_EXEC" --experimental "$CONFIG_DIR/lxc_state_aware_provision.json")"
 PROVISION_RC=$?
 check "provision exits 0" "$PROVISION_RC"
 echo "$PROVISION_OUT"

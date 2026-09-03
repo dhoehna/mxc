@@ -97,7 +97,7 @@ export interface IsolationSessionDeprovisionConfig {
 export interface LxcProvisionConfig {
   /** Schema version (semver). */
   version?: string;
-  /** Optional externally assigned LXC container name. */
+  /** Container name to use instead of a generated one. */
   containerId?: string;
   /** Linux distribution for the container rootfs, e.g. "alpine" or "ubuntu". */
   distribution: string;
@@ -105,42 +105,14 @@ export interface LxcProvisionConfig {
   release: string;
 }
 
-/**
- * Network policy accepted by LXC state-aware `start`.
- *
- * Narrowed to the fields an LXC caller can usefully set, rather than derived
- * from `NetworkConfig`:
- *
- * - `proxy` is rejected at start (`apply_network_policy` returns a
- *   policy-validation error).
- * - `removeRulesOnExit` is an SDK-only field emitted inside the top-level
- *   `network` object. Rust's `wire::Network` is `deny_unknown_fields`, so
- *   sending it fails the whole request.
- * - `allowLocalNetwork` deserializes, but start rejects
- *   `allowLocalNetwork: true` with a policy-validation error
- *   (`reject_unenforceable_network_policy`). The container's inbound chain can
- *   only open a source range, and opening every source is broader than the
- *   local-network access requested.
- * - `enforcementMode` is not offered.  At the version this SDK sends
- *   (`0.8.0-alpha`) `defaultPolicy`, `allowedHosts`, and `blockedHosts` drive
- *   enforcement on their own and the mode is ignored.  An explicit pre-0.8
- *   `version` records these fields and installs no firewall.  The wire still
- *   accepts the field; a `network` object shared with another backend keeps
- *   parsing.
- */
+/** The `NetworkConfig` fields LXC honors at start. */
 export interface LxcNetworkConfig {
   defaultPolicy?: NetworkConfig['defaultPolicy'];
   allowedHosts?: NetworkConfig['allowedHosts'];
   blockedHosts?: NetworkConfig['blockedHosts'];
 }
 
-/**
- * Filesystem policy an LXC start accepts.
- *
- * Narrowed from `FilesystemConfig`: `clearPolicyOnExit` is an SDK-only field.
- * Rust's `wire::Filesystem` is `deny_unknown_fields`, so sending it fails the
- * whole request with `malformed_request`.
- */
+/** The `FilesystemConfig` fields LXC honors at start. */
 export interface LxcFilesystemConfig {
   readwritePaths?: string[];
   readonlyPaths?: string[];
@@ -150,9 +122,7 @@ export interface LxcFilesystemConfig {
 export interface LxcStartConfig {
   /** Schema version (semver). */
   version?: string;
-  /** Filesystem mounts to apply before starting the container. */
   filesystem?: LxcFilesystemConfig;
-  /** iptables policy to install before the container starts. `proxy` is not supported by this backend. */
   network?: LxcNetworkConfig;
 }
 

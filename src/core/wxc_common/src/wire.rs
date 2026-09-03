@@ -737,11 +737,7 @@ pub struct IsolationSessionProvisionPhase {
     pub app_id: Option<String>,
 }
 
-/// LXC backend config under the experimental surface. Carries only the
-/// per-phase state-aware nesting for the phases that take config
-/// (`provision`); the one-shot LXC surface is the stable top-level `lxc`
-/// section, so this type is named apart from it rather than shared with it.
-/// `start`, `exec`, `stop`, and `deprovision` take no per-phase config payload.
+/// State-aware LXC configuration. Only provision takes a config payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
@@ -750,13 +746,9 @@ pub struct LxcExperimental {
     pub provision: Option<LxcProvisionPhase>,
 }
 
-/// Provision-phase LXC configuration (state-aware lifecycle), nested under
-/// `experimental.lxc.provision`. Names the container image to create.
-///
-/// Filesystem mounts and network policy derive from the top-level `filesystem`
-/// and `network` sections, not from here. It is its own type rather than a
-/// shared one because a shared type would advertise its fields on every phase
-/// in the generated schema.
+/// Provision-phase LXC configuration, separate from the stable top-level `lxc`
+/// section because this surface is experimental. Filesystem mounts and network
+/// policy come from the top-level `filesystem` and `network` sections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]

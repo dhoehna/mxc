@@ -85,7 +85,7 @@ provision() {
         printf '\n}\n'
     } > "$req"
 
-    "$LXC_EXEC" "$req"
+    "$LXC_EXEC" --experimental "$req"
 }
 
 deprovision() {
@@ -95,7 +95,7 @@ deprovision() {
     printf '{\n  "version": "0.8.0-alpha",\n  "phase": "deprovision",\n  "sandboxId": "%s"\n}\n' \
         "$sandbox_id" > "$req"
 
-    "$LXC_EXEC" "$req"
+    "$LXC_EXEC" --experimental "$req"
 }
 
 # Read one scalar out of a result envelope without jq or python, neither of

@@ -136,6 +136,13 @@ run_request() {
     set -e
 }
 
+run_lifecycle_request() {
+    set +e
+    LAST_STDOUT="$("$LXC_EXEC" --dry-run --experimental "$1" 2>/dev/null)"
+    LAST_STATUS=$?
+    set -e
+}
+
 assert_refused_naming_floor() {
     local label="$1"
     if [ "$LAST_STATUS" -eq 0 ]; then
@@ -186,13 +193,13 @@ assert_admitted() {
     esac
 }
 
-run_request "$(write_provision_request '0.7.0-alpha')"
+run_lifecycle_request "$(write_provision_request '0.7.0-alpha')"
 assert_refused_naming_floor "a 0.7 lifecycle request is refused"
 
-run_request "$(write_provision_request '0.6.0-alpha')"
+run_lifecycle_request "$(write_provision_request '0.6.0-alpha')"
 assert_refused_naming_floor "a 0.6 lifecycle request is refused"
 
-run_request "$(write_provision_request '')"
+run_lifecycle_request "$(write_provision_request '')"
 assert_refused_naming_floor "a lifecycle request with no declared version is refused"
 
 # A later phase carries no provision fields, and the floor must still refuse it.
@@ -204,7 +211,7 @@ cat > "$LATER_PHASE" <<'JSON'
   "sandboxId": "lxc:mxc-version-floor-probe"
 }
 JSON
-run_request "$LATER_PHASE"
+run_lifecycle_request "$LATER_PHASE"
 assert_refused_naming_floor "a 0.7 lifecycle request on a later phase is refused"
 
 # A version that is not semver is refused before the floor is ever compared.
@@ -222,10 +229,10 @@ cat > "$NONSENSE" <<'JSON'
   }
 }
 JSON
-run_request "$NONSENSE"
+run_lifecycle_request "$NONSENSE"
 assert_refused "a lifecycle request with a nonsense version is refused"
 
-run_request "$ADMITTED_CONFIG"
+run_lifecycle_request "$ADMITTED_CONFIG"
 assert_admitted "a lifecycle request declaring the floor version is admitted"
 
 run_request "$ONE_SHOT_CONFIG"

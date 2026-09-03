@@ -84,6 +84,8 @@ The `distribution` and `release` fields control which LXC template is used to cr
 
 ### State-aware lifecycle configuration
 
+The LXC state-aware lifecycle is experimental.  Every call to a lifecycle phase must pass `--experimental` to `lxc-exec`, or `{ experimental: true }` when using the TypeScript SDK.  Without it every phase is refused with `backend_unavailable` before any container is touched.  The one-shot surface is unaffected and does not require this flag.
+
 The table above describes the **one-shot** surface, where the two fields sit in
 a top-level `lxc` section.  The state-aware lifecycle carries the same two
 fields in the backend's own sub-object instead, under

@@ -150,7 +150,7 @@ OUT=""
 RUN_RC=0
 run_config() {
     set +e
-    OUT="$("$LXC_EXEC" "$1" 2>/dev/null)"
+    OUT="$("$LXC_EXEC" --experimental "$1" 2>/dev/null)"
     RUN_RC=$?
     set -e
 }
