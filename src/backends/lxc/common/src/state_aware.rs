@@ -19,7 +19,7 @@ use wxc_common::logger::{Logger, Mode};
 use wxc_common::models::{ContainerPolicy, ExecutionRequest, LxcConfig};
 use wxc_common::mxc_error::MxcError;
 use wxc_common::state_aware_backend::{
-    null_pipe_handle, DeprovisionResult, ExecConsumer, ExecHandle, ExecOutcome, ProvisionResult,
+    null_pipe_handle, DeprovisionResult, ExecHandle, ExecOutcome, ExecStdio, ProvisionResult,
     StartResult, StatefulSandboxBackend, StopResult,
 };
 
@@ -1081,14 +1081,14 @@ impl StatefulSandboxBackend for LxcStateAwareRunner {
         sandbox_id: &str,
         request: &ExecutionRequest,
         _config: Option<()>,
-        consumer: ExecConsumer,
+        stdio: ExecStdio,
     ) -> Result<ExecHandle, MxcError> {
         // Before any work: `attach_run` relays to this process's stdio and
-        // returns no pipes, so it cannot serve an in-process caller. Refusing
+        // returns no pipes, so it cannot serve a piped caller. Refusing
         // after running it would make the refusal describe output that has
         // already gone somewhere the caller never asked for.
-        if consumer == ExecConsumer::Library {
-            return Err(wxc_common::state_aware_backend::unsupported_library_exec(
+        if stdio == ExecStdio::Piped {
+            return Err(wxc_common::state_aware_backend::unsupported_piped_exec(
                 "LXC",
             ));
         }
@@ -1501,14 +1501,14 @@ mod tests {
     /// `MalformedId` first — so any error but the refusal means the consumer
     /// check came too late.
     #[test]
-    fn a_library_exec_is_refused_before_the_workload_runs() {
+    fn a_piped_exec_is_refused_before_the_workload_runs() {
         let mut runner = LxcStateAwareRunner::with_lxc_installed();
         let err = runner
             .exec(
                 "not-a-valid-sandbox-id",
                 &ExecutionRequest::default(),
                 None,
-                ExecConsumer::Library,
+                ExecStdio::Piped,
             )
             .expect_err("an in-process caller must be refused");
         assert!(
